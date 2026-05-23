@@ -101,3 +101,13 @@ api_keys.txt
 *.bak
 *.backup
 *.orig
+
+# AI coding assistant instruction files
+CLAUDE.md
+AGENTS.md
+
+# Antigravity CLI local project config
+.antigravitycli/
+
+# Upstream screenshots (not used in fork)
+screenshots/
