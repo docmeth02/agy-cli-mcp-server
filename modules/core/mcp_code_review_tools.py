@@ -8,18 +8,18 @@ import json
 import logging
 from typing import Optional
 
-from modules.utils.gemini_utils import (
-    execute_gemini_with_retry,
-    GeminiExecutionError,
-    GeminiTimeoutError,
-    GeminiRateLimitError,
+from modules.utils.cli_utils import (
+    execute_cli_with_retry,
+    extract_file_refs,
+    _build_cli_args,
+    CLIExecutionError,
+    CLITimeoutError,
+    CLIRateLimitError,
 )
-from modules.config.gemini_config import (
+from modules.config.cli_config import (
     GEMINI_CODE_REVIEW_LIMIT,
     GEMINI_EXTRACT_STRUCTURED_LIMIT,
     GEMINI_GIT_DIFF_LIMIT,
-    FALLBACK_MODEL,
-    get_model_scaling_factor,
 )
 
 logger = logging.getLogger(__name__)
@@ -45,14 +45,10 @@ async def execute_code_review(
     Returns:
         JSON string with code review results
     """
-    model = "gemini-2.5-pro"
-    scaling_factor = get_model_scaling_factor(model)
-    effective_limit = int(GEMINI_CODE_REVIEW_LIMIT * scaling_factor)
-
-    if len(code) > effective_limit:
+    if len(code) > GEMINI_CODE_REVIEW_LIMIT:
         return json.dumps({
             "status": "error",
-            "error": f"Code exceeds limit of {effective_limit:,} characters",
+            "error": f"Code exceeds limit of {GEMINI_CODE_REVIEW_LIMIT:,} characters",
             "error_code": "INPUT_TOO_LARGE"
         })
 
@@ -76,12 +72,14 @@ Code:
 
 Provide analysis in {output_format} format with severity levels."""
 
-    args = ["--model", model, "--prompt", prompt]
+    cleaned_prompt, files = extract_file_refs(prompt)
+    args = _build_cli_args(prompt=cleaned_prompt, files=files)
 
     try:
-        result = await execute_gemini_with_retry(args, fallback_model=FALLBACK_MODEL)
+        result = await execute_cli_with_retry(args)
+        result["model_ignored"] = True
         return json.dumps(result, indent=2)
-    except (GeminiTimeoutError, GeminiRateLimitError, GeminiExecutionError) as e:
+    except (CLITimeoutError, CLIRateLimitError, CLIExecutionError) as e:
         return json.dumps({
             "status": "error",
             "error": str(e)
@@ -103,20 +101,16 @@ async def execute_extract_structured(
         schema: JSON schema for output
         examples: Optional examples
         strict_mode: Enforce strict schema compliance
-        model: Model to use
+        model: Model to use (ignored; kept for backward compatibility)
 
     Returns:
         JSON string with extracted data
     """
-    model = model or "gemini-2.5-flash"
-    scaling_factor = get_model_scaling_factor(model)
-    effective_limit = int(GEMINI_EXTRACT_STRUCTURED_LIMIT * scaling_factor)
-
     total_length = len(content) + len(schema) + len(examples or "")
-    if total_length > effective_limit:
+    if total_length > GEMINI_EXTRACT_STRUCTURED_LIMIT:
         return json.dumps({
             "status": "error",
-            "error": f"Input exceeds limit of {effective_limit:,} characters",
+            "error": f"Input exceeds limit of {GEMINI_EXTRACT_STRUCTURED_LIMIT:,} characters",
             "error_code": "INPUT_TOO_LARGE"
         })
 
@@ -151,12 +145,15 @@ Content:
 
 Return valid JSON matching the schema."""
 
-    args = ["--model", model, "--prompt", prompt]
+    cleaned_prompt, files = extract_file_refs(prompt)
+    args = _build_cli_args(prompt=cleaned_prompt, files=files)
 
     try:
-        result = await execute_gemini_with_retry(args, fallback_model=FALLBACK_MODEL)
+        result = await execute_cli_with_retry(args)
+        if model != "gemini-2.5-flash":
+            result["model_ignored"] = True
         return json.dumps(result, indent=2)
-    except (GeminiTimeoutError, GeminiRateLimitError, GeminiExecutionError) as e:
+    except (CLITimeoutError, CLIRateLimitError, CLIExecutionError) as e:
         return json.dumps({
             "status": "error",
             "error": str(e)
@@ -183,14 +180,10 @@ async def execute_git_diff_review(
     Returns:
         JSON string with diff analysis
     """
-    model = "gemini-2.5-pro"
-    scaling_factor = get_model_scaling_factor(model)
-    effective_limit = int(GEMINI_GIT_DIFF_LIMIT * scaling_factor)
-
-    if len(diff) > effective_limit:
+    if len(diff) > GEMINI_GIT_DIFF_LIMIT:
         return json.dumps({
             "status": "error",
-            "error": f"Diff exceeds limit of {effective_limit:,} characters",
+            "error": f"Diff exceeds limit of {GEMINI_GIT_DIFF_LIMIT:,} characters",
             "error_code": "INPUT_TOO_LARGE"
         })
 
@@ -217,12 +210,14 @@ Provide feedback on:
 3. Security implications
 4. Suggestions for improvement"""
 
-    args = ["--model", model, "--prompt", prompt]
+    cleaned_prompt, files = extract_file_refs(prompt)
+    args = _build_cli_args(prompt=cleaned_prompt, files=files)
 
     try:
-        result = await execute_gemini_with_retry(args, fallback_model=FALLBACK_MODEL)
+        result = await execute_cli_with_retry(args)
+        result["model_ignored"] = True
         return json.dumps(result, indent=2)
-    except (GeminiTimeoutError, GeminiRateLimitError, GeminiExecutionError) as e:
+    except (CLITimeoutError, CLIRateLimitError, CLIExecutionError) as e:
         return json.dumps({
             "status": "error",
             "error": str(e)

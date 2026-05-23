@@ -1,12 +1,13 @@
 """
-Utility modules for Gemini CLI MCP Server
+Utility modules for Antigravity CLI MCP Server
 """
-from .gemini_utils import (
-    execute_gemini,
-    execute_gemini_with_retry,
-    validate_gemini_setup,
+from .cli_utils import (
+    execute_cli,
+    execute_cli_with_retry,
+    validate_cli_setup,
     sanitize_output,
-    GeminiExecutionError,
-    GeminiTimeoutError,
-    GeminiRateLimitError,
+    extract_file_refs,
+    CLIExecutionError,
+    CLITimeoutError,
+    CLIRateLimitError,
 )

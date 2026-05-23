@@ -1,10 +1,10 @@
 """
-Gemini CLI MCP Server
+Antigravity CLI MCP Server
 
 A production-ready Model Context Protocol (MCP) server that bridges Google's
-Gemini CLI with MCP-compatible clients like Claude Code and Claude Desktop.
+Antigravity CLI (agy) with MCP-compatible clients like Claude Code and Claude Desktop.
 
-This server provides 33 specialized tools for seamless multi-AI workflows.
+This server provides 24 specialized tools for seamless AI workflows.
 """
 import sys
 from pathlib import Path
@@ -33,16 +33,18 @@ logger = logging.getLogger(__name__)
 mcp = FastMCP("gemini-cli-mcp-server")
 
 # Import utilities
-from modules.utils.gemini_utils import (
-    execute_gemini,
-    execute_gemini_with_retry,
-    get_gemini_help,
-    get_gemini_version,
+from modules.utils.cli_utils import (
+    execute_cli,
+    execute_cli_with_retry,
+    extract_file_refs,
+    _build_cli_args,
+    get_cli_help,
+    get_cli_version,
     get_metrics,
-    validate_gemini_setup,
-    GeminiExecutionError,
-    GeminiTimeoutError,
-    GeminiRateLimitError,
+    validate_cli_setup,
+    CLIExecutionError,
+    CLITimeoutError,
+    CLIRateLimitError,
 )
 
 # ============================================================================
@@ -52,17 +54,17 @@ from modules.utils.gemini_utils import (
 @mcp.tool()
 async def gemini_cli(command: str) -> str:
     """
-    Execute any Gemini CLI command directly with comprehensive error handling.
+    Execute any Antigravity CLI command directly with comprehensive error handling.
 
     Args:
-        command: The Gemini CLI command to execute (without the 'gemini' prefix)
+        command: The Antigravity CLI command to execute (without the 'agy' prefix)
 
     Returns:
         JSON string with status, stdout, stderr, and return_code
 
     Examples:
-        gemini_cli(command="--prompt 'Hello world'")
-        gemini_cli(command="--model gemini-2.5-pro --prompt 'Explain AI'")
+        gemini_cli(command="--print 'Hello world'")
+        gemini_cli(command="--print 'Explain AI' --add-dir src/")
     """
     if not command or not command.strip():
         return json.dumps({
@@ -82,21 +84,21 @@ async def gemini_cli(command: str) -> str:
         })
 
     try:
-        result = await execute_gemini_with_retry(args)
+        result = await execute_cli_with_retry(args)
         return json.dumps(result, indent=2)
-    except GeminiTimeoutError as e:
+    except CLITimeoutError as e:
         return json.dumps({
             "status": "error",
             "error": str(e),
             "error_code": "TIMEOUT"
         })
-    except GeminiRateLimitError as e:
+    except CLIRateLimitError as e:
         return json.dumps({
             "status": "error",
             "error": str(e),
             "error_code": "RATE_LIMIT"
         })
-    except GeminiExecutionError as e:
+    except CLIExecutionError as e:
         return json.dumps({
             "status": "error",
             "error": str(e),
@@ -114,18 +116,18 @@ async def gemini_cli(command: str) -> str:
 @mcp.tool()
 async def gemini_help() -> str:
     """
-    Get cached Gemini CLI help information (30-minute TTL).
+    Get cached Antigravity CLI help information (30-minute TTL).
 
     Returns:
-        Gemini CLI help text
+        Antigravity CLI help text
 
     Examples:
         gemini_help()
     """
     try:
-        help_text = await get_gemini_help()
+        help_text = await get_cli_help()
         return help_text
-    except GeminiExecutionError as e:
+    except CLIExecutionError as e:
         return json.dumps({
             "status": "error",
             "error": str(e),
@@ -143,18 +145,18 @@ async def gemini_help() -> str:
 @mcp.tool()
 async def gemini_version() -> str:
     """
-    Get cached Gemini CLI version information (30-minute TTL).
+    Get cached Antigravity CLI version information (30-minute TTL).
 
     Returns:
-        Gemini CLI version information
+        Antigravity CLI version information
 
     Examples:
         gemini_version()
     """
     try:
-        version_text = await get_gemini_version()
+        version_text = await get_cli_version()
         return version_text
-    except GeminiExecutionError as e:
+    except CLIExecutionError as e:
         return json.dumps({
             "status": "error",
             "error": str(e),
@@ -175,7 +177,7 @@ async def gemini_version() -> str:
 
 # Import configuration when available
 try:
-    from modules.config.gemini_config import (
+    from modules.config.cli_config import (
         GEMINI_PROMPT_LIMIT,
         GEMINI_SANDBOX_LIMIT,
         GEMINI_SUMMARIZE_LIMIT,
@@ -185,8 +187,6 @@ try:
         GEMINI_VERIFY_LIMIT,
         GEMINI_COLLABORATION_LIMIT,
         DEFAULT_MODEL,
-        FALLBACK_MODEL,
-        get_model_scaling_factor,
     )
 except ImportError:
     # Default limits if config not yet available
@@ -199,10 +199,6 @@ except ImportError:
     GEMINI_VERIFY_LIMIT = 800000
     GEMINI_COLLABORATION_LIMIT = 500000
     DEFAULT_MODEL = "gemini-2.5-flash"
-    FALLBACK_MODEL = "gemini-2.5-flash"
-
-    def get_model_scaling_factor(model: str) -> float:
-        return 1.0
 
 
 @mcp.tool()
@@ -216,58 +212,50 @@ async def gemini_prompt(
     Send prompts with structured parameters and validation (100,000 char limit).
 
     Args:
-        prompt: The prompt to send to Gemini
-        model: Optional model to use (default: gemini-2.5-flash)
+        prompt: The prompt to send to Antigravity CLI
+        model: Optional model to use (ignored; kept for backward compatibility)
         sandbox: Whether to run in sandbox mode
-        debug: Whether to enable debug output
+        debug: Whether to enable debug output (ignored for agy)
 
     Returns:
         JSON string with the response
 
     Examples:
         gemini_prompt(prompt="Explain quantum computing")
-        gemini_prompt(prompt="Analyze this code", model="gemini-2.5-pro")
+        gemini_prompt(prompt="Analyze @src/auth.py")
     """
-    model = model or DEFAULT_MODEL
-    scaling_factor = get_model_scaling_factor(model)
-    effective_limit = int(GEMINI_PROMPT_LIMIT * scaling_factor)
-
-    if len(prompt) > effective_limit:
+    if len(prompt) > GEMINI_PROMPT_LIMIT:
         return json.dumps({
             "status": "error",
-            "error": f"Prompt exceeds limit of {effective_limit:,} characters "
+            "error": f"Prompt exceeds limit of {GEMINI_PROMPT_LIMIT:,} characters "
                      f"(got {len(prompt):,})",
             "error_code": "INPUT_TOO_LARGE"
         })
 
-    args = []
-    if model:
-        args.extend(["--model", model])
-    if sandbox:
-        args.append("--sandbox")
-    if debug:
-        args.append("--debug")
-    args.extend(["--prompt", prompt])
+    cleaned_prompt, files = extract_file_refs(prompt)
+    args = _build_cli_args(
+        prompt=cleaned_prompt,
+        sandbox=sandbox,
+        debug=debug,
+        files=files
+    )
 
     try:
-        result = await execute_gemini_with_retry(
-            args,
-            fallback_model=FALLBACK_MODEL if model != FALLBACK_MODEL else None
-        )
+        result = await execute_cli_with_retry(args)
         return json.dumps(result, indent=2)
-    except GeminiTimeoutError as e:
+    except CLITimeoutError as e:
         return json.dumps({
             "status": "error",
             "error": str(e),
             "error_code": "TIMEOUT"
         })
-    except GeminiRateLimitError as e:
+    except CLIRateLimitError as e:
         return json.dumps({
             "status": "error",
             "error": str(e),
             "error_code": "RATE_LIMIT"
         })
-    except GeminiExecutionError as e:
+    except CLIExecutionError as e:
         return json.dumps({
             "status": "error",
             "error": str(e),
@@ -278,53 +266,20 @@ async def gemini_prompt(
 @mcp.tool()
 async def gemini_models() -> str:
     """
-    List all available Gemini AI models.
+    List all available AI models.
 
     Returns:
-        List of available models with their capabilities
+        Note that Antigravity CLI manages models internally.
 
     Examples:
         gemini_models()
     """
-    # Import model config when available
-    try:
-        from modules.config.model_config import GEMINI_MODELS
-        return json.dumps({
-            "status": "success",
-            "models": GEMINI_MODELS
-        }, indent=2)
-    except ImportError:
-        # Default model list
-        models = {
-            "gemini-2.5-pro": {
-                "description": "Most capable model for complex tasks",
-                "context_window": "1M tokens",
-                "scaling_factor": 1.0,
-                "best_for": ["complex analysis", "code review", "creative tasks"]
-            },
-            "gemini-2.5-flash": {
-                "description": "Fast, efficient model for most tasks",
-                "context_window": "1M tokens",
-                "scaling_factor": 1.0,
-                "best_for": ["quick responses", "simple tasks", "high throughput"]
-            },
-            "gemini-1.5-pro": {
-                "description": "Stable production model",
-                "context_window": "128K tokens",
-                "scaling_factor": 0.8,
-                "best_for": ["production workloads", "reliability"]
-            },
-            "gemini-1.5-flash": {
-                "description": "Fast model for simpler tasks",
-                "context_window": "128K tokens",
-                "scaling_factor": 0.6,
-                "best_for": ["speed-critical tasks", "simple queries"]
-            }
-        }
-        return json.dumps({
-            "status": "success",
-            "models": models
-        }, indent=2)
+    return json.dumps({
+        "status": "success",
+        "note": "Antigravity CLI manages models internally. "
+                "No explicit model selection is available via this server. "
+                "Use 'agy' directly to inspect available models.",
+    }, indent=2)
 
 
 @mcp.tool()
@@ -342,7 +297,7 @@ async def gemini_metrics() -> str:
         metrics = get_metrics()
 
         # Add cache-specific stats
-        from modules.utils.gemini_utils import HELP_CACHE, VERSION_CACHE, PROMPT_CACHE
+        from modules.utils.cli_utils import HELP_CACHE, VERSION_CACHE, PROMPT_CACHE
 
         cache_stats = {
             "help_cache": {
@@ -368,7 +323,7 @@ async def gemini_metrics() -> str:
             "cache_stats": cache_stats,
             "server_info": {
                 "name": "gemini-cli-mcp-server",
-                "tools_available": 33,
+                "tools_available": 24,
                 "python_version": os.sys.version
             }
         }, indent=2)
@@ -406,30 +361,28 @@ async def gemini_sandbox(
         gemini_sandbox(prompt="Write and run a Python script to analyze data")
         gemini_sandbox(prompt="Test this code", sandbox_image="node:18-alpine")
     """
-    model = model or "gemini-2.5-pro"
-    scaling_factor = get_model_scaling_factor(model)
-    effective_limit = int(GEMINI_SANDBOX_LIMIT * scaling_factor)
-
-    if len(prompt) > effective_limit:
+    if len(prompt) > GEMINI_SANDBOX_LIMIT:
         return json.dumps({
             "status": "error",
-            "error": f"Prompt exceeds limit of {effective_limit:,} characters",
+            "error": f"Prompt exceeds limit of {GEMINI_SANDBOX_LIMIT:,} characters",
             "error_code": "INPUT_TOO_LARGE"
         })
 
-    args = ["--model", model, "--sandbox"]
-    if sandbox_image:
-        args.extend(["--sandbox-image", sandbox_image])
-    args.extend(["--prompt", prompt])
+    cleaned_prompt, files = extract_file_refs(prompt)
+    args = _build_cli_args(
+        prompt=cleaned_prompt,
+        sandbox=True,
+        files=files
+    )
 
     try:
-        result = await execute_gemini_with_retry(args, fallback_model=FALLBACK_MODEL)
+        result = await execute_cli_with_retry(args)
         return json.dumps(result, indent=2)
-    except (GeminiTimeoutError, GeminiRateLimitError, GeminiExecutionError) as e:
+    except (CLITimeoutError, CLIRateLimitError, CLIExecutionError) as e:
         return json.dumps({
             "status": "error",
             "error": str(e),
-            "error_code": type(e).__name__.replace("Gemini", "").replace("Error", "").upper()
+            "error_code": type(e).__name__.replace("CLI", "").replace("Error", "").upper()
         })
 
 
@@ -444,7 +397,7 @@ async def gemini_cache_stats() -> str:
     Examples:
         gemini_cache_stats()
     """
-    from modules.utils.gemini_utils import HELP_CACHE, VERSION_CACHE, PROMPT_CACHE
+    from modules.utils.cli_utils import HELP_CACHE, VERSION_CACHE, PROMPT_CACHE
 
     stats = {
         "help_cache": {
@@ -466,13 +419,6 @@ async def gemini_cache_stats() -> str:
             "item_count": len(PROMPT_CACHE)
         }
     }
-
-    # Try to get Redis cache stats if available
-    try:
-        from modules.services.redis_cache import get_redis_stats
-        stats["redis_cache"] = get_redis_stats()
-    except ImportError:
-        stats["redis_cache"] = {"status": "not_configured"}
 
     return json.dumps({
         "status": "success",
@@ -499,13 +445,6 @@ async def gemini_rate_limiting_stats() -> str:
         "commands_executed": metrics.get("commands_executed", 0),
         "success_rate": metrics.get("success_rate", 0),
     }
-
-    # Try to get per-model rate limiting stats
-    try:
-        from modules.services.per_model_rate_limiter import get_rate_limit_stats
-        rate_stats["per_model_stats"] = get_rate_limit_stats()
-    except ImportError:
-        rate_stats["per_model_stats"] = {"status": "not_configured"}
 
     return json.dumps({
         "status": "success",
@@ -537,14 +476,10 @@ async def gemini_summarize(
     Examples:
         gemini_summarize(content="@src/ @tests/", focus="architecture")
     """
-    model = model or "gemini-2.5-pro"
-    scaling_factor = get_model_scaling_factor(model)
-    effective_limit = int(GEMINI_SUMMARIZE_LIMIT * scaling_factor)
-
-    if len(content) > effective_limit:
+    if len(content) > GEMINI_SUMMARIZE_LIMIT:
         return json.dumps({
             "status": "error",
-            "error": f"Content exceeds limit of {effective_limit:,} characters",
+            "error": f"Content exceeds limit of {GEMINI_SUMMARIZE_LIMIT:,} characters",
             "error_code": "INPUT_TOO_LARGE"
         })
 
@@ -557,12 +492,13 @@ async def gemini_summarize(
         focus_text = f" Focus on: {focus}" if focus else ""
         prompt = f"Please summarize the following content.{focus_text}\n\n{content}"
 
-    args = ["--model", model, "--prompt", prompt]
+    cleaned_prompt, files = extract_file_refs(prompt)
+    args = _build_cli_args(prompt=cleaned_prompt, files=files)
 
     try:
-        result = await execute_gemini_with_retry(args, fallback_model=FALLBACK_MODEL)
+        result = await execute_cli_with_retry(args)
         return json.dumps(result, indent=2)
-    except (GeminiTimeoutError, GeminiRateLimitError, GeminiExecutionError) as e:
+    except (CLITimeoutError, CLIRateLimitError, CLIExecutionError) as e:
         return json.dumps({
             "status": "error",
             "error": str(e)
@@ -589,14 +525,10 @@ async def gemini_summarize_files(
     Examples:
         gemini_summarize_files(files="@src/ @docs/ @tests/", focus="complete system analysis")
     """
-    model = model or "gemini-2.5-pro"
-    scaling_factor = get_model_scaling_factor(model)
-    effective_limit = int(GEMINI_SUMMARIZE_FILES_LIMIT * scaling_factor)
-
-    if len(files) > effective_limit:
+    if len(files) > GEMINI_SUMMARIZE_FILES_LIMIT:
         return json.dumps({
             "status": "error",
-            "error": f"Files specification exceeds limit of {effective_limit:,} characters",
+            "error": f"Files specification exceeds limit of {GEMINI_SUMMARIZE_FILES_LIMIT:,} characters",
             "error_code": "INPUT_TOO_LARGE"
         })
 
@@ -604,12 +536,13 @@ async def gemini_summarize_files(
     focus_text = f" Focus on: {focus}" if focus else ""
     prompt = f"Analyze and summarize the following files.{focus_text}\n\n{files}"
 
-    args = ["--model", model, "--prompt", prompt]
+    cleaned_prompt, files = extract_file_refs(prompt)
+    args = _build_cli_args(prompt=cleaned_prompt, files=files)
 
     try:
-        result = await execute_gemini_with_retry(args, fallback_model=FALLBACK_MODEL)
+        result = await execute_cli_with_retry(args)
         return json.dumps(result, indent=2)
-    except (GeminiTimeoutError, GeminiRateLimitError, GeminiExecutionError) as e:
+    except (CLITimeoutError, CLIRateLimitError, CLIExecutionError) as e:
         return json.dumps({
             "status": "error",
             "error": str(e)
@@ -638,15 +571,11 @@ async def gemini_eval_plan(
     Examples:
         gemini_eval_plan(plan="1. Create JWT auth...", context="Express.js API")
     """
-    model = model or "gemini-2.5-pro"
-    scaling_factor = get_model_scaling_factor(model)
-    effective_limit = int(GEMINI_EVAL_LIMIT * scaling_factor)
-
     total_length = len(plan) + len(context or "") + len(requirements or "")
-    if total_length > effective_limit:
+    if total_length > GEMINI_EVAL_LIMIT:
         return json.dumps({
             "status": "error",
-            "error": f"Input exceeds limit of {effective_limit:,} characters",
+            "error": f"Input exceeds limit of {GEMINI_EVAL_LIMIT:,} characters",
             "error_code": "INPUT_TOO_LARGE"
         })
 
@@ -669,12 +598,13 @@ Provide a detailed analysis with:
 3. Missing considerations
 4. Recommendations"""
 
-    args = ["--model", model, "--prompt", prompt]
+    cleaned_prompt, files = extract_file_refs(prompt)
+    args = _build_cli_args(prompt=cleaned_prompt, files=files)
 
     try:
-        result = await execute_gemini_with_retry(args, fallback_model=FALLBACK_MODEL)
+        result = await execute_cli_with_retry(args)
         return json.dumps(result, indent=2)
-    except (GeminiTimeoutError, GeminiRateLimitError, GeminiExecutionError) as e:
+    except (CLITimeoutError, CLIRateLimitError, CLIExecutionError) as e:
         return json.dumps({
             "status": "error",
             "error": str(e)
@@ -705,15 +635,11 @@ async def gemini_review_code(
     Examples:
         gemini_review_code(code="@src/auth.py", purpose="Security review", language="python")
     """
-    model = model or "gemini-2.5-pro"
-    scaling_factor = get_model_scaling_factor(model)
-    effective_limit = int(GEMINI_REVIEW_LIMIT * scaling_factor)
-
     total_length = len(code) + len(purpose or "") + len(context or "")
-    if total_length > effective_limit:
+    if total_length > GEMINI_REVIEW_LIMIT:
         return json.dumps({
             "status": "error",
-            "error": f"Input exceeds limit of {effective_limit:,} characters",
+            "error": f"Input exceeds limit of {GEMINI_REVIEW_LIMIT:,} characters",
             "error_code": "INPUT_TOO_LARGE"
         })
 
@@ -737,12 +663,13 @@ Provide a detailed review covering:
 4. Performance considerations
 5. Recommendations"""
 
-    args = ["--model", model, "--prompt", prompt]
+    cleaned_prompt, files = extract_file_refs(prompt)
+    args = _build_cli_args(prompt=cleaned_prompt, files=files)
 
     try:
-        result = await execute_gemini_with_retry(args, fallback_model=FALLBACK_MODEL)
+        result = await execute_cli_with_retry(args)
         return json.dumps(result, indent=2)
-    except (GeminiTimeoutError, GeminiRateLimitError, GeminiExecutionError) as e:
+    except (CLITimeoutError, CLIRateLimitError, CLIExecutionError) as e:
         return json.dumps({
             "status": "error",
             "error": str(e)
@@ -773,16 +700,12 @@ async def gemini_verify_solution(
     Examples:
         gemini_verify_solution(solution="...", requirements="Auth system", test_criteria="99.9% uptime")
     """
-    model = model or "gemini-2.5-pro"
-    scaling_factor = get_model_scaling_factor(model)
-    effective_limit = int(GEMINI_VERIFY_LIMIT * scaling_factor)
-
     total_length = (len(solution) + len(requirements or "") +
                     len(test_criteria or "") + len(context or ""))
-    if total_length > effective_limit:
+    if total_length > GEMINI_VERIFY_LIMIT:
         return json.dumps({
             "status": "error",
-            "error": f"Input exceeds limit of {effective_limit:,} characters",
+            "error": f"Input exceeds limit of {GEMINI_VERIFY_LIMIT:,} characters",
             "error_code": "INPUT_TOO_LARGE"
         })
 
@@ -807,12 +730,13 @@ Verify:
 5. Test coverage adequacy
 6. Production readiness"""
 
-    args = ["--model", model, "--prompt", prompt]
+    cleaned_prompt, files = extract_file_refs(prompt)
+    args = _build_cli_args(prompt=cleaned_prompt, files=files)
 
     try:
-        result = await execute_gemini_with_retry(args, fallback_model=FALLBACK_MODEL)
+        result = await execute_cli_with_retry(args)
         return json.dumps(result, indent=2)
-    except (GeminiTimeoutError, GeminiRateLimitError, GeminiExecutionError) as e:
+    except (CLITimeoutError, CLIRateLimitError, CLIExecutionError) as e:
         return json.dumps({
             "status": "error",
             "error": str(e)
@@ -909,8 +833,9 @@ async def gemini_continue_conversation(
         return json.dumps(result, indent=2)
     except ImportError:
         # Fallback - just execute prompt without history
-        args = ["--model", model, "--prompt", prompt]
-        result = await execute_gemini_with_retry(args, fallback_model=FALLBACK_MODEL)
+        cleaned_prompt, files = extract_file_refs(prompt)
+        args = _build_cli_args(prompt=cleaned_prompt, files=files)
+        result = await execute_cli_with_retry(args)
         return json.dumps({
             "status": "success",
             "conversation_id": conversation_id,
@@ -1063,8 +988,9 @@ Code:
 
 Provide analysis in {output_format} format with severity levels."""
 
-        args = ["--model", model, "--prompt", prompt]
-        result = await execute_gemini_with_retry(args)
+        cleaned_prompt, files = extract_file_refs(prompt)
+        args = _build_cli_args(prompt=cleaned_prompt, files=files)
+        result = await execute_cli_with_retry(args)
         return json.dumps(result, indent=2)
 
 
@@ -1116,8 +1042,9 @@ Content:
 
 Return valid JSON matching the schema."""
 
-        args = ["--model", model, "--prompt", prompt]
-        result = await execute_gemini_with_retry(args)
+        cleaned_prompt, files = extract_file_refs(prompt)
+        args = _build_cli_args(prompt=cleaned_prompt, files=files)
+        result = await execute_cli_with_retry(args)
         return json.dumps(result, indent=2)
 
 
@@ -1170,8 +1097,9 @@ Provide feedback on:
 3. Security implications
 4. Suggestions for improvement"""
 
-        args = ["--model", model, "--prompt", prompt]
-        result = await execute_gemini_with_retry(args)
+        cleaned_prompt, files = extract_file_refs(prompt)
+        args = _build_cli_args(prompt=cleaned_prompt, files=files)
+        result = await execute_cli_with_retry(args)
         return json.dumps(result, indent=2)
 
 
@@ -1223,232 +1151,14 @@ Sources:
 
 Provide a {output_format} comparison{"with similarity metrics" if include_metrics else ""}."""
 
-        args = ["--model", model, "--prompt", prompt]
-        result = await execute_gemini_with_retry(args)
+        cleaned_prompt, files = extract_file_refs(prompt)
+        args = _build_cli_args(prompt=cleaned_prompt, files=files)
+        result = await execute_cli_with_retry(args)
         return json.dumps(result, indent=2)
 
 
 # ============================================================================
-# PHASE 8: OpenRouter Integration
-# ============================================================================
-
-@mcp.tool()
-async def gemini_test_openrouter() -> str:
-    """
-    Test OpenRouter connectivity and client functionality.
-
-    Returns:
-        JSON with test results
-
-    Examples:
-        gemini_test_openrouter()
-    """
-    try:
-        from modules.services.openrouter_client import OpenRouterClient
-        client = OpenRouterClient()
-        result = await client.test_connection()
-        return json.dumps({
-            "status": "success",
-            "test_results": result
-        }, indent=2)
-    except ImportError:
-        return json.dumps({
-            "status": "error",
-            "error": "OpenRouter client not configured",
-            "hint": "Set OPENROUTER_API_KEY environment variable"
-        }, indent=2)
-    except Exception as e:
-        return json.dumps({
-            "status": "error",
-            "error": str(e)
-        }, indent=2)
-
-
-@mcp.tool()
-async def gemini_openrouter_opinion(
-    prompt: str,
-    model: Optional[str] = None,
-    temperature: float = 0.7,
-    max_tokens: int = 2000,
-    file_handling_strategy: str = "auto"
-) -> str:
-    """
-    Get responses from any of 400+ AI models via OpenRouter (150,000 char limit).
-
-    Args:
-        prompt: The prompt (supports @filename syntax)
-        model: OpenRouter model ID (e.g., "anthropic/claude-3-haiku")
-        temperature: Sampling temperature (0.0-2.0)
-        max_tokens: Maximum tokens in response
-        file_handling_strategy: Strategy for large files (auto, full, chunk, summarize)
-
-    Returns:
-        JSON with model response
-
-    Examples:
-        gemini_openrouter_opinion(prompt="Analyze @config.yaml", model="anthropic/claude-3-haiku")
-    """
-    try:
-        from modules.services.openrouter_client import OpenRouterClient
-        client = OpenRouterClient()
-        result = await client.get_opinion(
-            prompt=prompt,
-            model=model,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            file_handling_strategy=file_handling_strategy
-        )
-        return json.dumps(result, indent=2)
-    except ImportError:
-        return json.dumps({
-            "status": "error",
-            "error": "OpenRouter client not configured",
-            "hint": "Set OPENROUTER_API_KEY environment variable"
-        }, indent=2)
-    except Exception as e:
-        return json.dumps({
-            "status": "error",
-            "error": str(e)
-        }, indent=2)
-
-
-@mcp.tool()
-async def gemini_openrouter_models(
-    category: Optional[str] = None,
-    provider_filter: Optional[str] = None,
-    sort_by: str = "usage",
-    include_pricing: bool = True
-) -> str:
-    """
-    List all available OpenRouter models (400+).
-
-    Args:
-        category: Filter by category (programming, creative, general, etc.)
-        provider_filter: Filter by provider (openai, anthropic, meta, etc.)
-        sort_by: Sort order (usage, price, name, context_length)
-        include_pricing: Include pricing information
-
-    Returns:
-        JSON with model list
-
-    Examples:
-        gemini_openrouter_models(provider_filter="openai", include_pricing=True)
-    """
-    try:
-        from modules.services.openrouter_client import OpenRouterClient
-        client = OpenRouterClient()
-        result = await client.list_models(
-            category=category,
-            provider_filter=provider_filter,
-            sort_by=sort_by,
-            include_pricing=include_pricing
-        )
-        return json.dumps(result, indent=2)
-    except ImportError:
-        return json.dumps({
-            "status": "error",
-            "error": "OpenRouter client not configured"
-        }, indent=2)
-    except Exception as e:
-        return json.dumps({
-            "status": "error",
-            "error": str(e)
-        }, indent=2)
-
-
-@mcp.tool()
-async def gemini_cross_model_comparison(
-    prompt: str,
-    models: str = "gemini-2.5-flash,openai/gpt-4.1-mini,anthropic/claude-3-haiku"
-) -> str:
-    """
-    Compare responses across Gemini CLI and OpenRouter models.
-
-    Args:
-        prompt: The prompt to send to all models
-        models: Comma-separated list of models
-
-    Returns:
-        JSON with comparison results
-
-    Examples:
-        gemini_cross_model_comparison(prompt="Design a REST API", models="gemini-2.5-flash,openai/gpt-4.1-mini")
-    """
-    model_list = [m.strip() for m in models.split(",")]
-    results = {}
-
-    for model in model_list:
-        try:
-            if model.startswith("gemini"):
-                # Use Gemini CLI
-                args = ["--model", model, "--prompt", prompt]
-                result = await execute_gemini_with_retry(args)
-                results[model] = {
-                    "status": "success",
-                    "response": result.get("stdout", ""),
-                    "source": "gemini_cli"
-                }
-            else:
-                # Use OpenRouter
-                try:
-                    from modules.services.openrouter_client import OpenRouterClient
-                    client = OpenRouterClient()
-                    result = await client.get_opinion(prompt=prompt, model=model)
-                    results[model] = {
-                        "status": "success",
-                        "response": result.get("content", ""),
-                        "source": "openrouter"
-                    }
-                except ImportError:
-                    results[model] = {
-                        "status": "error",
-                        "error": "OpenRouter not configured"
-                    }
-        except Exception as e:
-            results[model] = {
-                "status": "error",
-                "error": str(e)
-            }
-
-    return json.dumps({
-        "status": "success",
-        "prompt": prompt[:500] + "..." if len(prompt) > 500 else prompt,
-        "comparisons": results
-    }, indent=2)
-
-
-@mcp.tool()
-async def gemini_openrouter_usage_stats() -> str:
-    """
-    Get OpenRouter usage statistics and costs for the current session.
-
-    Returns:
-        JSON with usage statistics
-
-    Examples:
-        gemini_openrouter_usage_stats()
-    """
-    try:
-        from modules.services.openrouter_client import OpenRouterClient
-        client = OpenRouterClient()
-        stats = client.get_usage_stats()
-        return json.dumps({
-            "status": "success",
-            "usage_statistics": stats
-        }, indent=2)
-    except ImportError:
-        return json.dumps({
-            "status": "success",
-            "usage_statistics": {
-                "total_requests": 0,
-                "total_cost": 0.0,
-                "note": "OpenRouter not configured"
-            }
-        }, indent=2)
-
-
-# ============================================================================
-# PHASE 9: AI Collaboration Engine
+# PHASE 8: AI Collaboration Engine
 # ============================================================================
 
 @mcp.tool()
@@ -1483,7 +1193,7 @@ async def gemini_ai_collaboration(
         models: Comma-separated model list
         context: Additional context
         conversation_id: For stateful conversations
-        budget_limit: USD cost limit for OpenRouter
+        budget_limit: Deprecated (agy does not support cost budgeting)
         pipeline_stages: Stages for sequential mode
         handoff_criteria: Handoff criteria for sequential
         quality_gates: Quality gates for sequential
@@ -1537,12 +1247,14 @@ async def gemini_ai_collaboration(
             }.get(collaboration_mode, content)
 
             if model.startswith("gemini"):
-                args = ["--model", model, "--prompt", mode_prompt]
+                cleaned_prompt, files = extract_file_refs(mode_prompt)
+                args = _build_cli_args(prompt=cleaned_prompt, files=files)
                 try:
-                    result = await execute_gemini_with_retry(args)
+                    result = await execute_cli_with_retry(args)
                     results.append({
                         "model": model,
-                        "response": result.get("stdout", "")
+                        "response": result.get("stdout", ""),
+                        "model_ignored": True,
                     })
                 except Exception as e:
                     results.append({"model": model, "error": str(e)})
@@ -1560,13 +1272,13 @@ async def gemini_ai_collaboration(
 
 def main():
     """Run the MCP server."""
-    logger.info("Starting Gemini CLI MCP Server")
+    logger.info("Starting Antigravity CLI MCP Server")
     logger.info(f"Log level: {log_level}")
 
-    if validate_gemini_setup():
-        logger.info("Gemini CLI setup validated successfully")
+    if validate_cli_setup():
+        logger.info("Antigravity CLI setup validated successfully")
     else:
-        logger.warning("Gemini CLI not found - some features may not work")
+        logger.warning("Antigravity CLI not found - some features may not work")
 
     mcp.run()
 

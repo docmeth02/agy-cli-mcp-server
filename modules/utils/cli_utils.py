@@ -1,23 +1,27 @@
 """
-Core utilities for Gemini CLI subprocess execution.
+Core utilities for Antigravity CLI (agy) subprocess execution.
 
-This module provides the foundational functions for executing Gemini CLI commands
-with proper error handling, retry logic, and output sanitization.
+This module provides the foundational functions for executing agy commands
+with proper error handling, retry logic, output sanitization, and file
+reference expansion (@filename → --add-dir).
 """
 import asyncio
+import glob
 import os
+import random
 import re
 import shutil
 import time
 import logging
+from pathlib import Path
 from typing import Optional
 from cachetools import TTLCache
 
 logger = logging.getLogger(__name__)
 
 # Configuration from environment
-GEMINI_TIMEOUT = int(os.getenv("GEMINI_TIMEOUT", "300"))
-GEMINI_COMMAND_PATH = os.getenv("GEMINI_COMMAND_PATH", "gemini")
+CLI_TIMEOUT = int(os.getenv("CLI_TIMEOUT", os.getenv("GEMINI_TIMEOUT", "300")))
+CLI_COMMAND_PATH = os.getenv("CLI_COMMAND_PATH", os.getenv("GEMINI_COMMAND_PATH", "agy"))
 RETRY_MAX_ATTEMPTS = int(os.getenv("RETRY_MAX_ATTEMPTS", "3"))
 RETRY_BASE_DELAY = float(os.getenv("RETRY_BASE_DELAY", "1.0"))
 RETRY_MAX_DELAY = float(os.getenv("RETRY_MAX_DELAY", "30.0"))
@@ -41,28 +45,28 @@ METRICS = {
 }
 
 
-class GeminiExecutionError(Exception):
-    """Base exception for Gemini execution errors."""
+class CLIExecutionError(Exception):
+    """Base exception for CLI execution errors."""
     pass
 
 
-class GeminiTimeoutError(GeminiExecutionError):
-    """Raised when Gemini CLI command times out."""
+class CLITimeoutError(CLIExecutionError):
+    """Raised when CLI command times out."""
     pass
 
 
-class GeminiRateLimitError(GeminiExecutionError):
+class CLIRateLimitError(CLIExecutionError):
     """Raised when rate limits are exceeded."""
     pass
 
 
-def validate_gemini_setup() -> bool:
-    """Validate that Gemini CLI is properly installed and configured."""
-    gemini_path = shutil.which(GEMINI_COMMAND_PATH)
-    if not gemini_path:
-        logger.error(f"Gemini CLI not found at: {GEMINI_COMMAND_PATH}")
+def validate_cli_setup() -> bool:
+    """Validate that Antigravity CLI is properly installed and configured."""
+    cli_path = shutil.which(CLI_COMMAND_PATH)
+    if not cli_path:
+        logger.error(f"Antigravity CLI not found at: {CLI_COMMAND_PATH}")
         return False
-    logger.info(f"Gemini CLI found at: {gemini_path}")
+    logger.info(f"Antigravity CLI found at: {cli_path}")
     return True
 
 
@@ -71,7 +75,7 @@ def sanitize_output(output: str) -> str:
     Sanitize output to remove potentially sensitive information.
 
     Args:
-        output: Raw output string from Gemini CLI
+        output: Raw output string from CLI
 
     Returns:
         Sanitized output string
@@ -85,77 +89,117 @@ def sanitize_output(output: str) -> str:
     return output
 
 
-def _build_gemini_args(
-    command: Optional[str] = None,
-    prompt: Optional[str] = None,
-    model: Optional[str] = None,
+def extract_file_refs(prompt: str) -> tuple[str, list[str]]:
+    """
+    Extract @filename references from prompt and expand globs.
+
+    Antigravity CLI uses --add-dir for file context instead of inline
+    @filename syntax. This function extracts @path tokens, expands
+    wildcards with glob, and returns a cleaned prompt plus resolved paths.
+
+    Args:
+        prompt: Raw prompt string potentially containing @refs
+
+    Returns:
+        Tuple of (cleaned_prompt, list_of_resolved_paths)
+    """
+    pattern = r'@([^\s]+)'
+    matches = re.findall(pattern, prompt)
+
+    # Remove @prefix from prompt (keep the path text for context)
+    cleaned = re.sub(pattern, r'\1', prompt)
+
+    paths: list[str] = []
+    for raw_path in set(matches):
+        # Expand globs
+        expanded = glob.glob(raw_path)
+        if expanded:
+            for p in expanded:
+                path_obj = Path(p)
+                if path_obj.exists():
+                    paths.append(str(path_obj.resolve()))
+        else:
+            # Try as-is if no glob match
+            path_obj = Path(raw_path)
+            if path_obj.exists():
+                paths.append(str(path_obj.resolve()))
+
+    # Deduplicate while preserving order
+    seen = set()
+    unique_paths: list[str] = []
+    for p in paths:
+        if p not in seen:
+            seen.add(p)
+            unique_paths.append(p)
+
+    return cleaned, unique_paths
+
+
+def _build_cli_args(
+    prompt: str,
     sandbox: bool = False,
-    sandbox_image: Optional[str] = None,
     debug: bool = False,
-    extra_args: Optional[list] = None
+    files: Optional[list[str]] = None,
+    conversation_id: Optional[str] = None,
+    continue_conversation: bool = False,
 ) -> list[str]:
-    """Build argument list for Gemini CLI execution."""
-    args = []
+    """Build argument list for Antigravity CLI execution."""
+    args: list[str] = []
 
-    if command:
-        # Direct command - split by space but preserve quoted strings
-        import shlex
-        try:
-            args.extend(shlex.split(command))
-        except ValueError:
-            args.extend(command.split())
-    else:
-        # Structured command building
-        if model:
-            args.extend(["--model", model])
+    # Always skip permissions for MCP automation
+    args.append("--dangerously-skip-permissions")
 
-        if sandbox:
-            args.append("--sandbox")
-            if sandbox_image:
-                args.extend(["--sandbox-image", sandbox_image])
+    # Attach files via --add-dir (replaces @filename)
+    for f in (files or []):
+        args.extend(["--add-dir", f])
 
-        if debug:
-            args.append("--debug")
+    if sandbox:
+        args.append("--sandbox")
 
-        if prompt:
-            args.extend(["--prompt", prompt])
+    if debug:
+        # agy --debug is hidden/undocumented and produces a system report.
+        # We ignore it for normal execution and log a warning.
+        logger.warning("debug=True ignored: agy --debug produces a system report instead of answering prompts")
 
-    if extra_args:
-        args.extend(extra_args)
+    if conversation_id:
+        args.extend(["--conversation", conversation_id])
+    elif continue_conversation:
+        args.append("--continue")
 
+    args.extend(["--print", prompt])
     return args
 
 
-async def execute_gemini(
+async def execute_cli(
     args: list[str],
     timeout: Optional[int] = None,
     capture_stderr: bool = True
 ) -> dict:
     """
-    Execute Gemini CLI command asynchronously.
+    Execute Antigravity CLI command asynchronously.
 
     Args:
-        args: Command line arguments for Gemini CLI
-        timeout: Optional timeout in seconds (defaults to GEMINI_TIMEOUT)
+        args: Command line arguments for agy
+        timeout: Optional timeout in seconds (defaults to CLI_TIMEOUT)
         capture_stderr: Whether to capture stderr output
 
     Returns:
         Dictionary with status, stdout, stderr, and return_code
 
     Raises:
-        GeminiTimeoutError: If command times out
-        GeminiExecutionError: If command fails to execute
+        CLITimeoutError: If command times out
+        CLIExecutionError: If command fails to execute
     """
-    timeout = timeout or GEMINI_TIMEOUT
+    timeout = timeout or CLI_TIMEOUT
     start_time = time.time()
 
     METRICS["commands_executed"] += 1
 
     try:
-        logger.debug(f"Executing: {GEMINI_COMMAND_PATH} {' '.join(args)}")
+        logger.debug(f"Executing: {CLI_COMMAND_PATH} {' '.join(args)}")
 
         process = await asyncio.create_subprocess_exec(
-            GEMINI_COMMAND_PATH,
+            CLI_COMMAND_PATH,
             *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE if capture_stderr else None,
@@ -170,7 +214,7 @@ async def execute_gemini(
             process.kill()
             await process.wait()
             METRICS["commands_failed"] += 1
-            raise GeminiTimeoutError(
+            raise CLITimeoutError(
                 f"Command timed out after {timeout} seconds"
             )
 
@@ -182,21 +226,24 @@ async def execute_gemini(
             stderr.decode("utf-8", errors="replace") if stderr else ""
         )
 
-        # Check for rate limiting
+        # agy always returns returncode 0, even on errors.
+        # Detect errors by scanning stdout for known error patterns.
+        error_patterns = [
+            r'^Error:\s+',
+            r'^CLI error:\s+',
+            r'^Warning:\s+conversation\s+"[^"]+"\s+not found',
+        ]
+        has_error_in_stdout = any(
+            re.search(p, stdout_str, re.IGNORECASE | re.MULTILINE)
+            for p in error_patterns
+        )
+
+        # Also check stderr for rate limiting signals
         if "rate limit" in stderr_str.lower() or "quota" in stderr_str.lower():
             METRICS["rate_limit_hits"] += 1
-            raise GeminiRateLimitError(f"Rate limit exceeded: {stderr_str}")
+            raise CLIRateLimitError(f"Rate limit exceeded: {stderr_str}")
 
-        if process.returncode == 0:
-            METRICS["commands_succeeded"] += 1
-            return {
-                "status": "success",
-                "return_code": process.returncode,
-                "stdout": stdout_str,
-                "stderr": stderr_str,
-                "execution_time": execution_time
-            }
-        else:
+        if process.returncode != 0 or has_error_in_stdout:
             METRICS["commands_failed"] += 1
             return {
                 "status": "error",
@@ -205,35 +252,45 @@ async def execute_gemini(
                 "stderr": stderr_str,
                 "execution_time": execution_time
             }
+        else:
+            METRICS["commands_succeeded"] += 1
+            return {
+                "status": "success",
+                "return_code": process.returncode,
+                "stdout": stdout_str,
+                "stderr": stderr_str,
+                "execution_time": execution_time
+            }
 
-    except (GeminiTimeoutError, GeminiRateLimitError):
+    except (CLITimeoutError, CLIRateLimitError):
         raise
     except FileNotFoundError:
         METRICS["commands_failed"] += 1
-        raise GeminiExecutionError(
-            f"Gemini CLI not found at: {GEMINI_COMMAND_PATH}. "
-            "Please ensure Gemini CLI is installed and in PATH."
+        raise CLIExecutionError(
+            f"Antigravity CLI not found at: {CLI_COMMAND_PATH}. "
+            "Please ensure agy is installed and in PATH."
         )
     except Exception as e:
         METRICS["commands_failed"] += 1
-        logger.error(f"Unexpected error executing Gemini CLI: {e}")
-        raise GeminiExecutionError(f"Execution failed: {str(e)}")
+        logger.error(f"Unexpected error executing CLI: {e}")
+        raise CLIExecutionError(f"Execution failed: {str(e)}")
 
 
-async def execute_gemini_with_retry(
+async def execute_cli_with_retry(
     args: list[str],
     timeout: Optional[int] = None,
     max_attempts: Optional[int] = None,
-    fallback_model: Optional[str] = None
 ) -> dict:
     """
-    Execute Gemini CLI with exponential backoff retry.
+    Execute Antigravity CLI with exponential backoff retry.
+
+    Note: Model fallback is not supported because agy does not expose
+    a --model flag. Retries are for transient errors only.
 
     Args:
-        args: Command line arguments for Gemini CLI
+        args: Command line arguments for agy
         timeout: Optional timeout in seconds
         max_attempts: Maximum retry attempts (defaults to RETRY_MAX_ATTEMPTS)
-        fallback_model: Optional fallback model if primary fails
 
     Returns:
         Dictionary with execution results
@@ -243,32 +300,15 @@ async def execute_gemini_with_retry(
 
     for attempt in range(1, max_attempts + 1):
         try:
-            return await execute_gemini(args, timeout)
+            return await execute_cli(args, timeout)
 
-        except GeminiRateLimitError as e:
+        except CLIRateLimitError as e:
             last_error = e
-
-            # Try fallback model if available
-            if fallback_model and "--model" in args:
-                model_idx = args.index("--model")
-                original_model = args[model_idx + 1]
-                args[model_idx + 1] = fallback_model
-                METRICS["fallback_count"] += 1
-                logger.info(
-                    f"Falling back from {original_model} to {fallback_model}"
-                )
-                try:
-                    return await execute_gemini(args, timeout)
-                except Exception:
-                    args[model_idx + 1] = original_model
-
             if attempt < max_attempts:
-                # Exponential backoff with jitter
                 delay = min(
                     RETRY_BASE_DELAY * (2 ** (attempt - 1)),
                     RETRY_MAX_DELAY
                 )
-                import random
                 delay += random.uniform(0, delay * 0.1)
                 logger.warning(
                     f"Rate limit hit, attempt {attempt}/{max_attempts}. "
@@ -276,23 +316,23 @@ async def execute_gemini_with_retry(
                 )
                 await asyncio.sleep(delay)
 
-        except GeminiTimeoutError as e:
+        except CLITimeoutError as e:
             last_error = e
             if attempt < max_attempts:
                 logger.warning(
                     f"Timeout on attempt {attempt}/{max_attempts}, retrying..."
                 )
 
-        except GeminiExecutionError as e:
+        except CLIExecutionError as e:
             last_error = e
             # Don't retry for non-transient errors
             break
 
-    raise last_error or GeminiExecutionError("All retry attempts failed")
+    raise last_error or CLIExecutionError("All retry attempts failed")
 
 
-async def get_gemini_help() -> str:
-    """Get Gemini CLI help with caching."""
+async def get_cli_help() -> str:
+    """Get Antigravity CLI help with caching."""
     cache_key = "help"
 
     if cache_key in HELP_CACHE:
@@ -300,15 +340,15 @@ async def get_gemini_help() -> str:
         return HELP_CACHE[cache_key]
 
     METRICS["cache_misses"] += 1
-    result = await execute_gemini(["--help"], timeout=30)
+    result = await execute_cli(["help"], timeout=30)
 
-    output = result["stdout"] if result["status"] == "success" else result["stderr"]
+    output = result["stdout"] or result["stderr"]
     HELP_CACHE[cache_key] = output
     return output
 
 
-async def get_gemini_version() -> str:
-    """Get Gemini CLI version with caching."""
+async def get_cli_version() -> str:
+    """Get Antigravity CLI version with caching."""
     cache_key = "version"
 
     if cache_key in VERSION_CACHE:
@@ -316,7 +356,7 @@ async def get_gemini_version() -> str:
         return VERSION_CACHE[cache_key]
 
     METRICS["cache_misses"] += 1
-    result = await execute_gemini(["--version"], timeout=30)
+    result = await execute_cli(["--version"], timeout=30)
 
     output = result["stdout"] if result["status"] == "success" else result["stderr"]
     VERSION_CACHE[cache_key] = output

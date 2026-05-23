@@ -1,6 +1,5 @@
 # Core MCP Server Dependencies
 mcp>=0.3.0
-httpx>=0.24.0
 cachetools>=5.3.0
 
 # Optional Development Dependencies (install separately if needed)

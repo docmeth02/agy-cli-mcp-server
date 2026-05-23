@@ -1,8 +1,10 @@
 """
-Configuration modules for Gemini CLI MCP Server
+Configuration modules for Antigravity CLI MCP Server
 """
-from .gemini_config import (
-    GEMINI_TIMEOUT,
+from .cli_config import (
+    CLI_TIMEOUT,
+    CLI_COMMAND_PATH,
+    CLI_LOG_LEVEL,
     GEMINI_PROMPT_LIMIT,
     GEMINI_SANDBOX_LIMIT,
     GEMINI_SUMMARIZE_LIMIT,
@@ -13,5 +15,4 @@ from .gemini_config import (
     GEMINI_COLLABORATION_LIMIT,
     DEFAULT_MODEL,
     FALLBACK_MODEL,
-    get_model_scaling_factor,
 )

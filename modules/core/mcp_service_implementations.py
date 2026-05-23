@@ -8,20 +8,20 @@ import json
 import logging
 from typing import Optional
 
-from modules.utils.gemini_utils import (
-    execute_gemini_with_retry,
+from modules.utils.cli_utils import (
+    execute_cli_with_retry,
+    extract_file_refs,
+    _build_cli_args,
     get_metrics,
     HELP_CACHE,
     VERSION_CACHE,
     PROMPT_CACHE,
-    GeminiExecutionError,
-    GeminiTimeoutError,
-    GeminiRateLimitError,
+    CLIExecutionError,
+    CLITimeoutError,
+    CLIRateLimitError,
 )
-from modules.config.gemini_config import (
+from modules.config.cli_config import (
     GEMINI_SANDBOX_LIMIT,
-    FALLBACK_MODEL,
-    get_model_scaling_factor,
 )
 
 logger = logging.getLogger(__name__)
@@ -37,33 +37,38 @@ async def execute_sandbox(
 
     Args:
         prompt: The prompt to execute
-        model: Model to use (defaults to gemini-2.5-pro)
-        sandbox_image: Optional Docker image for sandbox
+        model: Model to use (ignored; kept for backward compatibility)
+        sandbox_image: Optional Docker image for sandbox (ignored for agy)
 
     Returns:
         Execution result dictionary
     """
-    model = model or "gemini-2.5-pro"
-    scaling_factor = get_model_scaling_factor(model)
-    effective_limit = int(GEMINI_SANDBOX_LIMIT * scaling_factor)
-
-    if len(prompt) > effective_limit:
+    if len(prompt) > GEMINI_SANDBOX_LIMIT:
         return {
             "status": "error",
-            "error": f"Prompt exceeds limit of {effective_limit:,} characters",
+            "error": f"Prompt exceeds limit of {GEMINI_SANDBOX_LIMIT:,} characters",
             "error_code": "INPUT_TOO_LARGE"
         }
 
-    args = ["--model", model, "--sandbox"]
     if sandbox_image:
-        args.extend(["--sandbox-image", sandbox_image])
-    args.extend(["--prompt", prompt])
+        logger.warning(f"sandbox_image='{sandbox_image}' ignored: agy does not support custom sandbox images")
+
+    cleaned_prompt, files = extract_file_refs(prompt)
+    args = _build_cli_args(
+        prompt=cleaned_prompt,
+        sandbox=True,
+        files=files
+    )
 
     try:
-        result = await execute_gemini_with_retry(args, fallback_model=FALLBACK_MODEL)
+        result = await execute_cli_with_retry(args)
+        if model != "gemini-2.5-pro":
+            result["model_ignored"] = True
+        if sandbox_image:
+            result["sandbox_image_ignored"] = True
         return result
-    except (GeminiTimeoutError, GeminiRateLimitError, GeminiExecutionError) as e:
-        error_code = type(e).__name__.replace("Gemini", "").replace("Error", "").upper()
+    except (CLITimeoutError, CLIRateLimitError, CLIExecutionError) as e:
+        error_code = type(e).__name__.replace("CLI", "").replace("Error", "").upper()
         return {"status": "error", "error": str(e), "error_code": error_code}
 
 
@@ -95,13 +100,6 @@ def get_cache_statistics() -> dict:
         }
     }
 
-    # Add Redis cache stats if available
-    try:
-        from modules.services.redis_cache import get_redis_stats
-        stats["redis_cache"] = get_redis_stats()
-    except ImportError:
-        stats["redis_cache"] = {"status": "not_configured"}
-
     return stats
 
 
@@ -119,14 +117,8 @@ def get_rate_limiting_statistics() -> dict:
         "fallback_count": metrics.get("fallback_count", 0),
         "commands_executed": metrics.get("commands_executed", 0),
         "success_rate": metrics.get("success_rate", 0),
+        "note": "Per-model rate limiting removed: agy does not expose model selection"
     }
-
-    # Add per-model rate limiting stats if available
-    try:
-        from modules.services.per_model_rate_limiter import get_rate_limit_stats
-        rate_stats["per_model_stats"] = get_rate_limit_stats()
-    except ImportError:
-        rate_stats["per_model_stats"] = {"status": "not_configured"}
 
     return rate_stats
 
@@ -145,7 +137,7 @@ def get_server_metrics() -> dict:
         "metrics": metrics,
         "cache_stats": cache_stats,
         "server_info": {
-            "name": "gemini-cli-mcp-server",
-            "tools_available": 33,
+            "name": "antigravity-cli-mcp-server",
+            "tools_available": 24,
         }
     }

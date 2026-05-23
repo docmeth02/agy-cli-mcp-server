@@ -1,5 +1,5 @@
 """
-Pure MCP tool implementations for core Gemini CLI tools.
+Pure MCP tool implementations for core Antigravity CLI tools.
 
 This module contains the core implementations that are imported by mcp_server.py.
 """
@@ -7,17 +7,17 @@ import json
 import logging
 from typing import Optional
 
-from modules.utils.gemini_utils import (
-    execute_gemini_with_retry,
-    GeminiExecutionError,
-    GeminiTimeoutError,
-    GeminiRateLimitError,
+from modules.utils.cli_utils import (
+    execute_cli_with_retry,
+    extract_file_refs,
+    _build_cli_args,
+    CLIExecutionError,
+    CLITimeoutError,
+    CLIRateLimitError,
 )
-from modules.config.gemini_config import (
+from modules.config.cli_config import (
     GEMINI_PROMPT_LIMIT,
     DEFAULT_MODEL,
-    FALLBACK_MODEL,
-    get_model_scaling_factor,
 )
 
 logger = logging.getLogger(__name__)
@@ -30,71 +30,61 @@ async def execute_prompt(
     debug: bool = False
 ) -> dict:
     """
-    Execute a prompt with the Gemini CLI.
+    Execute a prompt with the Antigravity CLI.
 
     Args:
         prompt: The prompt to send
-        model: Model to use
+        model: Model to use (ignored; kept for backward compatibility)
         sandbox: Whether to use sandbox mode
-        debug: Whether to enable debug output
+        debug: Whether to enable debug output (ignored for agy)
 
     Returns:
         Execution result dictionary
     """
-    model = model or DEFAULT_MODEL
-    scaling_factor = get_model_scaling_factor(model)
-    effective_limit = int(GEMINI_PROMPT_LIMIT * scaling_factor)
-
-    if len(prompt) > effective_limit:
+    if len(prompt) > GEMINI_PROMPT_LIMIT:
         return {
             "status": "error",
-            "error": f"Prompt exceeds limit of {effective_limit:,} characters",
+            "error": f"Prompt exceeds limit of {GEMINI_PROMPT_LIMIT:,} characters",
             "error_code": "INPUT_TOO_LARGE"
         }
 
-    args = []
-    if model:
-        args.extend(["--model", model])
-    if sandbox:
-        args.append("--sandbox")
-    if debug:
-        args.append("--debug")
-    args.extend(["--prompt", prompt])
+    cleaned_prompt, files = extract_file_refs(prompt)
+    args = _build_cli_args(
+        prompt=cleaned_prompt,
+        sandbox=sandbox,
+        debug=debug,
+        files=files
+    )
 
     try:
-        result = await execute_gemini_with_retry(
-            args,
-            fallback_model=FALLBACK_MODEL if model != FALLBACK_MODEL else None
-        )
+        result = await execute_cli_with_retry(args)
+        if model != DEFAULT_MODEL:
+            result["model_ignored"] = True
         return result
-    except GeminiTimeoutError as e:
+    except CLITimeoutError as e:
         return {"status": "error", "error": str(e), "error_code": "TIMEOUT"}
-    except GeminiRateLimitError as e:
+    except CLIRateLimitError as e:
         return {"status": "error", "error": str(e), "error_code": "RATE_LIMIT"}
-    except GeminiExecutionError as e:
+    except CLIExecutionError as e:
         return {"status": "error", "error": str(e), "error_code": "EXECUTION_ERROR"}
     except Exception as e:
         logger.error(f"Unexpected error in execute_prompt: {e}")
         return {"status": "error", "error": str(e), "error_code": "INTERNAL_ERROR"}
 
 
-def validate_prompt_length(prompt: str, limit: int, model: str = None) -> tuple[bool, str]:
+def validate_prompt_length(prompt: str, limit: int) -> tuple[bool, str]:
     """
     Validate that a prompt is within the allowed length.
 
     Args:
         prompt: The prompt to validate
-        limit: Base character limit
-        model: Optional model for scaling
+        limit: Character limit
 
     Returns:
         Tuple of (is_valid, error_message)
     """
-    scaling_factor = get_model_scaling_factor(model) if model else 1.0
-    effective_limit = int(limit * scaling_factor)
-
-    if len(prompt) > effective_limit:
-        return False, f"Input exceeds limit of {effective_limit:,} characters (got {len(prompt):,})"
+    if len(prompt) > limit:
+        return False, f"Input exceeds limit of {limit:,} characters (got {len(prompt):,})"
 
     return True, ""
 

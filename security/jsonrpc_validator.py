@@ -7,7 +7,7 @@ import json
 import logging
 from typing import Optional, Tuple, Any
 
-from modules.config.gemini_config import (
+from modules.config.cli_config import (
     JSONRPC_MAX_REQUEST_SIZE,
     JSONRPC_MAX_NESTING_DEPTH,
     JSONRPC_STRICT_MODE,

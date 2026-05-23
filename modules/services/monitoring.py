@@ -4,17 +4,33 @@ OpenTelemetry, Prometheus, and health check integration.
 This module provides enterprise monitoring capabilities.
 """
 import logging
+import os
 import time
 from typing import Optional, Callable
 from dataclasses import dataclass, field
 
-from modules.config.feature_config import (
-    FEATURE_MONITORING_ENABLED,
-    FEATURE_OPENTELEMETRY_ENABLED,
-    FEATURE_PROMETHEUS_ENABLED,
-    FEATURE_HEALTH_CHECKS_ENABLED,
-    MONITORING_CONFIG,
-)
+# Monitoring feature flags (previously in feature_config.py)
+FEATURE_MONITORING_ENABLED = os.getenv("ENABLE_MONITORING", "false").lower() == "true"
+FEATURE_OPENTELEMETRY_ENABLED = os.getenv("ENABLE_OPENTELEMETRY", "false").lower() == "true"
+FEATURE_PROMETHEUS_ENABLED = os.getenv("ENABLE_PROMETHEUS", "false").lower() == "true"
+FEATURE_HEALTH_CHECKS_ENABLED = os.getenv("ENABLE_HEALTH_CHECKS", "true").lower() == "true"
+
+MONITORING_CONFIG = {
+    "enabled": FEATURE_MONITORING_ENABLED,
+    "opentelemetry": {
+        "enabled": FEATURE_OPENTELEMETRY_ENABLED,
+        "endpoint": os.getenv("OPENTELEMETRY_ENDPOINT", ""),
+        "service_name": os.getenv("OPENTELEMETRY_SERVICE_NAME", "antigravity-cli-mcp-server"),
+    },
+    "prometheus": {
+        "enabled": FEATURE_PROMETHEUS_ENABLED,
+        "port": int(os.getenv("PROMETHEUS_PORT", "8000")),
+    },
+    "health_checks": {
+        "enabled": FEATURE_HEALTH_CHECKS_ENABLED,
+        "interval_seconds": int(os.getenv("HEALTH_CHECK_INTERVAL", "30")),
+    },
+}
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +117,7 @@ class MonitoringService:
             return
 
         self.register_health_check("server", self._check_server_health)
-        self.register_health_check("gemini_cli", self._check_gemini_cli)
+        self.register_health_check("antigravity_cli", self._check_antigravity_cli)
 
     def _check_server_health(self) -> HealthCheckResult:
         """Check server health."""
@@ -122,21 +138,21 @@ class MonitoringService:
                 duration_ms=(time.time() - start) * 1000
             )
 
-    def _check_gemini_cli(self) -> HealthCheckResult:
-        """Check Gemini CLI availability."""
+    def _check_antigravity_cli(self) -> HealthCheckResult:
+        """Check Antigravity CLI availability."""
         start = time.time()
         try:
-            from modules.utils.gemini_utils import validate_gemini_setup
-            is_healthy = validate_gemini_setup()
+            from modules.utils.cli_utils import validate_cli_setup
+            is_healthy = validate_cli_setup()
             return HealthCheckResult(
-                name="gemini_cli",
+                name="antigravity_cli",
                 healthy=is_healthy,
-                message="Gemini CLI available" if is_healthy else "Gemini CLI not found",
+                message="Antigravity CLI available" if is_healthy else "Antigravity CLI not found",
                 duration_ms=(time.time() - start) * 1000
             )
         except Exception as e:
             return HealthCheckResult(
-                name="gemini_cli",
+                name="antigravity_cli",
                 healthy=False,
                 message=str(e),
                 duration_ms=(time.time() - start) * 1000

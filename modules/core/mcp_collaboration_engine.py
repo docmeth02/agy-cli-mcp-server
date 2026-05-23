@@ -8,26 +8,25 @@ import json
 import logging
 from typing import Optional
 
-from modules.utils.gemini_utils import (
-    execute_gemini_with_retry,
-    GeminiExecutionError,
-    GeminiTimeoutError,
-    GeminiRateLimitError,
+from modules.utils.cli_utils import (
+    execute_cli_with_retry,
+    extract_file_refs,
+    _build_cli_args,
+    CLIExecutionError,
+    CLITimeoutError,
+    CLIRateLimitError,
 )
-from modules.config.gemini_config import (
+from modules.config.cli_config import (
     GEMINI_COLLABORATION_LIMIT,
-    DEFAULT_MODEL,
-    FALLBACK_MODEL,
-    get_model_scaling_factor,
 )
 
 logger = logging.getLogger(__name__)
 
-# Default model selections by mode
+# Default model selections by mode (agy-only; no OpenRouter models)
 DEFAULT_MODELS = {
-    "sequential": "gemini-2.5-flash,openai/gpt-4.1-nano,anthropic/claude-3-haiku",
-    "debate": "gemini-2.5-flash,openai/gpt-4.1-mini,anthropic/claude-3-haiku",
-    "validation": "gemini-2.5-flash,openai/gpt-4.1-nano,anthropic/claude-3-haiku",
+    "sequential": "gemini-2.5-flash",
+    "debate": "gemini-2.5-flash",
+    "validation": "gemini-2.5-flash",
 }
 
 
@@ -59,21 +58,17 @@ async def execute_collaboration(
     Args:
         collaboration_mode: Mode (sequential, debate, validation)
         content: Content to analyze
-        models: Comma-separated model list
+        models: Comma-separated model list (ignored; agy manages models internally)
         context: Additional context
         Other mode-specific parameters
 
     Returns:
         JSON string with collaboration results
     """
-    # Validate input length
-    scaling_factor = get_model_scaling_factor(DEFAULT_MODEL)
-    effective_limit = int(GEMINI_COLLABORATION_LIMIT * scaling_factor)
-
-    if len(content) > effective_limit:
+    if len(content) > GEMINI_COLLABORATION_LIMIT:
         return json.dumps({
             "status": "error",
-            "error": f"Content exceeds limit of {effective_limit:,} characters",
+            "error": f"Content exceeds limit of {GEMINI_COLLABORATION_LIMIT:,} characters",
             "error_code": "INPUT_TOO_LARGE"
         })
 
@@ -165,7 +160,7 @@ Content:
 
 Perform {stage} analysis."""
 
-        # Execute with appropriate model
+        # Execute with appropriate model (ignored by agy, kept for logging)
         result = await _execute_model(model, prompt)
 
         results.append({
@@ -186,7 +181,8 @@ Perform {stage} analysis."""
         "collaboration_mode": "sequential",
         "stages_completed": len(results),
         "results": results,
-        "summary": summary
+        "summary": summary,
+        "model_ignored": True,
     }, indent=2)
 
 
@@ -254,7 +250,8 @@ Provide your perspective."""
         "debate_style": debate_style,
         "rounds_completed": rounds,
         "arguments": all_arguments,
-        "synthesis": synthesis
+        "synthesis": synthesis,
+        "model_ignored": True,
     }, indent=2)
 
 
@@ -312,35 +309,26 @@ Provide validation results."""
         "validation_criteria": validation_criteria,
         "confidence_threshold": confidence_threshold,
         "validations": validations,
-        "consensus": consensus
+        "consensus": consensus,
+        "model_ignored": True,
     }, indent=2)
 
 
 async def _execute_model(model: str, prompt: str) -> dict:
-    """Execute a prompt with the specified model."""
-    if model.startswith("gemini"):
-        # Use Gemini CLI
-        args = ["--model", model, "--prompt", prompt]
-        try:
-            result = await execute_gemini_with_retry(args, fallback_model=FALLBACK_MODEL)
-            return {
-                "status": "success",
-                "content": result.get("stdout", ""),
-                "source": "gemini_cli"
-            }
-        except Exception as e:
-            return {"status": "error", "error": str(e)}
-    else:
-        # Use OpenRouter
-        try:
-            from modules.services.openrouter_client import get_openrouter_client
-            client = get_openrouter_client()
-            result = await client.get_opinion(prompt=prompt, model=model)
-            return result
-        except ImportError:
-            return {"status": "error", "error": "OpenRouter not configured"}
-        except Exception as e:
-            return {"status": "error", "error": str(e)}
+    """Execute a prompt with the specified model via agy."""
+    cleaned_prompt, files = extract_file_refs(prompt)
+    args = _build_cli_args(prompt=cleaned_prompt, files=files)
+
+    try:
+        result = await execute_cli_with_retry(args)
+        return {
+            "status": "success",
+            "content": result.get("stdout", ""),
+            "source": "antigravity_cli",
+            "model_ignored": True,
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
 
 
 async def _generate_pipeline_summary(
@@ -357,7 +345,6 @@ async def _generate_pipeline_summary(
         )
         prompt = get_pipeline_summary_prompt(original_content, all_outputs, stages)
 
-        # Use first Gemini model for summary
         result = await _execute_model("gemini-2.5-flash", prompt)
         return result.get("content", result.get("stdout", "Pipeline complete"))
     except Exception as e:

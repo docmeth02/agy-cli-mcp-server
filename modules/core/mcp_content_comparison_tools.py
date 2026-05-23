@@ -7,16 +7,16 @@ import json
 import logging
 from typing import Optional
 
-from modules.utils.gemini_utils import (
-    execute_gemini_with_retry,
-    GeminiExecutionError,
-    GeminiTimeoutError,
-    GeminiRateLimitError,
+from modules.utils.cli_utils import (
+    execute_cli_with_retry,
+    extract_file_refs,
+    _build_cli_args,
+    CLIExecutionError,
+    CLITimeoutError,
+    CLIRateLimitError,
 )
-from modules.config.gemini_config import (
+from modules.config.cli_config import (
     GEMINI_CONTENT_COMPARISON_LIMIT,
-    FALLBACK_MODEL,
-    get_model_scaling_factor,
 )
 
 logger = logging.getLogger(__name__)
@@ -42,14 +42,10 @@ async def execute_content_comparison(
     Returns:
         JSON string with comparison results
     """
-    model = "gemini-2.5-pro"
-    scaling_factor = get_model_scaling_factor(model)
-    effective_limit = int(GEMINI_CONTENT_COMPARISON_LIMIT * scaling_factor)
-
-    if len(sources) > effective_limit:
+    if len(sources) > GEMINI_CONTENT_COMPARISON_LIMIT:
         return json.dumps({
             "status": "error",
-            "error": f"Sources exceed limit of {effective_limit:,} characters",
+            "error": f"Sources exceed limit of {GEMINI_CONTENT_COMPARISON_LIMIT:,} characters",
             "error_code": "INPUT_TOO_LARGE"
         })
 
@@ -89,12 +85,14 @@ Sources:
 
 Provide a {output_format} comparison{"with similarity metrics" if include_metrics else ""}."""
 
-    args = ["--model", model, "--prompt", prompt]
+    cleaned_prompt, files = extract_file_refs(prompt)
+    args = _build_cli_args(prompt=cleaned_prompt, files=files)
 
     try:
-        result = await execute_gemini_with_retry(args, fallback_model=FALLBACK_MODEL)
+        result = await execute_cli_with_retry(args)
+        result["model_ignored"] = True
         return json.dumps(result, indent=2)
-    except (GeminiTimeoutError, GeminiRateLimitError, GeminiExecutionError) as e:
+    except (CLITimeoutError, CLIRateLimitError, CLIExecutionError) as e:
         return json.dumps({
             "status": "error",
             "error": str(e)

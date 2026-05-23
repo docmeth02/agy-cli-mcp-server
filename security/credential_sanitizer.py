@@ -15,7 +15,6 @@ CREDENTIAL_PATTERNS = [
     # API Keys
     (r'AIza[0-9A-Za-z_-]{35}', '[REDACTED_GOOGLE_API_KEY]'),
     (r'sk-[a-zA-Z0-9]{32,}', '[REDACTED_OPENAI_KEY]'),
-    (r'sk-or-v1-[a-zA-Z0-9]{64}', '[REDACTED_OPENROUTER_KEY]'),
     (r'sk-ant-[a-zA-Z0-9-]{40,}', '[REDACTED_ANTHROPIC_KEY]'),
 
     # AWS
