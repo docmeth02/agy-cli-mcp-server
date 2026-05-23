@@ -198,12 +198,16 @@ async def execute_cli(
     try:
         logger.debug(f"Executing: {CLI_COMMAND_PATH} {' '.join(args)}")
 
+        env = os.environ.copy()
+        env.pop("ANTIGRAVITY_LS_ADDRESS", None)
+
         process = await asyncio.create_subprocess_exec(
             CLI_COMMAND_PATH,
             *args,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE if capture_stderr else None,
+            env=env,
         )
 
         try:

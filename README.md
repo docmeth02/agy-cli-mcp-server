@@ -834,9 +834,11 @@ Each tool has optimized character limits based on typical use cases:
 | `gemini_content_comparison` | 400K chars | Multi-source content comparison |
 | **Conversation Tools** | Variable | Context-aware with token management |
 
-### Model Parameter
+### Model Selection
 
-The `model` parameter is accepted on all tools for backward compatibility but is **ignored** by the Antigravity CLI. Model selection is handled internally by `agy`. When `model` is passed, the response includes `"model_ignored": true`.
+The `model` parameter is accepted on all tools for backward compatibility but is currently **ignored**. Antigravity CLI (`agy`) does not expose a `--model` flag, environment variable, or config key for model selection as of v1.0. The model is determined by your Google account tier (e.g. Gemini 3.5 Flash). A `--model` CLI flag is planned for a future agy release — once available, this server will wire it up automatically.
+
+The server ensures agy always runs with its own isolated backend by unsetting `ANTIGRAVITY_LS_ADDRESS`, preventing interference from any IDE language server running in the same environment.
 
 ### Conversation History Management
 
@@ -1230,16 +1232,26 @@ This provides detailed information about:
 - Cache operations and hit rates
 - Error details and stack traces
 - Performance metrics and timing
-- Model fallback behavior
+
+### Antigravity CLI Logs
+
+agy writes detailed session logs (including gRPC API calls and model resolution) to:
+
+```
+~/.gemini/antigravity-cli/log/cli-YYYYMMDD_HHMMSS.log
+```
+
+Check the latest file when debugging issues with agy itself (as opposed to the MCP server layer).
 
 ### Getting Help
 
 If you encounter issues not covered here:
 
-1. **Check server logs** for detailed error messages
-2. **Verify Antigravity CLI** works independently: `agy --help`
-3. **Test with simple commands** first: `@gemini_version()`
-4. **Monitor metrics** for performance insights: `@gemini_metrics()`
+1. **Check MCP server logs** for detailed error messages (`CLI_LOG_LEVEL=DEBUG`)
+2. **Check agy logs** at `~/.gemini/antigravity-cli/log/` for CLI-level issues
+3. **Verify Antigravity CLI** works independently: `agy --print "hello" < /dev/null`
+4. **Test with simple commands** first: `@gemini_version()`
+5. **Monitor metrics** for performance insights: `@gemini_metrics()`
 5. **Check environment variables** for correct configuration
 
 ## 📄 Requirements
