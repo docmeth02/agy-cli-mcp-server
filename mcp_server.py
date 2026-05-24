@@ -206,7 +206,8 @@ async def gemini_prompt(
     prompt: str,
     model: Optional[str] = None,
     sandbox: bool = False,
-    debug: bool = False
+    debug: bool = False,
+    readonly: bool = False
 ) -> str:
     """
     Send prompts with structured parameters and validation (100,000 char limit).
@@ -216,14 +217,24 @@ async def gemini_prompt(
         model: Optional model to use (ignored; kept for backward compatibility)
         sandbox: Whether to run in sandbox mode
         debug: Whether to enable debug output (ignored for agy)
+        readonly: When True, instructs the AI to only respond with text and not
+                  create, modify, or delete any files. Use for brainstorming,
+                  analysis, opinions, and planning tasks.
 
     Returns:
         JSON string with the response
 
     Examples:
         gemini_prompt(prompt="Explain quantum computing")
-        gemini_prompt(prompt="Analyze @src/auth.py")
+        gemini_prompt(prompt="Analyze @src/auth.py", readonly=True)
     """
+    if readonly:
+        prompt = (
+            "IMPORTANT: This is a read-only request. Do NOT create, modify, or "
+            "delete any files. Do NOT execute any code or run any commands. "
+            "Only provide your written response.\n\n" + prompt
+        )
+
     if len(prompt) > GEMINI_PROMPT_LIMIT:
         return json.dumps({
             "status": "error",
@@ -521,9 +532,8 @@ async def gemini_summarize_files(
             "error_code": "INPUT_TOO_LARGE"
         })
 
-    # Build lightweight prompt for file analysis
     focus_text = f" Focus on: {focus}" if focus else ""
-    prompt = f"Analyze and summarize the following files.{focus_text}\n\n{files}"
+    prompt = f"IMPORTANT: This is an analysis-only task. Do NOT create, modify, or delete any files. Do NOT execute any code. Only provide your written summary.\n\nAnalyze and summarize the following files.{focus_text}\n\n{files}"
 
     cleaned_prompt, files = extract_file_refs(prompt)
     args = _build_cli_args(prompt=cleaned_prompt, files=files)
