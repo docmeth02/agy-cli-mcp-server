@@ -39,7 +39,9 @@ Requirements:
 {requirements}
 """
 
-    return f"""Please evaluate the following implementation plan for completeness, correctness, and potential issues.{context_section}{requirements_section}
+    return f"""IMPORTANT: This is an analysis-only task. Do NOT create, modify, or delete any files. Do NOT execute any code. Do NOT implement anything. Only provide your written evaluation.
+
+Please evaluate the following implementation plan for completeness, correctness, and potential issues.{context_section}{requirements_section}
 
 Plan:
 {plan}

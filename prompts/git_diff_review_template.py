@@ -59,7 +59,9 @@ Review Focus: Quick Review
 - Obvious bugs"""
     }.get(review_type, "")
 
-    return f"""Review the following git diff and provide feedback.{branch_section}{commit_section}
+    return f"""IMPORTANT: This is an analysis-only task. Do NOT create, modify, or delete any files. Do NOT execute any code. Only provide your written review.
+
+Review the following git diff and provide feedback.{branch_section}{commit_section}
 {review_focus}
 
 Git Diff:

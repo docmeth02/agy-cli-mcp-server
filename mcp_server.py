@@ -490,7 +490,7 @@ async def gemini_summarize(
     except ImportError:
         # Fallback prompt
         focus_text = f" Focus on: {focus}" if focus else ""
-        prompt = f"Please summarize the following content.{focus_text}\n\n{content}"
+        prompt = f"IMPORTANT: This is an analysis-only task. Do NOT create, modify, or delete any files. Do NOT execute any code. Only provide your written summary.\n\nPlease summarize the following content.{focus_text}\n\n{content}"
 
     cleaned_prompt, files = extract_file_refs(prompt)
     args = _build_cli_args(prompt=cleaned_prompt, files=files)
@@ -586,7 +586,9 @@ async def gemini_eval_plan(
         # Fallback prompt
         context_text = f"\n\nContext: {context}" if context else ""
         req_text = f"\n\nRequirements: {requirements}" if requirements else ""
-        prompt = f"""Please evaluate the following implementation plan for completeness,
+        prompt = f"""IMPORTANT: This is an analysis-only task. Do NOT create, modify, or delete any files. Do NOT execute any code. Do NOT implement anything. Only provide your written evaluation.
+
+Please evaluate the following implementation plan for completeness,
 correctness, and potential issues.{context_text}{req_text}
 
 Plan:
@@ -651,7 +653,9 @@ async def gemini_review_code(
         purpose_text = f"\n\nPurpose: {purpose}" if purpose else ""
         context_text = f"\n\nContext: {context}" if context else ""
         lang_text = f"\n\nLanguage: {language}" if language else ""
-        prompt = f"""Please review the following code.{purpose_text}{context_text}{lang_text}
+        prompt = f"""IMPORTANT: This is an analysis-only task. Do NOT create, modify, or delete any files. Do NOT execute any code. Only provide your written review.
+
+Please review the following code.{purpose_text}{context_text}{lang_text}
 
 Code:
 {code}
@@ -717,7 +721,9 @@ async def gemini_verify_solution(
         req_text = f"\n\nRequirements: {requirements}" if requirements else ""
         test_text = f"\n\nTest Criteria: {test_criteria}" if test_criteria else ""
         ctx_text = f"\n\nContext: {context}" if context else ""
-        prompt = f"""Please verify the following solution comprehensively.{req_text}{test_text}{ctx_text}
+        prompt = f"""IMPORTANT: This is an analysis-only task. Do NOT create, modify, or delete any files. Do NOT execute any code. Only provide your written verification.
+
+Please verify the following solution comprehensively.{req_text}{test_text}{ctx_text}
 
 Solution:
 {solution}

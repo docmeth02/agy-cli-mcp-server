@@ -26,7 +26,9 @@ Focus Area:
 Please pay particular attention to: {focus}
 """
 
-    return f"""Please provide a comprehensive summary of the following content.{focus_section}
+    return f"""IMPORTANT: This is an analysis-only task. Do NOT create, modify, or delete any files. Do NOT execute any code. Only provide your written summary.
+
+Please provide a comprehensive summary of the following content.{focus_section}
 
 Content:
 {content}

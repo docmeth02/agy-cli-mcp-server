@@ -27,6 +27,8 @@ def get_structured_code_review_prompt(
     Returns:
         Complete prompt string
     """
+    analysis_only = "IMPORTANT: This is an analysis-only task. Do NOT create, modify, or delete any files. Do NOT execute any code. Only provide your written review.\n\n"
+
     language_section = f"\nLanguage: {language}" if language else ""
 
     focus_section = ""
@@ -52,7 +54,7 @@ Output Format: JSON
 - Use consistent key naming"""
     }.get(output_format, "")
 
-    return f"""Perform a comprehensive code review with structured output.{language_section}{focus_section}
+    return f"""{analysis_only}Perform a comprehensive code review with structured output.{language_section}{focus_section}
 
 Severity Threshold: Only report issues at {severity_threshold} level or above.
 {format_instructions}

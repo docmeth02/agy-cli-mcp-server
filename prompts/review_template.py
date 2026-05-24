@@ -48,7 +48,9 @@ Context:
 Programming Language: {language}
 """
 
-    return f"""Please perform a comprehensive code review.{purpose_section}{context_section}{language_section}
+    return f"""IMPORTANT: This is an analysis-only task. Do NOT create, modify, or delete any files. Do NOT execute any code. Only provide your written review.
+
+Please perform a comprehensive code review.{purpose_section}{context_section}{language_section}
 
 Code:
 {code}

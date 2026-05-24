@@ -49,7 +49,9 @@ Deployment Context:
 {context}
 """
 
-    return f"""Please perform a comprehensive verification of the following solution.{requirements_section}{criteria_section}{context_section}
+    return f"""IMPORTANT: This is an analysis-only task. Do NOT create, modify, or delete any files. Do NOT execute any code. Only provide your written verification.
+
+Please perform a comprehensive verification of the following solution.{requirements_section}{criteria_section}{context_section}
 
 Solution:
 {solution}

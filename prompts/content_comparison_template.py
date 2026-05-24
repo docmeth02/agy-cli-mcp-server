@@ -73,7 +73,9 @@ Include Metrics:
 - Difference count by category
 - Confidence scores""" if include_metrics else ""
 
-    return f"""Compare the following sources and analyze their similarities and differences.
+    return f"""IMPORTANT: This is an analysis-only task. Do NOT create, modify, or delete any files. Do NOT execute any code. Only provide your written comparison.
+
+Compare the following sources and analyze their similarities and differences.
 {comparison_instructions}
 
 Output Format: {format_instructions}

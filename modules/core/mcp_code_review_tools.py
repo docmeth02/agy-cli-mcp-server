@@ -65,7 +65,9 @@ async def execute_code_review(
         # Fallback prompt
         focus_text = f"\n\nFocus areas: {focus_areas}" if focus_areas else ""
         lang_text = f"\n\nLanguage: {language}" if language else ""
-        prompt = f"""Perform a comprehensive code review.{focus_text}{lang_text}
+        prompt = f"""IMPORTANT: This is an analysis-only task. Do NOT create, modify, or delete any files. Do NOT execute any code. Only provide your written review.
+
+Perform a comprehensive code review.{focus_text}{lang_text}
 
 Code:
 {code}
