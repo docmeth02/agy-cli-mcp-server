@@ -210,7 +210,12 @@ async def gemini_prompt(
     readonly: bool = False
 ) -> str:
     """
-    Send prompts with structured parameters and validation (100,000 char limit).
+    Send prompts to Antigravity CLI for execution (100,000 char limit).
+
+    Use this tool when you want the AI to IMPLEMENT something — write code,
+    create files, or execute commands. For analysis, brainstorming, opinions,
+    or plan evaluation, prefer gemini_eval_plan (read-only by design) or set
+    readonly=True to prevent file modifications.
 
     Args:
         prompt: The prompt to send to Antigravity CLI
@@ -556,19 +561,25 @@ async def gemini_eval_plan(
     model: Optional[str] = None
 ) -> str:
     """
-    Evaluate Claude Code implementation plans (500,000 char limit).
+    Get a second opinion on implementation plans, architecture decisions,
+    brainstorming ideas, or technical proposals (500,000 char limit). This tool
+    is READ-ONLY — it will never create, modify, or delete files.
+
+    Use this instead of gemini_prompt when you want analysis, feedback, or
+    discussion without any risk of the AI modifying the codebase.
 
     Args:
-        plan: The implementation plan to evaluate
+        plan: The plan, idea, or proposal to evaluate
         context: Optional context (e.g., "Node.js REST API with MongoDB")
-        requirements: Optional requirements (e.g., "Must support 10,000 concurrent users")
-        model: Optional model to use
+        requirements: Optional requirements or constraints
+        model: Optional model to use (ignored by agy)
 
     Returns:
         JSON string with evaluation results
 
     Examples:
         gemini_eval_plan(plan="1. Create JWT auth...", context="Express.js API")
+        gemini_eval_plan(plan="Should we use microservices or monolith?", context="Early stage startup")
     """
     total_length = len(plan) + len(context or "") + len(requirements or "")
     if total_length > GEMINI_EVAL_LIMIT:
