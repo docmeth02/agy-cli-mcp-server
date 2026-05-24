@@ -15,7 +15,6 @@ from modules.utils.cli_utils import (
     get_metrics,
     HELP_CACHE,
     VERSION_CACHE,
-    PROMPT_CACHE,
     CLIExecutionError,
     CLITimeoutError,
     CLIRateLimitError,
@@ -62,7 +61,7 @@ async def execute_sandbox(
 
     try:
         result = await execute_cli_with_retry(args)
-        if model != "gemini-2.5-pro":
+        if model is not None:
             result["model_ignored"] = True
         if sandbox_image:
             result["sandbox_image_ignored"] = True
@@ -92,12 +91,6 @@ def get_cache_statistics() -> dict:
             "ttl_seconds": VERSION_CACHE.ttl,
             "items": list(VERSION_CACHE.keys())
         },
-        "prompt_cache": {
-            "size": len(PROMPT_CACHE),
-            "maxsize": PROMPT_CACHE.maxsize,
-            "ttl_seconds": PROMPT_CACHE.ttl,
-            "item_count": len(PROMPT_CACHE)
-        }
     }
 
     return stats

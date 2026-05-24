@@ -58,7 +58,7 @@ async def execute_prompt(
 
     try:
         result = await execute_cli_with_retry(args)
-        if model != DEFAULT_MODEL:
+        if model is not None and model != DEFAULT_MODEL:
             result["model_ignored"] = True
         return result
     except CLITimeoutError as e:

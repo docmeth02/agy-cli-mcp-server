@@ -147,11 +147,11 @@ class ConversationManager:
         try:
             result = await execute_cli_with_retry(args)
 
-            # Update metadata
+            # Reload metadata after await to avoid overwriting concurrent changes
+            metadata = _load_metadata()
             now = time.time()
-            if meta:
-                meta["updated_at"] = now
-                metadata[conversation_id] = meta
+            if conversation_id in metadata:
+                metadata[conversation_id]["updated_at"] = now
                 _save_metadata(metadata)
 
             self._stats["messages_added"] += 1
@@ -185,13 +185,17 @@ class ConversationManager:
         conversations = []
         now = time.time()
 
-        for cid in all_ids[:limit]:
+        for cid in all_ids:
             meta = metadata.get(cid, {})
             mtime = _get_conversation_mtime(cid)
             created_at = meta.get("created_at", mtime or now)
             expiration_hours = meta.get("expiration_hours", DEFAULT_EXPIRATION_HOURS)
 
-            conv = {
+            if status_filter == "active":
+                if now > created_at + (expiration_hours * 3600):
+                    continue
+
+            conversations.append({
                 "conversation_id": cid,
                 "title": meta.get("title", f"Conversation {cid[:8]}"),
                 "description": meta.get("description"),
@@ -199,15 +203,12 @@ class ConversationManager:
                 "created_at": created_at,
                 "updated_at": meta.get("updated_at", mtime or created_at),
                 "expiration_hours": expiration_hours,
-                "message_count": 0,  # agy .pb is opaque; we cannot count messages
+                "message_count": 0,
                 "has_native_file": _conversation_exists(cid),
-            }
+            })
 
-            if status_filter == "active":
-                if now > created_at + (expiration_hours * 3600):
-                    continue
-
-            conversations.append(conv)
+            if len(conversations) >= limit:
+                break
 
         return conversations
 

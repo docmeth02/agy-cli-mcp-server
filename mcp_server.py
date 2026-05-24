@@ -297,7 +297,7 @@ async def gemini_metrics() -> str:
         metrics = get_metrics()
 
         # Add cache-specific stats
-        from modules.utils.cli_utils import HELP_CACHE, VERSION_CACHE, PROMPT_CACHE
+        from modules.utils.cli_utils import HELP_CACHE, VERSION_CACHE
 
         cache_stats = {
             "help_cache": {
@@ -310,11 +310,6 @@ async def gemini_metrics() -> str:
                 "maxsize": VERSION_CACHE.maxsize,
                 "ttl": VERSION_CACHE.ttl
             },
-            "prompt_cache": {
-                "size": len(PROMPT_CACHE),
-                "maxsize": PROMPT_CACHE.maxsize,
-                "ttl": PROMPT_CACHE.ttl
-            }
         }
 
         return json.dumps({
@@ -397,7 +392,7 @@ async def gemini_cache_stats() -> str:
     Examples:
         gemini_cache_stats()
     """
-    from modules.utils.cli_utils import HELP_CACHE, VERSION_CACHE, PROMPT_CACHE
+    from modules.utils.cli_utils import HELP_CACHE, VERSION_CACHE
 
     stats = {
         "help_cache": {
@@ -412,12 +407,6 @@ async def gemini_cache_stats() -> str:
             "ttl_seconds": VERSION_CACHE.ttl,
             "items": list(VERSION_CACHE.keys())
         },
-        "prompt_cache": {
-            "size": len(PROMPT_CACHE),
-            "maxsize": PROMPT_CACHE.maxsize,
-            "ttl_seconds": PROMPT_CACHE.ttl,
-            "item_count": len(PROMPT_CACHE)
-        }
     }
 
     return json.dumps({
@@ -789,7 +778,7 @@ async def gemini_start_conversation(
             "conversation": conversation
         }, indent=2)
     except ImportError:
-        # Fallback implementation
+        logger.error("Failed to import ConversationManager", exc_info=True)
         import uuid
         conversation_id = f"conv_{uuid.uuid4().hex[:12]}"
         return json.dumps({
@@ -838,7 +827,7 @@ async def gemini_continue_conversation(
         )
         return json.dumps(result, indent=2)
     except ImportError:
-        # Fallback - just execute prompt without history
+        logger.error("Failed to import ConversationManager", exc_info=True)
         cleaned_prompt, files = extract_file_refs(prompt)
         args = _build_cli_args(prompt=cleaned_prompt, files=files)
         result = await execute_cli_with_retry(args)
@@ -880,6 +869,7 @@ async def gemini_list_conversations(
             "total": len(conversations)
         }, indent=2)
     except ImportError:
+        logger.error("Failed to import ConversationManager", exc_info=True)
         return json.dumps({
             "status": "success",
             "conversations": [],
@@ -908,6 +898,7 @@ async def gemini_clear_conversation(conversation_id: str) -> str:
         result = manager.clear_conversation(conversation_id)
         return json.dumps(result, indent=2)
     except ImportError:
+        logger.error("Failed to import ConversationManager", exc_info=True)
         return json.dumps({
             "status": "success",
             "message": f"Conversation {conversation_id} cleared",
@@ -935,6 +926,7 @@ async def gemini_conversation_stats() -> str:
             "statistics": stats
         }, indent=2)
     except ImportError:
+        logger.error("Failed to import ConversationManager", exc_info=True)
         return json.dumps({
             "status": "success",
             "statistics": {

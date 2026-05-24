@@ -142,8 +142,7 @@ class SecurityMonitor:
         Returns:
             Threat level (critical, high, elevated, normal)
         """
-        # Look at last 100 events or last hour
-        recent_events = self.get_recent_events(100)
+        recent_events = self.get_recent_events(self._events.maxlen)
         one_hour_ago = time.time() - 3600
         recent_events = [e for e in recent_events if e.timestamp > one_hour_ago]
 

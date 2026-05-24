@@ -14,6 +14,7 @@ These tests validate every agy calling pattern used by the MCP server:
 Each test exercises the real subprocess path through execute_cli / execute_cli_with_retry.
 """
 import json
+from pathlib import Path
 
 import pytest
 import pytest_asyncio
@@ -127,24 +128,42 @@ class TestFileContext:
         result = await execute_cli_with_retry(args, timeout=60)
         assert result["status"] == "success"
 
-    def test_extract_file_refs_resolves_real_file(self, sample_file):
-        """Verify extract_file_refs finds an existing file and strips the @."""
-        prompt = f"Analyze @{sample_file}"
+    def test_extract_file_refs_resolves_real_file(self, monkeypatch):
+        """Verify extract_file_refs finds an existing file within workspace."""
+        workspace = Path(__file__).parent.parent.resolve()
+        monkeypatch.chdir(workspace)
+        prompt = "Analyze @mcp_server.py"
         cleaned, files = extract_file_refs(prompt)
 
         assert "@" not in cleaned
         assert len(files) == 1
-        assert files[0] == str(sample_file.resolve())
+        assert files[0] == str(workspace / "mcp_server.py")
 
     def test_extract_file_refs_skips_missing_file(self):
         """Verify extract_file_refs ignores non-existent paths."""
         cleaned, files = extract_file_refs("Analyze @/nonexistent/path.py")
         assert files == []
 
-    def test_extract_file_refs_deduplicates(self, sample_file):
+    def test_extract_file_refs_deduplicates(self, monkeypatch):
         """Same file referenced twice should appear once."""
-        prompt = f"Compare @{sample_file} with @{sample_file}"
+        workspace = Path(__file__).parent.parent.resolve()
+        monkeypatch.chdir(workspace)
+        prompt = "Compare @mcp_server.py with @mcp_server.py"
         _, files = extract_file_refs(prompt)
+        assert len(files) == 1
+
+    def test_extract_file_refs_blocks_path_traversal(self, monkeypatch):
+        """Paths outside workspace should be blocked."""
+        workspace = Path(__file__).parent.parent.resolve()
+        monkeypatch.chdir(workspace)
+        _, files = extract_file_refs("Read @/etc/hosts")
+        assert files == []
+
+    def test_extract_file_refs_strips_trailing_punctuation(self, monkeypatch):
+        """Trailing punctuation should be stripped from @refs."""
+        workspace = Path(__file__).parent.parent.resolve()
+        monkeypatch.chdir(workspace)
+        _, files = extract_file_refs("Check @mcp_server.py, please")
         assert len(files) == 1
 
 

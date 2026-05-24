@@ -44,7 +44,7 @@ THREAT_PATTERNS = {
         "severity": "high",
         "patterns": [
             r'\.\./\.\.',
-            r'\.\.\\\\',
+            r'\.\.\\{1,2}',
             r'%2e%2e%2f',
             r'%2e%2e/',
             r'/etc/passwd',

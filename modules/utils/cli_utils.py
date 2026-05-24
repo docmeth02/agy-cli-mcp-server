@@ -19,17 +19,17 @@ from cachetools import TTLCache
 
 logger = logging.getLogger(__name__)
 
-# Configuration from environment
-CLI_TIMEOUT = int(os.getenv("CLI_TIMEOUT", os.getenv("GEMINI_TIMEOUT", "300")))
-CLI_COMMAND_PATH = os.getenv("CLI_COMMAND_PATH", os.getenv("GEMINI_COMMAND_PATH", "agy"))
-RETRY_MAX_ATTEMPTS = int(os.getenv("RETRY_MAX_ATTEMPTS", "3"))
-RETRY_BASE_DELAY = float(os.getenv("RETRY_BASE_DELAY", "1.0"))
-RETRY_MAX_DELAY = float(os.getenv("RETRY_MAX_DELAY", "30.0"))
+from modules.config.cli_config import (
+    CLI_TIMEOUT,
+    CLI_COMMAND_PATH,
+    RETRY_MAX_ATTEMPTS,
+    RETRY_BASE_DELAY,
+    RETRY_MAX_DELAY,
+)
 
 # Caches with TTL
 HELP_CACHE: TTLCache = TTLCache(maxsize=1, ttl=1800)  # 30 min
 VERSION_CACHE: TTLCache = TTLCache(maxsize=1, ttl=1800)  # 30 min
-PROMPT_CACHE: TTLCache = TTLCache(maxsize=100, ttl=300)  # 5 min
 
 # Metrics tracking
 METRICS = {
@@ -97,6 +97,9 @@ def extract_file_refs(prompt: str) -> tuple[str, list[str]]:
     @filename syntax. This function extracts @path tokens, expands
     wildcards with glob, and returns a cleaned prompt plus resolved paths.
 
+    Only paths that resolve within the current workspace are accepted;
+    paths outside the workspace root are rejected to prevent path traversal.
+
     Args:
         prompt: Raw prompt string potentially containing @refs
 
@@ -106,25 +109,26 @@ def extract_file_refs(prompt: str) -> tuple[str, list[str]]:
     pattern = r'@([^\s]+)'
     matches = re.findall(pattern, prompt)
 
-    # Remove @prefix from prompt (keep the path text for context)
     cleaned = re.sub(pattern, r'\1', prompt)
 
+    workspace_root = Path(os.getcwd()).resolve()
     paths: list[str] = []
-    for raw_path in set(matches):
-        # Expand globs
+    for raw_match in set(matches):
+        raw_path = raw_match.rstrip(".,;)]}\"'")
+        if not raw_path:
+            continue
+
         expanded = glob.glob(raw_path)
         if expanded:
             for p in expanded:
-                path_obj = Path(p)
-                if path_obj.exists():
-                    paths.append(str(path_obj.resolve()))
+                path_obj = Path(p).resolve()
+                if path_obj.exists() and _is_within_workspace(path_obj, workspace_root):
+                    paths.append(str(path_obj))
         else:
-            # Try as-is if no glob match
-            path_obj = Path(raw_path)
-            if path_obj.exists():
-                paths.append(str(path_obj.resolve()))
+            path_obj = Path(raw_path).resolve()
+            if path_obj.exists() and _is_within_workspace(path_obj, workspace_root):
+                paths.append(str(path_obj))
 
-    # Deduplicate while preserving order
     seen = set()
     unique_paths: list[str] = []
     for p in paths:
@@ -133,6 +137,16 @@ def extract_file_refs(prompt: str) -> tuple[str, list[str]]:
             unique_paths.append(p)
 
     return cleaned, unique_paths
+
+
+def _is_within_workspace(path: Path, workspace_root: Path) -> bool:
+    """Check that a resolved path is within the workspace root."""
+    try:
+        path.relative_to(workspace_root)
+        return True
+    except ValueError:
+        logger.warning(f"Blocked path outside workspace: {path}")
+        return False
 
 
 def _build_cli_args(

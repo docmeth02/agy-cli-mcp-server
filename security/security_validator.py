@@ -48,6 +48,9 @@ class SecurityValidator:
         Returns:
             Tuple of (is_valid, list of issues)
         """
+        if not content or not isinstance(content, str):
+            return True, []
+
         issues = []
 
         # Check length
@@ -87,6 +90,9 @@ class SecurityValidator:
         Returns:
             Sanitized content
         """
+        if not content or not isinstance(content, str):
+            return ""
+
         from .credential_sanitizer import sanitize_credentials
 
         # Truncate if too long

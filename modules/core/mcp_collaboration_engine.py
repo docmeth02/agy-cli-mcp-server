@@ -321,6 +321,12 @@ async def _execute_model(model: str, prompt: str) -> dict:
 
     try:
         result = await execute_cli_with_retry(args)
+        if result.get("status") == "error":
+            return {
+                "status": "error",
+                "error": result.get("stdout", "") or result.get("stderr", ""),
+                "source": "antigravity_cli",
+            }
         return {
             "status": "success",
             "content": result.get("stdout", ""),

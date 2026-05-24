@@ -22,20 +22,20 @@ CREDENTIAL_PATTERNS = [
     (r'(?<![A-Za-z0-9/+])[A-Za-z0-9/+=]{40}(?![A-Za-z0-9/+=])', '[REDACTED_AWS_SECRET]'),
 
     # Bearer tokens
-    (r'Bearer\s+[a-zA-Z0-9._-]+', 'Bearer [REDACTED]'),
+    (r'Bearer\s+[a-zA-Z0-9._~+/=-]+', 'Bearer [REDACTED]'),
 
-    # Generic secrets
-    (r'password["\s]*[:=]["\s]*[^\s"]+', 'password=[REDACTED]'),
-    (r'secret["\s]*[:=]["\s]*[^\s"]+', 'secret=[REDACTED]'),
-    (r'token["\s]*[:=]["\s]*[^\s"]+', 'token=[REDACTED]'),
-    (r'api[_-]?key["\s]*[:=]["\s]*[^\s"]+', 'api_key=[REDACTED]'),
+    # Generic secrets (handles quoted multi-word values)
+    (r'password\s*[:=]\s*(?:"[^"]*"|\'[^\']*\'|[^\s"\']+)', 'password=[REDACTED]'),
+    (r'secret\s*[:=]\s*(?:"[^"]*"|\'[^\']*\'|[^\s"\']+)', 'secret=[REDACTED]'),
+    (r'token\s*[:=]\s*(?:"[^"]*"|\'[^\']*\'|[^\s"\']+)', 'token=[REDACTED]'),
+    (r'api[_-]?key\s*[:=]\s*(?:"[^"]*"|\'[^\']*\'|[^\s"\']+)', 'api_key=[REDACTED]'),
 
     # Private keys
     (r'-----BEGIN (RSA |EC |DSA )?PRIVATE KEY-----[\s\S]*?-----END (RSA |EC |DSA )?PRIVATE KEY-----',
      '[REDACTED_PRIVATE_KEY]'),
 
     # JWT tokens
-    (r'eyJ[A-Za-z0-9_-]*\.eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*', '[REDACTED_JWT]'),
+    (r'eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+', '[REDACTED_JWT]'),
 ]
 
 # Compile patterns for performance
@@ -120,7 +120,7 @@ class CredentialSanitizer:
                 locations.append({
                     "start": match.start(),
                     "end": match.end(),
-                    "type": replacement.strip("[]"),
+                    "type": replacement.replace("[", "").replace("]", ""),
                     "masked": replacement
                 })
 
