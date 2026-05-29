@@ -16,6 +16,21 @@ CLI_COMMAND_PATH = os.getenv("CLI_COMMAND_PATH", os.getenv("GEMINI_COMMAND_PATH"
 CLI_LOG_LEVEL = os.getenv("CLI_LOG_LEVEL", os.getenv("GEMINI_LOG_LEVEL", "INFO")).upper()
 CLI_OUTPUT_FORMAT = os.getenv("CLI_OUTPUT_FORMAT", os.getenv("GEMINI_OUTPUT_FORMAT", "json"))
 
+# Optional override for agy's own diagnostic log file (language-server startup,
+# warnings, update checks). Set CLI_LOG_FILE to a real, writable path to keep
+# that noise off stdout and make the error-pattern scan more robust. Disabled
+# by default: agy already keeps stdout clean in --print mode, and the null
+# device (os.devnull) is NOT a safe value here — agy hangs when --log-file
+# points at /dev/null. Must be a regular file path if set.
+CLI_LOG_FILE = os.getenv("CLI_LOG_FILE", "")
+
+# Extra seconds added to agy's internal --print-timeout on top of the Python
+# supervisor timeout. Python stays the authoritative supervisor (it kills the
+# subprocess at exactly `timeout`); agy's own timeout sits just above as a
+# safety net so it never preempts the configured budget, yet still self-aborts
+# if the supervisor's kill ever fails.
+CLI_PRINT_TIMEOUT_GRACE = int(os.getenv("CLI_PRINT_TIMEOUT_GRACE", "30"))
+
 # ============================================================================
 # Retry Configuration
 # ============================================================================
