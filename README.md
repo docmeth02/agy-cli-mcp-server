@@ -929,7 +929,16 @@ export CLI_COMMAND_PATH=agy     # Path to Antigravity CLI executable
 export GEMINI_TIMEOUT=300       # Fallback for CLI_TIMEOUT
 export GEMINI_LOG_LEVEL=INFO    # Fallback for CLI_LOG_LEVEL
 export GEMINI_COMMAND_PATH=agy  # Fallback for CLI_COMMAND_PATH
+export CLI_PRINT_TIMEOUT_GRACE=30  # Seconds agy's --print-timeout sits above CLI_TIMEOUT
+export CLI_LOG_FILE=            # Optional path for agy diagnostics; keeps stdout clean (do NOT use /dev/null — agy hangs)
 ```
+
+`--print-timeout`: agy's internal print-mode timeout defaults to 5 minutes. The
+server passes `--print-timeout (CLI_TIMEOUT + CLI_PRINT_TIMEOUT_GRACE)s` so that
+raising `CLI_TIMEOUT` above 300s no longer lets agy preempt a long run before the
+Python-side supervisor timeout fires. The server also sets
+`AGY_CLI_HIDE_ACCOUNT_INFO=1` on the agy subprocess so the account/credits header
+never leaks into the parsed stdout.
 
 #### Retry Configuration
 ```bash

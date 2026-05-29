@@ -14,20 +14,25 @@ These tests validate every agy calling pattern used by the MCP server:
 Each test exercises the real subprocess path through execute_cli / execute_cli_with_retry.
 """
 import json
+import os
 from pathlib import Path
 
 import pytest
 import pytest_asyncio
 
+import asyncio
+
 from modules.utils.cli_utils import (
     execute_cli,
     execute_cli_with_retry,
     _build_cli_args,
+    _apply_print_runtime_flags,
     extract_file_refs,
     sanitize_output,
     validate_cli_setup,
     CLITimeoutError,
 )
+from modules.config.cli_config import CLI_PRINT_TIMEOUT_GRACE
 
 
 # ---------------------------------------------------------------------------
@@ -508,3 +513,118 @@ class TestConversationToolRoundTrip:
         )
         result2 = await execute_cli_with_retry(args2, timeout=60)
         assert result2["status"] == "success"
+
+
+# ---------------------------------------------------------------------------
+# 12. Print-mode runtime flags (--print-timeout / --log-file) — pure, no agy
+# ---------------------------------------------------------------------------
+
+class TestPrintRuntimeFlags:
+
+    def test_injects_print_timeout_for_print_args(self):
+        out = _apply_print_runtime_flags(["--print", "hi"], timeout=300)
+        assert "--print-timeout" in out
+        idx = out.index("--print-timeout")
+        # agy budget sits just above the Python supervisor timeout.
+        assert out[idx + 1] == f"{300 + CLI_PRINT_TIMEOUT_GRACE}s"
+
+    def test_print_timeout_tracks_caller_timeout(self):
+        out = _apply_print_runtime_flags(["--print", "hi"], timeout=1800)
+        idx = out.index("--print-timeout")
+        assert out[idx + 1] == f"{1800 + CLI_PRINT_TIMEOUT_GRACE}s"
+
+    def test_preserves_print_payload_as_last_arg(self):
+        out = _apply_print_runtime_flags(["--print", "the prompt"], timeout=300)
+        assert out[-2:] == ["--print", "the prompt"]
+
+    def test_no_injection_for_non_print_args(self):
+        for base in (["--version"], ["help"]):
+            assert _apply_print_runtime_flags(list(base), timeout=300) == base
+
+    def test_does_not_override_existing_print_timeout(self):
+        base = ["--print-timeout", "5s", "--print", "hi"]
+        out = _apply_print_runtime_flags(list(base), timeout=300)
+        assert out.count("--print-timeout") == 1
+        assert "5s" in out
+
+    def test_does_not_duplicate_joined_form_flags(self):
+        # `--flag=val` form must be recognised as already-present (no dup).
+        base = ["--print-timeout=5s", "--print", "hi"]
+        out = _apply_print_runtime_flags(list(base), timeout=300)
+        assert sum(a.startswith("--print-timeout") for a in out) == 1
+
+    def test_triggers_for_prompt_alias(self):
+        out = _apply_print_runtime_flags(["--prompt", "hi"], timeout=300)
+        assert "--print-timeout" in out
+
+    def test_prompt_payload_not_treated_as_flag(self):
+        # A prompt whose text starts with a flag string must NOT suppress
+        # injection (the payload token is excluded from flag detection).
+        out = _apply_print_runtime_flags(
+            ["--print", "--print-timeout=5s"], timeout=300
+        )
+        # Injected flag present AND the prompt payload preserved verbatim.
+        assert out[:2] == ["--print-timeout", f"{300 + CLI_PRINT_TIMEOUT_GRACE}s"]
+        assert out[-2:] == ["--print", "--print-timeout=5s"]
+
+    def test_duplicate_print_flags_payloads_all_excluded(self):
+        # Every print-flag payload is excluded from detection, not just the
+        # first — a later payload starting with a flag string must not suppress.
+        out = _apply_print_runtime_flags(
+            ["--print", "one", "--print", "--print-timeout=5s"], timeout=300
+        )
+        assert out[:2] == ["--print-timeout", f"{300 + CLI_PRINT_TIMEOUT_GRACE}s"]
+
+    def test_log_file_opt_in(self, monkeypatch):
+        # Default (unset): no --log-file injected.
+        monkeypatch.setattr("modules.utils.cli_utils.CLI_LOG_FILE", "")
+        out = _apply_print_runtime_flags(["--print", "hi"], timeout=300)
+        assert "--log-file" not in out
+        # Configured: injected with the given path.
+        monkeypatch.setattr("modules.utils.cli_utils.CLI_LOG_FILE", "/tmp/agy.log")
+        out = _apply_print_runtime_flags(["--print", "hi"], timeout=300)
+        assert out[out.index("--log-file") + 1] == "/tmp/agy.log"
+
+
+class TestSubprocessEnvironment:
+    """Verify the env handed to the agy subprocess (mocked — no real agy)."""
+
+    @pytest.mark.asyncio
+    async def test_env_isolation_and_preservation(self, monkeypatch):
+        captured = {}
+
+        class _FakeProc:
+            returncode = 0
+
+            async def communicate(self):
+                return (b"OK\n", b"")
+
+            def kill(self):
+                pass
+
+            async def wait(self):
+                return 0
+
+        async def _fake_exec(*args, **kwargs):
+            captured["args"] = args
+            captured["env"] = kwargs.get("env")
+            return _FakeProc()
+
+        monkeypatch.setenv("ANTIGRAVITY_LS_ADDRESS", "localhost:9999")
+        # Even an explicit disable in the launch env must be force-overridden.
+        monkeypatch.setenv("AGY_CLI_HIDE_ACCOUNT_INFO", "0")
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+
+        result = await execute_cli(["--print", "hi"], timeout=300)
+        assert result["status"] == "success"
+
+        env = captured["env"]
+        # IDE language-server address stripped so agy uses its own backend.
+        assert "ANTIGRAVITY_LS_ADDRESS" not in env
+        # Account/credits header suppressed so it can't leak into stdout.
+        assert env["AGY_CLI_HIDE_ACCOUNT_INFO"] == "1"
+        # Critical user-space vars preserved so agy resolves ~/.gemini config.
+        assert env.get("HOME") == os.environ.get("HOME")
+        assert env.get("PATH") == os.environ.get("PATH")
+        # --print-timeout injected into the actual argv passed to the subprocess.
+        assert "--print-timeout" in captured["args"]

@@ -22,6 +22,8 @@ logger = logging.getLogger(__name__)
 from modules.config.cli_config import (
     CLI_TIMEOUT,
     CLI_COMMAND_PATH,
+    CLI_LOG_FILE,
+    CLI_PRINT_TIMEOUT_GRACE,
     RETRY_MAX_ATTEMPTS,
     RETRY_BASE_DELAY,
     RETRY_MAX_DELAY,
@@ -184,6 +186,59 @@ def _build_cli_args(
     return args
 
 
+def _apply_print_runtime_flags(args: list[str], timeout: int) -> list[str]:
+    """
+    Inject non-interactive print-mode runtime flags onto every `--print` call,
+    independent of which tool built the base args.
+
+    - ``--print-timeout``: agy's internal print-mode timeout defaults to 5m. If
+      CLI_TIMEOUT is raised above that, agy would preempt long runs before the
+      Python supervisor fires. We set it to ``timeout + grace`` so agy never
+      aborts before the configured budget, while the Python-side ``wait_for``
+      (at exactly ``timeout``) remains the authoritative supervisor and still
+      raises CLITimeoutError on overrun.
+    - ``--log-file``: only when CLI_LOG_FILE is configured (opt-in), routes
+      agy's own diagnostics (language-server startup, warnings, update checks)
+      to that file so stdout stays a clean response payload for the error scan.
+
+    Flags already present in ``args`` are never overridden. Non-print
+    invocations (``--version``, ``help``) are returned unchanged. The prompt
+    payload itself is excluded from flag detection, so a prompt whose text
+    happens to start with ``--print-timeout=`` / ``--log-file=`` does not
+    suppress injection.
+    """
+    print_flags = ("--print", "-p", "--prompt")
+
+    # Locate the print flag and the split-form prompt payload that follows it
+    # (`--print <prompt>`). The joined form (`--print=...`) has no separate
+    # payload token. Anything that isn't a print invocation is left untouched.
+    is_print = False
+    payload_idxs: set[int] = set()
+    for i, a in enumerate(args):
+        if a in print_flags:
+            is_print = True
+            payload_idxs.add(i + 1)  # next token is the prompt (split form)
+        elif any(a.startswith(f + "=") for f in print_flags):
+            is_print = True  # joined form: prompt is part of this token
+    if not is_print:
+        return args
+
+    # Scan flags only, never any prompt payload, in split and joined forms.
+    flag_tokens = [a for j, a in enumerate(args) if j not in payload_idxs]
+
+    def _has(flag: str) -> bool:
+        return any(a == flag or a.startswith(flag + "=") for a in flag_tokens)
+
+    injected: list[str] = []
+    if not _has("--print-timeout"):
+        injected += ["--print-timeout", f"{timeout + CLI_PRINT_TIMEOUT_GRACE}s"]
+    if CLI_LOG_FILE and not _has("--log-file"):
+        injected += ["--log-file", CLI_LOG_FILE]
+
+    # Prepend so injected flags precede the trailing `--print <prompt>` payload.
+    return injected + args
+
+
 async def execute_cli(
     args: list[str],
     timeout: Optional[int] = None,
@@ -205,6 +260,7 @@ async def execute_cli(
         CLIExecutionError: If command fails to execute
     """
     timeout = timeout or CLI_TIMEOUT
+    args = _apply_print_runtime_flags(args, timeout)
     start_time = time.time()
 
     METRICS["commands_executed"] += 1
@@ -213,7 +269,12 @@ async def execute_cli(
         logger.debug(f"Executing: {CLI_COMMAND_PATH} {' '.join(args)}")
 
         env = os.environ.copy()
+        # Isolate agy from any IDE language server sharing this environment.
         env.pop("ANTIGRAVITY_LS_ADDRESS", None)
+        # Force-suppress the account/credits header (set unconditionally, even
+        # if the launch env disables it) so it can never leak into the stdout
+        # the error-pattern scan parses.
+        env["AGY_CLI_HIDE_ACCOUNT_INFO"] = "1"
 
         process = await asyncio.create_subprocess_exec(
             CLI_COMMAND_PATH,
