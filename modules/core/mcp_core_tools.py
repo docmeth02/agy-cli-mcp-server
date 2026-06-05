@@ -17,7 +17,7 @@ from modules.utils.cli_utils import (
 )
 from modules.config.cli_config import (
     GEMINI_PROMPT_LIMIT,
-    DEFAULT_MODEL,
+    get_task_model,
 )
 
 logger = logging.getLogger(__name__)
@@ -34,7 +34,7 @@ async def execute_prompt(
 
     Args:
         prompt: The prompt to send
-        model: Model to use (ignored; kept for backward compatibility)
+        model: Model to use. Resolved via get_task_model().
         sandbox: Whether to use sandbox mode
         debug: Whether to enable debug output (ignored for agy)
 
@@ -48,18 +48,19 @@ async def execute_prompt(
             "error_code": "INPUT_TOO_LARGE"
         }
 
+    effective_model = get_task_model("prompt", model)
+
     cleaned_prompt, files = extract_file_refs(prompt)
     args = _build_cli_args(
         prompt=cleaned_prompt,
         sandbox=sandbox,
         debug=debug,
-        files=files
+        files=files,
+        model=effective_model,
     )
 
     try:
         result = await execute_cli_with_retry(args)
-        if model is not None and model != DEFAULT_MODEL:
-            result["model_ignored"] = True
         return result
     except CLITimeoutError as e:
         return {"status": "error", "error": str(e), "error_code": "TIMEOUT"}

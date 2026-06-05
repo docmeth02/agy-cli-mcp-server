@@ -40,6 +40,8 @@ from modules.utils.cli_utils import (
     _build_cli_args,
     get_cli_help,
     get_cli_version,
+    get_available_models,
+    validate_model,
     get_metrics,
     validate_cli_setup,
     CLIExecutionError,
@@ -186,10 +188,9 @@ try:
         GEMINI_REVIEW_LIMIT,
         GEMINI_VERIFY_LIMIT,
         GEMINI_COLLABORATION_LIMIT,
-        DEFAULT_MODEL,
+        get_task_model,
     )
 except ImportError:
-    # Default limits if config not yet available
     GEMINI_PROMPT_LIMIT = 100000
     GEMINI_SANDBOX_LIMIT = 200000
     GEMINI_SUMMARIZE_LIMIT = 400000
@@ -198,7 +199,9 @@ except ImportError:
     GEMINI_REVIEW_LIMIT = 300000
     GEMINI_VERIFY_LIMIT = 800000
     GEMINI_COLLABORATION_LIMIT = 500000
-    DEFAULT_MODEL = "gemini-2.5-flash"
+
+    def get_task_model(task: str, explicit: Optional[str] = None) -> Optional[str]:
+        return explicit or None
 
 
 @mcp.tool()
@@ -219,7 +222,9 @@ async def gemini_prompt(
 
     Args:
         prompt: The prompt to send to Antigravity CLI
-        model: Optional model to use (ignored; kept for backward compatibility)
+        model: Model to use. Use "pro" for complex reasoning or "flash" for
+               speed. Short names and full names both work. Defaults to agy's
+               default (Flash). See gemini_models() for the full list.
         sandbox: Whether to run in sandbox mode
         debug: Whether to enable debug output (ignored for agy)
         readonly: When True, instructs the AI to only respond with text and not
@@ -232,6 +237,7 @@ async def gemini_prompt(
     Examples:
         gemini_prompt(prompt="Explain quantum computing")
         gemini_prompt(prompt="Analyze @src/auth.py", readonly=True)
+        gemini_prompt(prompt="Complex analysis", model="pro")
     """
     if readonly:
         prompt = (
@@ -248,12 +254,15 @@ async def gemini_prompt(
             "error_code": "INPUT_TOO_LARGE"
         })
 
+    effective_model = get_task_model("prompt", model)
+
     cleaned_prompt, files = extract_file_refs(prompt)
     args = _build_cli_args(
         prompt=cleaned_prompt,
         sandbox=sandbox,
         debug=debug,
-        files=files
+        files=files,
+        model=effective_model,
     )
 
     try:
@@ -282,19 +291,51 @@ async def gemini_prompt(
 @mcp.tool()
 async def gemini_models() -> str:
     """
-    List all available AI models.
+    List all available AI models with selection guidance.
 
     Returns:
-        Note that Antigravity CLI manages models internally.
+        JSON with available models, short names, and per-tool defaults.
 
     Examples:
         gemini_models()
     """
+    models = await get_available_models()
+
+    if not models:
+        return json.dumps({
+            "status": "success",
+            "models": [],
+            "note": "Could not fetch models list. Use short names like "
+                    "'pro' or 'flash' which agy resolves automatically."
+        }, indent=2)
+
+    categorized = []
+    for m in models:
+        lower = m.lower()
+        if "gemini" in lower:
+            category = "primary"
+        else:
+            category = "alternative"
+        categorized.append({"name": m, "category": category})
+
+    from modules.config.cli_config import TASK_MODEL_DEFAULTS
     return json.dumps({
         "status": "success",
-        "note": "Antigravity CLI manages models internally. "
-                "No explicit model selection is available via this server. "
-                "Use 'agy' directly to inspect available models.",
+        "models": categorized,
+        "short_names": {
+            "flash": "Gemini 3.5 Flash (agy resolves tier automatically)",
+            "pro": "Gemini 3.1 Pro (agy resolves tier automatically)",
+            "claude": "Claude (agy resolves to available Claude model)",
+        },
+        "guidance": (
+            "Use 'pro' for complex reasoning, code review, and analysis. "
+            "Use 'flash' (or omit model) for fast responses and simple tasks. "
+            "Short names and full display names both work."
+        ),
+        "task_defaults": {
+            k: v or "(agy default)"
+            for k, v in TASK_MODEL_DEFAULTS.items()
+        },
     }, indent=2)
 
 
@@ -362,7 +403,8 @@ async def gemini_sandbox(
 
     Args:
         prompt: The prompt to execute in sandbox mode
-        model: Optional model to use (default: gemini-2.5-pro)
+        model: Model to use. Use "pro" for complex reasoning or "flash" for
+               speed. Defaults to agy's default (Flash).
         sandbox_image: Optional Docker image for sandbox (e.g., python:3.11-slim)
 
     Returns:
@@ -379,11 +421,14 @@ async def gemini_sandbox(
             "error_code": "INPUT_TOO_LARGE"
         })
 
+    effective_model = get_task_model("sandbox", model)
+
     cleaned_prompt, files = extract_file_refs(prompt)
     args = _build_cli_args(
         prompt=cleaned_prompt,
         sandbox=True,
-        files=files
+        files=files,
+        model=effective_model,
     )
 
     try:
@@ -473,7 +518,8 @@ async def gemini_summarize(
     Args:
         content: Content to summarize (supports @filename syntax)
         focus: Optional focus area (e.g., "architecture and design patterns")
-        model: Optional model to use
+        model: Model to use. Defaults to agy's default (Flash). Use "pro" for
+               deeper analysis of complex content.
 
     Returns:
         JSON string with summarization results
@@ -497,8 +543,10 @@ async def gemini_summarize(
         focus_text = f" Focus on: {focus}" if focus else ""
         prompt = f"IMPORTANT: This is an analysis-only task. Do NOT create, modify, or delete any files. Do NOT execute any code. Only provide your written summary.\n\nPlease summarize the following content.{focus_text}\n\n{content}"
 
+    effective_model = get_task_model("summarize", model)
+
     cleaned_prompt, files = extract_file_refs(prompt)
-    args = _build_cli_args(prompt=cleaned_prompt, files=files)
+    args = _build_cli_args(prompt=cleaned_prompt, files=files, model=effective_model)
 
     try:
         result = await execute_cli_with_retry(args)
@@ -522,7 +570,8 @@ async def gemini_summarize_files(
     Args:
         files: Files to summarize using @filename syntax (e.g., "@src/ @docs/")
         focus: Optional focus area for analysis
-        model: Optional model to use
+        model: Model to use. Defaults to agy's default (Flash). Use "pro" for
+               deeper analysis.
 
     Returns:
         JSON string with summarization results
@@ -540,8 +589,10 @@ async def gemini_summarize_files(
     focus_text = f" Focus on: {focus}" if focus else ""
     prompt = f"IMPORTANT: This is an analysis-only task. Do NOT create, modify, or delete any files. Do NOT execute any code. Only provide your written summary.\n\nAnalyze and summarize the following files.{focus_text}\n\n{files}"
 
+    effective_model = get_task_model("summarize_files", model)
+
     cleaned_prompt, files = extract_file_refs(prompt)
-    args = _build_cli_args(prompt=cleaned_prompt, files=files)
+    args = _build_cli_args(prompt=cleaned_prompt, files=files, model=effective_model)
 
     try:
         result = await execute_cli_with_retry(args)
@@ -572,7 +623,8 @@ async def gemini_eval_plan(
         plan: The plan, idea, or proposal to evaluate
         context: Optional context (e.g., "Node.js REST API with MongoDB")
         requirements: Optional requirements or constraints
-        model: Optional model to use (ignored by agy)
+        model: Model to use. Defaults to "pro" for deeper analysis. Use "flash"
+               for quick evaluations.
 
     Returns:
         JSON string with evaluation results
@@ -610,8 +662,10 @@ Provide a detailed analysis with:
 3. Missing considerations
 4. Recommendations"""
 
+    effective_model = get_task_model("eval_plan", model)
+
     cleaned_prompt, files = extract_file_refs(prompt)
-    args = _build_cli_args(prompt=cleaned_prompt, files=files)
+    args = _build_cli_args(prompt=cleaned_prompt, files=files, model=effective_model)
 
     try:
         result = await execute_cli_with_retry(args)
@@ -639,7 +693,7 @@ async def gemini_review_code(
         purpose: Purpose of the review (e.g., "Security review")
         context: Additional context
         language: Programming language
-        model: Optional model to use
+        model: Model to use. Defaults to "pro" for thorough reviews.
 
     Returns:
         JSON string with review results
@@ -677,8 +731,10 @@ Provide a detailed review covering:
 4. Performance considerations
 5. Recommendations"""
 
+    effective_model = get_task_model("review_code", model)
+
     cleaned_prompt, files = extract_file_refs(prompt)
-    args = _build_cli_args(prompt=cleaned_prompt, files=files)
+    args = _build_cli_args(prompt=cleaned_prompt, files=files, model=effective_model)
 
     try:
         result = await execute_cli_with_retry(args)
@@ -706,7 +762,7 @@ async def gemini_verify_solution(
         requirements: Original requirements
         test_criteria: Testing and performance criteria
         context: Deployment context
-        model: Optional model to use
+        model: Model to use. Defaults to "pro" for thorough verification.
 
     Returns:
         JSON string with verification results
@@ -746,8 +802,10 @@ Verify:
 5. Test coverage adequacy
 6. Production readiness"""
 
+    effective_model = get_task_model("verify_solution", model)
+
     cleaned_prompt, files = extract_file_refs(prompt)
-    args = _build_cli_args(prompt=cleaned_prompt, files=files)
+    args = _build_cli_args(prompt=cleaned_prompt, files=files, model=effective_model)
 
     try:
         result = await execute_cli_with_retry(args)
@@ -828,7 +886,8 @@ async def gemini_continue_conversation(
     Args:
         conversation_id: ID of the conversation to continue
         prompt: The new prompt/message
-        model: Optional model to use
+        model: Model to use. If omitted, reuses the model from the conversation
+               or falls back to agy's default.
 
     Returns:
         JSON with response and updated conversation state
@@ -836,7 +895,7 @@ async def gemini_continue_conversation(
     Examples:
         gemini_continue_conversation(conversation_id="conv_12345", prompt="How do I optimize this?")
     """
-    model = model or DEFAULT_MODEL
+    effective_model = get_task_model("continue_conversation", model)
 
     try:
         from modules.services.conversation_manager import ConversationManager
@@ -844,13 +903,15 @@ async def gemini_continue_conversation(
         result = await manager.continue_conversation(
             conversation_id=conversation_id,
             prompt=prompt,
-            model=model
+            model=effective_model,
         )
         return json.dumps(result, indent=2)
     except ImportError:
         logger.error("Failed to import ConversationManager", exc_info=True)
         cleaned_prompt, files = extract_file_refs(prompt)
-        args = _build_cli_args(prompt=cleaned_prompt, files=files)
+        args = _build_cli_args(
+            prompt=cleaned_prompt, files=files, model=effective_model,
+        )
         result = await execute_cli_with_retry(args)
         return json.dumps({
             "status": "success",
@@ -968,7 +1029,8 @@ async def gemini_code_review(
     language: Optional[str] = None,
     focus_areas: Optional[str] = None,
     severity_threshold: str = "info",
-    output_format: str = "structured"
+    output_format: str = "structured",
+    model: Optional[str] = None,
 ) -> str:
     """
     Comprehensive code analysis with structured output (300,000 char limit).
@@ -979,6 +1041,7 @@ async def gemini_code_review(
         focus_areas: Comma-separated focus areas (security,performance,quality,best_practices)
         severity_threshold: Minimum severity to report (info, warning, error, critical)
         output_format: Output format (structured, markdown, json)
+        model: Model to use. Defaults to "pro" for thorough code reviews.
 
     Returns:
         JSON with structured code review
@@ -993,11 +1056,11 @@ async def gemini_code_review(
             language=language,
             focus_areas=focus_areas,
             severity_threshold=severity_threshold,
-            output_format=output_format
+            output_format=output_format,
+            model=model,
         )
     except ImportError:
-        # Fallback implementation
-        model = "gemini-2.5-pro"
+        effective_model = get_task_model("code_review", model)
         focus_text = f"\n\nFocus areas: {focus_areas}" if focus_areas else ""
         lang_text = f"\n\nLanguage: {language}" if language else ""
         prompt = f"""Perform a comprehensive code review.{focus_text}{lang_text}
@@ -1008,7 +1071,7 @@ Code:
 Provide analysis in {output_format} format with severity levels."""
 
         cleaned_prompt, files = extract_file_refs(prompt)
-        args = _build_cli_args(prompt=cleaned_prompt, files=files)
+        args = _build_cli_args(prompt=cleaned_prompt, files=files, model=effective_model)
         result = await execute_cli_with_retry(args)
         return json.dumps(result, indent=2)
 
@@ -1029,7 +1092,7 @@ async def gemini_extract_structured(
         schema: JSON schema defining the output structure
         examples: Optional examples of expected output
         strict_mode: Whether to enforce strict schema compliance
-        model: Optional model to use
+        model: Model to use. Defaults to "pro" for accurate extraction.
 
     Returns:
         JSON with extracted structured data
@@ -1047,8 +1110,7 @@ async def gemini_extract_structured(
             model=model
         )
     except ImportError:
-        # Fallback implementation
-        model = model or "gemini-2.5-flash"
+        effective_model = get_task_model("extract_structured", model)
         strict_text = " Strictly follow the schema." if strict_mode else ""
         example_text = f"\n\nExamples:\n{examples}" if examples else ""
         prompt = f"""Extract structured data from the following content according to this schema.{strict_text}
@@ -1062,7 +1124,7 @@ Content:
 Return valid JSON matching the schema."""
 
         cleaned_prompt, files = extract_file_refs(prompt)
-        args = _build_cli_args(prompt=cleaned_prompt, files=files)
+        args = _build_cli_args(prompt=cleaned_prompt, files=files, model=effective_model)
         result = await execute_cli_with_retry(args)
         return json.dumps(result, indent=2)
 
@@ -1073,7 +1135,8 @@ async def gemini_git_diff_review(
     context_lines: int = 3,
     review_type: str = "comprehensive",
     base_branch: Optional[str] = None,
-    commit_message: Optional[str] = None
+    commit_message: Optional[str] = None,
+    model: Optional[str] = None,
 ) -> str:
     """
     Analyze git diffs with contextual feedback (150,000 char limit).
@@ -1084,6 +1147,7 @@ async def gemini_git_diff_review(
         review_type: Review type (comprehensive, security_only, performance_only, quick)
         base_branch: Base branch for context
         commit_message: Associated commit message
+        model: Model to use. Defaults to "pro" for thorough diff analysis.
 
     Returns:
         JSON with diff analysis
@@ -1098,11 +1162,11 @@ async def gemini_git_diff_review(
             context_lines=context_lines,
             review_type=review_type,
             base_branch=base_branch,
-            commit_message=commit_message
+            commit_message=commit_message,
+            model=model,
         )
     except ImportError:
-        # Fallback implementation
-        model = "gemini-2.5-pro"
+        effective_model = get_task_model("git_diff_review", model)
         branch_text = f"\n\nBase branch: {base_branch}" if base_branch else ""
         commit_text = f"\n\nCommit message: {commit_message}" if commit_message else ""
         prompt = f"""Review the following git diff ({review_type} review).{branch_text}{commit_text}
@@ -1117,7 +1181,7 @@ Provide feedback on:
 4. Suggestions for improvement"""
 
         cleaned_prompt, files = extract_file_refs(prompt)
-        args = _build_cli_args(prompt=cleaned_prompt, files=files)
+        args = _build_cli_args(prompt=cleaned_prompt, files=files, model=effective_model)
         result = await execute_cli_with_retry(args)
         return json.dumps(result, indent=2)
 
@@ -1132,7 +1196,8 @@ async def gemini_content_comparison(
     comparison_type: str = "semantic",
     output_format: str = "structured",
     include_metrics: bool = True,
-    focus_areas: Optional[str] = None
+    focus_areas: Optional[str] = None,
+    model: Optional[str] = None,
 ) -> str:
     """
     Advanced multi-source content comparison and analysis (400,000 char limit).
@@ -1143,6 +1208,7 @@ async def gemini_content_comparison(
         output_format: Output format (structured, matrix, summary, detailed, json)
         include_metrics: Include similarity scores and metrics
         focus_areas: Comma-separated focus areas
+        model: Model to use. Defaults to "pro" for thorough comparison.
 
     Returns:
         JSON with comparison results
@@ -1157,11 +1223,11 @@ async def gemini_content_comparison(
             comparison_type=comparison_type,
             output_format=output_format,
             include_metrics=include_metrics,
-            focus_areas=focus_areas
+            focus_areas=focus_areas,
+            model=model,
         )
     except ImportError:
-        # Fallback implementation
-        model = "gemini-2.5-pro"
+        effective_model = get_task_model("content_comparison", model)
         focus_text = f"\n\nFocus on: {focus_areas}" if focus_areas else ""
         prompt = f"""Compare the following sources using {comparison_type} comparison.{focus_text}
 
@@ -1171,7 +1237,7 @@ Sources:
 Provide a {output_format} comparison{"with similarity metrics" if include_metrics else ""}."""
 
         cleaned_prompt, files = extract_file_refs(prompt)
-        args = _build_cli_args(prompt=cleaned_prompt, files=files)
+        args = _build_cli_args(prompt=cleaned_prompt, files=files, model=effective_model)
         result = await execute_cli_with_retry(args)
         return json.dumps(result, indent=2)
 
@@ -1209,7 +1275,7 @@ async def gemini_ai_collaboration(
     Args:
         collaboration_mode: Mode (sequential, debate, validation)
         content: Content to analyze
-        models: Comma-separated model list
+        models: Comma-separated model list (e.g., "pro,flash,claude" for diverse debate)
         context: Additional context
         conversation_id: For stateful conversations
         budget_limit: Deprecated (agy does not support cost budgeting)
@@ -1253,30 +1319,29 @@ async def gemini_ai_collaboration(
             focus=focus
         )
     except ImportError:
-        # Fallback - simplified collaboration
-        model_list = (models or "gemini-2.5-flash").split(",")
+        model_list = (models or "flash").split(",")
         results = []
 
-        for model in model_list:
-            model = model.strip()
+        for m in model_list:
+            m = m.strip()
             mode_prompt = {
                 "sequential": f"Analyze the following content:\n\n{content}",
                 "debate": f"Provide your perspective on:\n\n{content}",
                 "validation": f"Validate the following:\n\n{content}"
             }.get(collaboration_mode, content)
 
-            if model.startswith("gemini"):
-                cleaned_prompt, files = extract_file_refs(mode_prompt)
-                args = _build_cli_args(prompt=cleaned_prompt, files=files)
-                try:
-                    result = await execute_cli_with_retry(args)
-                    results.append({
-                        "model": model,
-                        "response": result.get("stdout", ""),
-                        "model_ignored": True,
-                    })
-                except Exception as e:
-                    results.append({"model": model, "error": str(e)})
+            cleaned_prompt, files = extract_file_refs(mode_prompt)
+            args = _build_cli_args(
+                prompt=cleaned_prompt, files=files, model=m or None,
+            )
+            try:
+                result = await execute_cli_with_retry(args)
+                results.append({
+                    "model": m,
+                    "response": result.get("stdout", ""),
+                })
+            except Exception as e:
+                results.append({"model": m, "error": str(e)})
 
         return json.dumps({
             "status": "success",

@@ -17,6 +17,7 @@ from modules.utils.cli_utils import (
 )
 from modules.config.cli_config import (
     GEMINI_CONTENT_COMPARISON_LIMIT,
+    get_task_model,
 )
 
 logger = logging.getLogger(__name__)
@@ -27,7 +28,9 @@ async def execute_content_comparison(
     comparison_type: str = "semantic",
     output_format: str = "structured",
     include_metrics: bool = True,
-    focus_areas: Optional[str] = None
+    focus_areas: Optional[str] = None,
+    *,
+    model: Optional[str] = None,
 ) -> str:
     """
     Execute advanced multi-source content comparison.
@@ -85,12 +88,13 @@ Sources:
 
 Provide a {output_format} comparison{"with similarity metrics" if include_metrics else ""}."""
 
+    effective_model = get_task_model("content_comparison", model)
+
     cleaned_prompt, files = extract_file_refs(prompt)
-    args = _build_cli_args(prompt=cleaned_prompt, files=files)
+    args = _build_cli_args(prompt=cleaned_prompt, files=files, model=effective_model)
 
     try:
         result = await execute_cli_with_retry(args)
-        result["model_ignored"] = True
         return json.dumps(result, indent=2)
     except (CLITimeoutError, CLIRateLimitError, CLIExecutionError) as e:
         return json.dumps({

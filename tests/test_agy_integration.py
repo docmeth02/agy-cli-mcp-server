@@ -27,12 +27,13 @@ from modules.utils.cli_utils import (
     execute_cli_with_retry,
     _build_cli_args,
     _apply_print_runtime_flags,
+    _parse_version,
     extract_file_refs,
     sanitize_output,
     validate_cli_setup,
     CLITimeoutError,
 )
-from modules.config.cli_config import CLI_PRINT_TIMEOUT_GRACE
+from modules.config.cli_config import CLI_PRINT_TIMEOUT_GRACE, get_task_model
 
 
 # ---------------------------------------------------------------------------
@@ -331,6 +332,98 @@ class TestBuildCliArgs:
         args = _build_cli_args(prompt=prompt)
         assert args[-1] == prompt
 
+    def test_model_flag_injected(self):
+        args = _build_cli_args(prompt="hello", model="pro")
+        assert "--model" in args
+        assert args[args.index("--model") + 1] == "pro"
+
+    def test_model_none_omits_flag(self):
+        args = _build_cli_args(prompt="hello", model=None)
+        assert "--model" not in args
+
+    def test_model_empty_string_omits_flag(self):
+        args = _build_cli_args(prompt="hello", model="")
+        assert "--model" not in args
+
+    def test_model_before_print(self):
+        args = _build_cli_args(prompt="hello", model="pro")
+        assert args.index("--model") < args.index("--print")
+
+    def test_model_with_spaces(self):
+        args = _build_cli_args(prompt="hello", model="Gemini 3.5 Flash (Medium)")
+        assert args[args.index("--model") + 1] == "Gemini 3.5 Flash (Medium)"
+
+    def test_model_with_sandbox_and_files(self, sample_file):
+        args = _build_cli_args(
+            prompt="test", sandbox=True, files=[str(sample_file)], model="pro",
+        )
+        assert "--model" in args
+        assert "--sandbox" in args
+        assert "--add-dir" in args
+
+
+# ---------------------------------------------------------------------------
+# Model configuration resolution
+# ---------------------------------------------------------------------------
+
+class TestModelConfig:
+
+    def test_explicit_model_wins(self):
+        assert get_task_model("prompt", "claude") == "claude"
+
+    def test_task_default_pro(self):
+        assert get_task_model("eval_plan") == "pro"
+        assert get_task_model("code_review") == "pro"
+        assert get_task_model("review_code") == "pro"
+
+    def test_task_default_none_for_lightweight(self):
+        assert get_task_model("prompt") is None
+        assert get_task_model("summarize") is None
+        assert get_task_model("sandbox") is None
+
+    def test_unknown_task_returns_none(self):
+        assert get_task_model("nonexistent_task") is None
+
+    def test_explicit_overrides_task_default(self):
+        assert get_task_model("eval_plan", "flash") == "flash"
+
+
+class TestParseVersion:
+
+    def test_bare_version(self):
+        assert _parse_version("1.0.5") == (1, 0, 5)
+
+    def test_prefixed_version(self):
+        assert _parse_version("agy 1.0.5") == (1, 0, 5)
+
+    def test_version_with_whitespace(self):
+        assert _parse_version("  1.0.5\n") == (1, 0, 5)
+
+    def test_garbage_returns_zeros(self):
+        assert _parse_version("not-a-version") == (0, 0, 0)
+
+    def test_empty_string(self):
+        assert _parse_version("") == (0, 0, 0)
+
+
+# ---------------------------------------------------------------------------
+# Model selection integration (requires real agy)
+# ---------------------------------------------------------------------------
+
+class TestModelIntegration:
+
+    @pytest.mark.asyncio
+    async def test_model_flag_works_with_pro(self):
+        args = _build_cli_args(prompt="Reply with only the word OK", model="pro")
+        result = await execute_cli_with_retry(args)
+        assert result["status"] == "success"
+
+    @pytest.mark.asyncio
+    async def test_model_flag_works_with_flash(self):
+        args = _build_cli_args(prompt="Reply with only the word OK", model="flash")
+        result = await execute_cli_with_retry(args)
+        assert result["status"] == "success"
+
 
 # ---------------------------------------------------------------------------
 # 9. Retry logic
@@ -415,7 +508,9 @@ class TestMCPToolRoundTrip:
         raw = await gemini_models()
         result = json.loads(raw)
         assert result["status"] == "success"
-        assert "Antigravity" in result["note"]
+        assert "models" in result
+        assert len(result["models"]) > 0
+        assert "guidance" in result
 
     @pytest.mark.asyncio
     async def test_gemini_metrics_tool(self):
