@@ -20,6 +20,7 @@ from modules.config.cli_config import (
     GEMINI_CODE_REVIEW_LIMIT,
     GEMINI_EXTRACT_STRUCTURED_LIMIT,
     GEMINI_GIT_DIFF_LIMIT,
+    get_task_model,
 )
 
 logger = logging.getLogger(__name__)
@@ -30,7 +31,9 @@ async def execute_code_review(
     language: Optional[str] = None,
     focus_areas: Optional[str] = None,
     severity_threshold: str = "info",
-    output_format: str = "structured"
+    output_format: str = "structured",
+    *,
+    model: Optional[str] = None,
 ) -> str:
     """
     Execute a comprehensive code review with structured output.
@@ -74,12 +77,13 @@ Code:
 
 Provide analysis in {output_format} format with severity levels."""
 
+    effective_model = get_task_model("code_review", model)
+
     cleaned_prompt, files = extract_file_refs(prompt)
-    args = _build_cli_args(prompt=cleaned_prompt, files=files)
+    args = _build_cli_args(prompt=cleaned_prompt, files=files, model=effective_model)
 
     try:
         result = await execute_cli_with_retry(args)
-        result["model_ignored"] = True
         return json.dumps(result, indent=2)
     except (CLITimeoutError, CLIRateLimitError, CLIExecutionError) as e:
         return json.dumps({
@@ -103,7 +107,7 @@ async def execute_extract_structured(
         schema: JSON schema for output
         examples: Optional examples
         strict_mode: Enforce strict schema compliance
-        model: Model to use (ignored; kept for backward compatibility)
+        model: Model to use. Resolved via get_task_model().
 
     Returns:
         JSON string with extracted data
@@ -147,13 +151,13 @@ Content:
 
 Return valid JSON matching the schema."""
 
+    effective_model = get_task_model("extract_structured", model)
+
     cleaned_prompt, files = extract_file_refs(prompt)
-    args = _build_cli_args(prompt=cleaned_prompt, files=files)
+    args = _build_cli_args(prompt=cleaned_prompt, files=files, model=effective_model)
 
     try:
         result = await execute_cli_with_retry(args)
-        if model != "gemini-2.5-flash":
-            result["model_ignored"] = True
         return json.dumps(result, indent=2)
     except (CLITimeoutError, CLIRateLimitError, CLIExecutionError) as e:
         return json.dumps({
@@ -167,7 +171,9 @@ async def execute_git_diff_review(
     context_lines: int = 3,
     review_type: str = "comprehensive",
     base_branch: Optional[str] = None,
-    commit_message: Optional[str] = None
+    commit_message: Optional[str] = None,
+    *,
+    model: Optional[str] = None,
 ) -> str:
     """
     Analyze git diffs with contextual feedback.
@@ -212,12 +218,13 @@ Provide feedback on:
 3. Security implications
 4. Suggestions for improvement"""
 
+    effective_model = get_task_model("git_diff_review", model)
+
     cleaned_prompt, files = extract_file_refs(prompt)
-    args = _build_cli_args(prompt=cleaned_prompt, files=files)
+    args = _build_cli_args(prompt=cleaned_prompt, files=files, model=effective_model)
 
     try:
         result = await execute_cli_with_retry(args)
-        result["model_ignored"] = True
         return json.dumps(result, indent=2)
     except (CLITimeoutError, CLIRateLimitError, CLIExecutionError) as e:
         return json.dumps({

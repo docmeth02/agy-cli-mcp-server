@@ -58,14 +58,57 @@ GEMINI_GIT_DIFF_LIMIT = int(os.getenv("GEMINI_GIT_DIFF_LIMIT", "150000"))
 GEMINI_CONTENT_COMPARISON_LIMIT = int(os.getenv("GEMINI_CONTENT_COMPARISON_LIMIT", "400000"))
 
 # ============================================================================
-# Model Configuration (no-ops for backward compatibility)
+# Model Configuration (agy 1.0.5+)
 # ============================================================================
-# Antigravity CLI does not support --model. These symbols are kept as stubs
-# so existing imports do not break during the transition.
+# agy supports --model with short names ("pro", "flash", "claude") or full
+# display names ("Gemini 3.5 Flash (Medium)"). Empty string = let agy decide.
 
-DEFAULT_MODEL = os.getenv("GEMINI_DEFAULT_MODEL", "gemini-2.5-flash")
-FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash")
-ENABLE_FALLBACK = os.getenv("GEMINI_ENABLE_FALLBACK", "true").lower() == "true"
+DEFAULT_MODEL = os.getenv(
+    "CLI_DEFAULT_MODEL", os.getenv("GEMINI_DEFAULT_MODEL", "")
+)
+FALLBACK_MODEL = os.getenv(
+    "CLI_FALLBACK_MODEL", os.getenv("GEMINI_FALLBACK_MODEL", "")
+)
+ENABLE_FALLBACK = os.getenv(
+    "CLI_ENABLE_FALLBACK", os.getenv("GEMINI_ENABLE_FALLBACK", "false")
+).lower() == "true"
+
+# Per-task default models. "pro" for complex reasoning, None for agy's default.
+# Override any task via CLI_MODEL_{TASK} or GEMINI_MODEL_{TASK} env vars.
+TASK_MODEL_DEFAULTS: dict[str, Optional[str]] = {
+    "eval_plan": "pro",
+    "review_code": "pro",
+    "verify_solution": "pro",
+    "code_review": "pro",
+    "extract_structured": "pro",
+    "git_diff_review": "pro",
+    "content_comparison": "pro",
+    "prompt": None,
+    "summarize": None,
+    "summarize_files": None,
+    "sandbox": None,
+    "continue_conversation": None,
+}
+
+
+def get_task_model(task: str, explicit: Optional[str] = None) -> Optional[str]:
+    """
+    Resolve the effective model for a tool invocation.
+
+    Resolution order: explicit caller choice > env var override > task default.
+    Returns None when no model should be passed (let agy decide).
+    """
+    if explicit:
+        return explicit
+
+    env_key = task.upper()
+    env_model = os.getenv(
+        f"CLI_MODEL_{env_key}", os.getenv(f"GEMINI_MODEL_{env_key}", "")
+    )
+    if env_model:
+        return env_model
+
+    return TASK_MODEL_DEFAULTS.get(task)
 
 # ============================================================================
 # Rate Limiting Configuration
@@ -103,11 +146,13 @@ def get_config_summary() -> dict:
             "collaboration": GEMINI_COLLABORATION_LIMIT,
         },
         "models": {
-            "note": "Antigravity CLI manages models internally. "
-                    "No explicit model selection available.",
-            "default": DEFAULT_MODEL,
-            "fallback": FALLBACK_MODEL,
+            "default": DEFAULT_MODEL or "(agy default)",
+            "fallback": FALLBACK_MODEL or "(none)",
             "fallback_enabled": ENABLE_FALLBACK,
+            "task_defaults": {
+                k: v or "(agy default)"
+                for k, v in TASK_MODEL_DEFAULTS.items()
+            },
         },
         "rate_limiting": {
             "requests": GEMINI_RATE_LIMIT_REQUESTS,

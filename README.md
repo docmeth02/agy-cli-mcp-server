@@ -372,7 +372,7 @@ gemini_ai_collaboration(
 **Universal Parameters:**
 - **`collaboration_mode`** (required): `sequential` | `debate` | `validation`
 - **`content`** (required): Content to be analyzed/processed
-- **`models`** (optional): Comma-separated list of AI models (auto-selected if not provided; note: `model` parameter is accepted but ignored by agy)
+- **`models`** (optional): Comma-separated list of AI models (e.g., "pro,flash,claude" for diverse debate; auto-selected if not provided)
 - **`context`** (optional): Additional context for collaboration
 - **`conversation_id`** (optional): For stateful conversation history
 
@@ -836,7 +836,7 @@ Each tool has optimized character limits based on typical use cases:
 
 ### Model Selection
 
-The `model` parameter is accepted on all tools for backward compatibility but is currently **ignored**. Antigravity CLI (`agy`) does not expose a `--model` flag, environment variable, or config key for model selection as of v1.0. The model is determined by your Google account tier (e.g. Gemini 3.5 Flash). A `--model` CLI flag is planned for a future agy release — once available, this server will wire it up automatically.
+The `model` parameter on all tools is passed through to `agy --model` (requires agy >= 1.0.5). Short names like `"pro"`, `"flash"`, and `"claude"` are resolved by agy automatically. Complex tools (eval_plan, review_code, verify_solution, code_review, extract_structured, git_diff_review, content_comparison) default to `"pro"` for deeper reasoning; lightweight tools let agy decide (Flash). Use `gemini_models()` to list all available models. Per-task defaults can be overridden via `CLI_MODEL_{TASK}` / `GEMINI_MODEL_{TASK}` environment variables.
 
 The server ensures agy always runs with its own isolated backend by unsetting `ANTIGRAVITY_LS_ADDRESS`, preventing interference from any IDE language server running in the same environment.
 
@@ -966,8 +966,8 @@ export GEMINI_GIT_DIFF_REVIEW_LIMIT=150000  # gemini_git_diff_review character l
 #### Model Fallback
 ```bash
 export GEMINI_ENABLE_FALLBACK=true     # Enable automatic model fallback
-export GEMINI_DEFAULT_MODEL=gemini-2.5-flash      # Default model (accepted but ignored by agy)
-export GEMINI_FALLBACK_MODEL=gemini-2.5-flash     # Fallback model (accepted but ignored by agy)
+export GEMINI_DEFAULT_MODEL=                       # Global default model (empty = let agy decide)
+export GEMINI_FALLBACK_MODEL=                      # Fallback model (empty = none)
 ```
 
 #### Rate Limiting
@@ -1198,7 +1198,7 @@ python -m pytest tests/ -v -k "not prompt and not sandbox and not lifecycle and 
 **Solutions**:
 1. Wait for rate limit window to reset
 2. Increase limits: `export GEMINI_RATE_LIMIT_REQUESTS=500`
-3. Use faster model: Switch to `gemini-2.5-flash`
+3. Use faster model: Set `model="flash"` on the tool call
 
 #### Large Content Failures
 

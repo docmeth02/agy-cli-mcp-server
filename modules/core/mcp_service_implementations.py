@@ -21,6 +21,7 @@ from modules.utils.cli_utils import (
 )
 from modules.config.cli_config import (
     GEMINI_SANDBOX_LIMIT,
+    get_task_model,
 )
 
 logger = logging.getLogger(__name__)
@@ -36,7 +37,7 @@ async def execute_sandbox(
 
     Args:
         prompt: The prompt to execute
-        model: Model to use (ignored; kept for backward compatibility)
+        model: Model to use. Resolved via get_task_model().
         sandbox_image: Optional Docker image for sandbox (ignored for agy)
 
     Returns:
@@ -52,17 +53,18 @@ async def execute_sandbox(
     if sandbox_image:
         logger.warning(f"sandbox_image='{sandbox_image}' ignored: agy does not support custom sandbox images")
 
+    effective_model = get_task_model("sandbox", model)
+
     cleaned_prompt, files = extract_file_refs(prompt)
     args = _build_cli_args(
         prompt=cleaned_prompt,
         sandbox=True,
-        files=files
+        files=files,
+        model=effective_model,
     )
 
     try:
         result = await execute_cli_with_retry(args)
-        if model is not None:
-            result["model_ignored"] = True
         if sandbox_image:
             result["sandbox_image_ignored"] = True
         return result
@@ -110,7 +112,7 @@ def get_rate_limiting_statistics() -> dict:
         "fallback_count": metrics.get("fallback_count", 0),
         "commands_executed": metrics.get("commands_executed", 0),
         "success_rate": metrics.get("success_rate", 0),
-        "note": "Per-model rate limiting removed: agy does not expose model selection"
+        "note": "Per-model rate limiting not implemented; agy handles rate limits internally"
     }
 
     return rate_stats

@@ -32,6 +32,10 @@ from modules.config.cli_config import (
 # Caches with TTL
 HELP_CACHE: TTLCache = TTLCache(maxsize=1, ttl=1800)  # 30 min
 VERSION_CACHE: TTLCache = TTLCache(maxsize=1, ttl=1800)  # 30 min
+MODELS_CACHE: TTLCache = TTLCache(maxsize=1, ttl=1800)  # 30 min
+
+# Minimum agy version that supports --model
+_MIN_MODEL_VERSION = (1, 0, 5)
 
 # Metrics tracking
 METRICS = {
@@ -151,6 +155,17 @@ def _is_within_workspace(path: Path, workspace_root: Path) -> bool:
         return False
 
 
+def _parse_version(version_str: str) -> tuple[int, ...]:
+    """Parse a version string like '1.0.5' or 'agy 1.0.5' into a comparable tuple."""
+    try:
+        match = re.search(r'(\d+\.\d+\.\d+)', version_str.strip())
+        if match:
+            return tuple(int(x) for x in match.group(1).split("."))
+        return (0, 0, 0)
+    except (ValueError, AttributeError):
+        return (0, 0, 0)
+
+
 def _build_cli_args(
     prompt: str,
     sandbox: bool = False,
@@ -158,6 +173,7 @@ def _build_cli_args(
     files: Optional[list[str]] = None,
     conversation_id: Optional[str] = None,
     continue_conversation: bool = False,
+    model: Optional[str] = None,
 ) -> list[str]:
     """Build argument list for Antigravity CLI execution."""
     args: list[str] = []
@@ -173,9 +189,17 @@ def _build_cli_args(
         args.append("--sandbox")
 
     if debug:
-        # agy --debug is hidden/undocumented and produces a system report.
-        # We ignore it for normal execution and log a warning.
         logger.warning("debug=True ignored: agy --debug produces a system report instead of answering prompts")
+
+    if model:
+        cached_version = VERSION_CACHE.get("version", "")
+        if cached_version and _parse_version(cached_version) < _MIN_MODEL_VERSION:
+            logger.warning(
+                f"--model requires agy >= {'.'.join(str(v) for v in _MIN_MODEL_VERSION)}, "
+                f"found {cached_version}; skipping --model flag"
+            )
+        else:
+            args.extend(["--model", model])
 
     if conversation_id:
         args.extend(["--conversation", conversation_id])
@@ -364,8 +388,7 @@ async def execute_cli_with_retry(
     """
     Execute Antigravity CLI with exponential backoff retry.
 
-    Note: Model fallback is not supported because agy does not expose
-    a --model flag. Retries are for transient errors only.
+    Retries are for transient errors (rate limits, timeouts) only.
 
     Args:
         args: Command line arguments for agy
@@ -441,6 +464,55 @@ async def get_cli_version() -> str:
     output = result["stdout"] if result["status"] == "success" else result["stderr"]
     VERSION_CACHE[cache_key] = output
     return output
+
+
+async def get_available_models() -> list[str]:
+    """Get available models from agy with caching."""
+    cache_key = "models"
+
+    if cache_key in MODELS_CACHE:
+        METRICS["cache_hits"] += 1
+        return MODELS_CACHE[cache_key]
+
+    METRICS["cache_misses"] += 1
+    try:
+        result = await execute_cli(["models"], timeout=30)
+        if result["status"] == "success" and result["stdout"]:
+            models = [
+                line.strip()
+                for line in result["stdout"].strip().splitlines()
+                if line.strip()
+            ]
+            MODELS_CACHE[cache_key] = models
+            return models
+    except Exception as e:
+        logger.warning(f"Failed to fetch models list: {e}")
+
+    return []
+
+
+async def validate_model(model: str) -> tuple[bool, str]:
+    """
+    Validate a model name against the available models list.
+
+    Returns (True, "") if valid or unverifiable (fail-open),
+    (False, warning_message) if the model is not in the known list.
+    """
+    models = await get_available_models()
+    if not models:
+        return (True, "")
+
+    lower_model = model.lower()
+    for m in models:
+        if lower_model == m.lower() or lower_model in m.lower():
+            return (True, "")
+
+    available = ", ".join(models)
+    return (
+        False,
+        f"Unknown model '{model}'. Available models: {available}. "
+        "agy may silently fall back to its default model."
+    )
 
 
 def get_metrics() -> dict:

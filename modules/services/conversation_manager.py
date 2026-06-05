@@ -137,11 +137,11 @@ class ConversationManager:
         if not meta and not _conversation_exists(conversation_id):
             return {"status": "error", "error": f"Conversation {conversation_id} not found"}
 
-        # Build agy args
         from modules.utils.cli_utils import _build_cli_args
         args = _build_cli_args(
             prompt=prompt,
-            conversation_id=conversation_id
+            conversation_id=conversation_id,
+            model=model,
         )
 
         try:
@@ -160,8 +160,12 @@ class ConversationManager:
                 "status": result.get("status", "success"),
                 "conversation_id": conversation_id,
                 "response": result.get("stdout", ""),
-                "model_ignored": model is not None,
             }
+            if model:
+                response["model"] = model
+                if conversation_id in metadata:
+                    metadata[conversation_id]["model"] = model
+                    _save_metadata(metadata)
             if result.get("stderr"):
                 response["stderr"] = result["stderr"]
             return response

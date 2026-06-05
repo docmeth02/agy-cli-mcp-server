@@ -22,11 +22,10 @@ from modules.config.cli_config import (
 
 logger = logging.getLogger(__name__)
 
-# Default model selections by mode (agy-only; no OpenRouter models)
 DEFAULT_MODELS = {
-    "sequential": "gemini-2.5-flash",
-    "debate": "gemini-2.5-flash",
-    "validation": "gemini-2.5-flash",
+    "sequential": "flash,pro",
+    "debate": "pro,flash,claude",
+    "validation": "pro,flash",
 }
 
 
@@ -58,7 +57,7 @@ async def execute_collaboration(
     Args:
         collaboration_mode: Mode (sequential, debate, validation)
         content: Content to analyze
-        models: Comma-separated model list (ignored; agy manages models internally)
+        models: Comma-separated model list (e.g., "pro,flash,claude" for debate)
         context: Additional context
         Other mode-specific parameters
 
@@ -160,7 +159,7 @@ Content:
 
 Perform {stage} analysis."""
 
-        # Execute with appropriate model (ignored by agy, kept for logging)
+        # Execute with the model assigned to this pipeline stage
         result = await _execute_model(model, prompt)
 
         results.append({
@@ -182,7 +181,6 @@ Perform {stage} analysis."""
         "stages_completed": len(results),
         "results": results,
         "summary": summary,
-        "model_ignored": True,
     }, indent=2)
 
 
@@ -251,7 +249,6 @@ Provide your perspective."""
         "rounds_completed": rounds,
         "arguments": all_arguments,
         "synthesis": synthesis,
-        "model_ignored": True,
     }, indent=2)
 
 
@@ -310,14 +307,13 @@ Provide validation results."""
         "confidence_threshold": confidence_threshold,
         "validations": validations,
         "consensus": consensus,
-        "model_ignored": True,
     }, indent=2)
 
 
 async def _execute_model(model: str, prompt: str) -> dict:
     """Execute a prompt with the specified model via agy."""
     cleaned_prompt, files = extract_file_refs(prompt)
-    args = _build_cli_args(prompt=cleaned_prompt, files=files)
+    args = _build_cli_args(prompt=cleaned_prompt, files=files, model=model or None)
 
     try:
         result = await execute_cli_with_retry(args)
@@ -331,7 +327,7 @@ async def _execute_model(model: str, prompt: str) -> dict:
             "status": "success",
             "content": result.get("stdout", ""),
             "source": "antigravity_cli",
-            "model_ignored": True,
+            "model": model,
         }
     except Exception as e:
         return {"status": "error", "error": str(e)}
@@ -351,7 +347,7 @@ async def _generate_pipeline_summary(
         )
         prompt = get_pipeline_summary_prompt(original_content, all_outputs, stages)
 
-        result = await _execute_model("gemini-2.5-flash", prompt)
+        result = await _execute_model("flash", prompt)
         return result.get("content", result.get("stdout", "Pipeline complete"))
     except Exception as e:
         logger.error(f"Error generating pipeline summary: {e}")
@@ -373,7 +369,7 @@ async def _generate_debate_synthesis(
         )
         prompt = get_debate_synthesis_prompt(topic, args_text, debate_style, total_rounds)
 
-        result = await _execute_model("gemini-2.5-flash", prompt)
+        result = await _execute_model("flash", prompt)
         return result.get("content", result.get("stdout", "Debate concluded"))
     except Exception as e:
         logger.error(f"Error generating debate synthesis: {e}")
@@ -398,7 +394,7 @@ async def _build_consensus(
             content, all_validations, validation_criteria, consensus_method, conflict_resolution
         )
 
-        result = await _execute_model("gemini-2.5-flash", prompt)
+        result = await _execute_model("flash", prompt)
         return result.get("content", result.get("stdout", "Consensus reached"))
     except Exception as e:
         logger.error(f"Error building consensus: {e}")
