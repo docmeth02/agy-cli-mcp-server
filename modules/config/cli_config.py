@@ -127,38 +127,3 @@ GEMINI_RATE_LIMIT_WINDOW = int(os.getenv("GEMINI_RATE_LIMIT_WINDOW", "60"))
 JSONRPC_MAX_REQUEST_SIZE = int(os.getenv("JSONRPC_MAX_REQUEST_SIZE", "1048576"))
 JSONRPC_MAX_NESTING_DEPTH = int(os.getenv("JSONRPC_MAX_NESTING_DEPTH", "10"))
 JSONRPC_STRICT_MODE = os.getenv("JSONRPC_STRICT_MODE", "true").lower() == "true"
-
-
-def get_config_summary() -> dict:
-    """Get a summary of current configuration."""
-    return {
-        "core": {
-            "timeout": CLI_TIMEOUT,
-            "command_path": CLI_COMMAND_PATH,
-            "log_level": CLI_LOG_LEVEL,
-            "output_format": CLI_OUTPUT_FORMAT,
-        },
-        "limits": {
-            "prompt": GEMINI_PROMPT_LIMIT,
-            "sandbox": GEMINI_SANDBOX_LIMIT,
-            "summarize": GEMINI_SUMMARIZE_LIMIT,
-            "summarize_files": GEMINI_SUMMARIZE_FILES_LIMIT,
-            "eval": GEMINI_EVAL_LIMIT,
-            "review": GEMINI_REVIEW_LIMIT,
-            "verify": GEMINI_VERIFY_LIMIT,
-            "collaboration": GEMINI_COLLABORATION_LIMIT,
-        },
-        "models": {
-            "default": DEFAULT_MODEL or "(agy default)",
-            "fallback": FALLBACK_MODEL or "(none)",
-            "fallback_enabled": ENABLE_FALLBACK,
-            "task_defaults": {
-                k: v or "(agy default)"
-                for k, v in TASK_MODEL_DEFAULTS.items()
-            },
-        },
-        "rate_limiting": {
-            "requests": GEMINI_RATE_LIMIT_REQUESTS,
-            "window_seconds": GEMINI_RATE_LIMIT_WINDOW,
-        },
-    }

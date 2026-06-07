@@ -1,20 +1,6 @@
 """
-Configuration modules for Antigravity CLI MCP Server
+Configuration for Antigravity CLI MCP Server.
+
+All config is in cli_config.py. Import directly:
+    from modules.config.cli_config import CLI_TIMEOUT, get_task_model, ...
 """
-from .cli_config import (
-    CLI_TIMEOUT,
-    CLI_COMMAND_PATH,
-    CLI_LOG_LEVEL,
-    GEMINI_PROMPT_LIMIT,
-    GEMINI_SANDBOX_LIMIT,
-    GEMINI_SUMMARIZE_LIMIT,
-    GEMINI_SUMMARIZE_FILES_LIMIT,
-    GEMINI_EVAL_LIMIT,
-    GEMINI_REVIEW_LIMIT,
-    GEMINI_VERIFY_LIMIT,
-    GEMINI_COLLABORATION_LIMIT,
-    DEFAULT_MODEL,
-    FALLBACK_MODEL,
-    TASK_MODEL_DEFAULTS,
-    get_task_model,
-)

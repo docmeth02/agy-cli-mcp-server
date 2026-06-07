@@ -1,3 +1,3 @@
 """
-Gemini CLI MCP Server Modules
+Antigravity CLI MCP Server modules.
 """
