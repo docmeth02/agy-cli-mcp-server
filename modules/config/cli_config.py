@@ -66,6 +66,9 @@ GEMINI_CONTENT_COMPARISON_LIMIT = int(os.getenv("GEMINI_CONTENT_COMPARISON_LIMIT
 DEFAULT_MODEL = os.getenv(
     "CLI_DEFAULT_MODEL", os.getenv("GEMINI_DEFAULT_MODEL", "")
 )
+# Reserved for future model-retry logic in execute_cli_with_retry().
+# Not wired yet — automatic model fallback during an MCP session is too
+# complex/risky to enable without careful design.
 FALLBACK_MODEL = os.getenv(
     "CLI_FALLBACK_MODEL", os.getenv("GEMINI_FALLBACK_MODEL", "")
 )
@@ -95,7 +98,7 @@ def get_task_model(task: str, explicit: Optional[str] = None) -> Optional[str]:
     """
     Resolve the effective model for a tool invocation.
 
-    Resolution order: explicit caller choice > env var override > task default.
+    Resolution: explicit > env var > task default > DEFAULT_MODEL > None.
     Returns None when no model should be passed (let agy decide).
     """
     if explicit:
@@ -108,7 +111,7 @@ def get_task_model(task: str, explicit: Optional[str] = None) -> Optional[str]:
     if env_model:
         return env_model
 
-    return TASK_MODEL_DEFAULTS.get(task)
+    return TASK_MODEL_DEFAULTS.get(task) or DEFAULT_MODEL or None
 
 # ============================================================================
 # Rate Limiting Configuration

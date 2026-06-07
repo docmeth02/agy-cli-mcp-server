@@ -369,10 +369,17 @@ async def gemini_metrics() -> str:
             },
         }
 
+        try:
+            from security.security_monitor import get_security_monitor
+            security_stats = get_security_monitor().get_stats()
+        except Exception:
+            security_stats = {}
+
         return json.dumps({
             "status": "success",
             "metrics": metrics,
             "cache_stats": cache_stats,
+            "security_stats": security_stats,
             "server_info": {
                 "name": "gemini-cli-mcp-server",
                 "tools_available": 24,
@@ -846,7 +853,7 @@ async def gemini_start_conversation(
     try:
         from modules.services.conversation_manager import ConversationManager
         manager = ConversationManager()
-        conversation = manager.create_conversation(
+        conversation = await manager.create_conversation(
             title=title,
             description=description,
             tags=tags.split(",") if tags else None,
@@ -977,7 +984,7 @@ async def gemini_clear_conversation(conversation_id: str) -> str:
     try:
         from modules.services.conversation_manager import ConversationManager
         manager = ConversationManager()
-        result = manager.clear_conversation(conversation_id)
+        result = await manager.clear_conversation(conversation_id)
         return json.dumps(result, indent=2)
     except ImportError:
         logger.error("Failed to import ConversationManager", exc_info=True)

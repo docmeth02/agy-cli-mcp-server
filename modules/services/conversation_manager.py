@@ -5,9 +5,12 @@ This module provides a thin wrapper around agy's native conversation storage
 (~/.gemini/antigravity-cli/conversations/<uuid>.pb) with metadata tracking
 in a local JSON sidecar file.
 """
+import asyncio
 import json
 import logging
 import os
+import shutil
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -23,6 +26,18 @@ METADATA_FILE = Path.home() / ".gemini" / "antigravity-cli" / "mcp_metadata.json
 
 DEFAULT_EXPIRATION_HOURS = 24
 
+_metadata_locks: dict = {}
+
+
+def _get_metadata_lock() -> asyncio.Lock:
+    """Get an asyncio.Lock bound to the current event loop."""
+    loop = asyncio.get_running_loop()
+    lock = _metadata_locks.get(id(loop))
+    if lock is None:
+        lock = asyncio.Lock()
+        _metadata_locks[id(loop)] = lock
+    return lock
+
 
 def _ensure_dirs():
     """Ensure conversation and metadata directories exist."""
@@ -35,20 +50,43 @@ def _load_metadata() -> dict:
         try:
             with open(METADATA_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
-        except (json.JSONDecodeError, OSError) as e:
-            logger.warning(f"Failed to load conversation metadata: {e}")
+        except json.JSONDecodeError as e:
+            backup = METADATA_FILE.with_suffix(f".corrupt.{int(time.time())}.json")
+            try:
+                shutil.copy2(METADATA_FILE, backup)
+                logger.error(f"Corrupt metadata backed up to {backup}: {e}")
+            except OSError:
+                logger.error(f"Corrupt metadata and backup failed: {e}")
+        except OSError as e:
+            logger.warning(f"Failed to read conversation metadata: {e}")
     return {}
 
 
 def _save_metadata(data: dict) -> bool:
-    """Save conversation metadata to sidecar JSON."""
+    """Save conversation metadata atomically via temp file + os.replace."""
     _ensure_dirs()
+    tmp_path = None
     try:
-        with open(METADATA_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            dir=METADATA_FILE.parent,
+            suffix=".tmp",
+            delete=False,
+            encoding="utf-8",
+        ) as tmp_fd:
+            tmp_path = tmp_fd.name
+            json.dump(data, tmp_fd, indent=2)
+            tmp_fd.flush()
+            os.fsync(tmp_fd.fileno())
+        os.replace(tmp_path, METADATA_FILE)
         return True
-    except OSError as e:
+    except Exception as e:
         logger.error(f"Failed to save conversation metadata: {e}")
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
         return False
 
 
@@ -85,7 +123,7 @@ class ConversationManager:
             "conversations_cleared": 0,
         }
 
-    def create_conversation(
+    async def create_conversation(
         self,
         title: Optional[str] = None,
         description: Optional[str] = None,
@@ -96,16 +134,20 @@ class ConversationManager:
         conversation_id = str(uuid.uuid4())
         now = time.time()
 
-        metadata = _load_metadata()
-        metadata[conversation_id] = {
-            "title": title or f"Conversation {conversation_id[:8]}",
-            "description": description,
-            "tags": tags or [],
-            "created_at": now,
-            "updated_at": now,
-            "expiration_hours": expiration_hours,
-        }
-        _save_metadata(metadata)
+        async with _get_metadata_lock():
+            metadata = _load_metadata()
+            metadata[conversation_id] = {
+                "title": title or f"Conversation {conversation_id[:8]}",
+                "description": description,
+                "tags": tags or [],
+                "created_at": now,
+                "updated_at": now,
+                "expiration_hours": expiration_hours,
+            }
+            saved = _save_metadata(metadata)
+
+        if not saved:
+            return {"status": "error", "error": "Failed to persist conversation metadata"}
 
         self._stats["conversations_created"] += 1
 
@@ -147,12 +189,16 @@ class ConversationManager:
         try:
             result = await execute_cli_with_retry(args)
 
-            # Reload metadata after await to avoid overwriting concurrent changes
-            metadata = _load_metadata()
-            now = time.time()
-            if conversation_id in metadata:
-                metadata[conversation_id]["updated_at"] = now
-                _save_metadata(metadata)
+            async with _get_metadata_lock():
+                metadata = _load_metadata()
+                now = time.time()
+                if conversation_id in metadata:
+                    metadata[conversation_id]["updated_at"] = now
+                    if model:
+                        metadata[conversation_id]["model"] = model
+                    saved = _save_metadata(metadata)
+                else:
+                    saved = True
 
             self._stats["messages_added"] += 1
 
@@ -163,9 +209,8 @@ class ConversationManager:
             }
             if model:
                 response["model"] = model
-                if conversation_id in metadata:
-                    metadata[conversation_id]["model"] = model
-                    _save_metadata(metadata)
+            if not saved:
+                response["warning"] = "metadata update failed"
             if result.get("stderr"):
                 response["stderr"] = result["stderr"]
             return response
@@ -216,11 +261,10 @@ class ConversationManager:
 
         return conversations
 
-    def clear_conversation(self, conversation_id: str) -> dict:
+    async def clear_conversation(self, conversation_id: str) -> dict:
         """Clear/delete a conversation."""
         deleted = False
 
-        # Delete agy .pb file
         pb_path = CONVERSATIONS_DIR / f"{conversation_id}.pb"
         if pb_path.exists():
             try:
@@ -229,12 +273,12 @@ class ConversationManager:
             except OSError as e:
                 logger.error(f"Failed to delete conversation file {conversation_id}: {e}")
 
-        # Delete metadata entry
-        metadata = _load_metadata()
-        if conversation_id in metadata:
-            del metadata[conversation_id]
-            _save_metadata(metadata)
-            deleted = True
+        async with _get_metadata_lock():
+            metadata = _load_metadata()
+            if conversation_id in metadata:
+                del metadata[conversation_id]
+                _save_metadata(metadata)
+                deleted = True
 
         if deleted:
             self._stats["conversations_cleared"] += 1

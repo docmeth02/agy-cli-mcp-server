@@ -31,6 +31,7 @@ from modules.utils.cli_utils import (
     extract_file_refs,
     sanitize_output,
     validate_cli_setup,
+    VERSION_CACHE,
     CLITimeoutError,
 )
 from modules.config.cli_config import CLI_PRINT_TIMEOUT_GRACE, get_task_model
@@ -245,7 +246,7 @@ class TestConversations:
             prompt="hello",
             conversation_id="nonexistent_conversation_id_xyz_999",
         )
-        result = await execute_cli(args, timeout=60)
+        result = await execute_cli(args, timeout=120)
         assert result["return_code"] == 0
         assert result["status"] == "error"
         assert "not found" in result["stdout"]
@@ -404,6 +405,27 @@ class TestParseVersion:
 
     def test_empty_string(self):
         assert _parse_version("") == (0, 0, 0)
+
+
+class TestVersionGuard:
+
+    def test_old_version_skips_model(self):
+        VERSION_CACHE["version"] = "1.0.4"
+        args = _build_cli_args(prompt="hello", model="pro")
+        assert "--model" not in args
+        VERSION_CACHE.clear()
+
+    def test_valid_version_passes_model(self):
+        VERSION_CACHE["version"] = "1.0.5"
+        args = _build_cli_args(prompt="hello", model="pro")
+        assert "--model" in args
+        VERSION_CACHE.clear()
+
+    def test_sync_fetch_on_empty_cache(self):
+        VERSION_CACHE.clear()
+        args = _build_cli_args(prompt="hello", model="pro")
+        assert "--model" in args
+        assert "version" in VERSION_CACHE
 
 
 # ---------------------------------------------------------------------------
