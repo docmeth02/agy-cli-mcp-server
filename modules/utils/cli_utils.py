@@ -19,6 +19,17 @@ from cachetools import TTLCache
 
 logger = logging.getLogger(__name__)
 
+
+def _record_security_event(event_type: str, severity: str, source: str,
+                           details: Optional[dict] = None) -> None:
+    """Record a security event if the monitor is available."""
+    try:
+        from security.security_monitor import get_security_monitor
+        get_security_monitor().record_event(event_type, severity, source, details)
+    except Exception:
+        pass
+
+
 from modules.config.cli_config import (
     CLI_TIMEOUT,
     CLI_COMMAND_PATH,
@@ -80,19 +91,14 @@ def sanitize_output(output: str) -> str:
     """
     Sanitize output to remove potentially sensitive information.
 
-    Args:
-        output: Raw output string from CLI
-
-    Returns:
-        Sanitized output string
+    Delegates to the security module's CredentialSanitizer which covers
+    Google/OpenAI/Anthropic/AWS keys, bearer tokens, JWTs, private keys,
+    and generic secret patterns.
     """
-    # Remove potential API keys
-    output = re.sub(r'AIza[0-9A-Za-z_-]{35}', '[REDACTED_API_KEY]', output)
-    # Remove potential secrets
-    output = re.sub(r'sk-[a-zA-Z0-9]{32,}', '[REDACTED_SECRET]', output)
-    # Remove potential bearer tokens
-    output = re.sub(r'Bearer\s+[a-zA-Z0-9._-]+', 'Bearer [REDACTED]', output)
-    return output
+    if not output:
+        return output
+    from security.credential_sanitizer import sanitize_credentials
+    return sanitize_credentials(output)
 
 
 def extract_file_refs(prompt: str) -> tuple[str, list[str]]:
@@ -166,6 +172,26 @@ def _parse_version(version_str: str) -> tuple[int, ...]:
         return (0, 0, 0)
 
 
+def _get_cached_or_sync_version() -> str:
+    """Get version from cache, or fetch synchronously if empty."""
+    cache_key = "version"
+    if cache_key in VERSION_CACHE:
+        return VERSION_CACHE[cache_key]
+    try:
+        import subprocess
+        result = subprocess.run(
+            [CLI_COMMAND_PATH, "--version"],
+            capture_output=True, text=True, timeout=5,
+        )
+        version = result.stdout.strip() if result.returncode == 0 else ""
+        if version:
+            VERSION_CACHE[cache_key] = version
+        return version
+    except Exception as e:
+        logger.warning(f"Failed to fetch CLI version synchronously: {e}")
+        return ""
+
+
 def _build_cli_args(
     prompt: str,
     sandbox: bool = False,
@@ -192,8 +218,10 @@ def _build_cli_args(
         logger.warning("debug=True ignored: agy --debug produces a system report instead of answering prompts")
 
     if model:
-        cached_version = VERSION_CACHE.get("version", "")
-        if cached_version and _parse_version(cached_version) < _MIN_MODEL_VERSION:
+        cached_version = _get_cached_or_sync_version()
+        if not cached_version:
+            logger.warning("CLI version could not be resolved; skipping --model flag")
+        elif _parse_version(cached_version) < _MIN_MODEL_VERSION:
             logger.warning(
                 f"--model requires agy >= {'.'.join(str(v) for v in _MIN_MODEL_VERSION)}, "
                 f"found {cached_version}; skipping --model flag"
@@ -318,6 +346,8 @@ async def execute_cli(
             process.kill()
             await process.wait()
             METRICS["commands_failed"] += 1
+            _record_security_event("timeout", "low", "execute_cli",
+                                   {"timeout_seconds": timeout})
             raise CLITimeoutError(
                 f"Command timed out after {timeout} seconds"
             )
@@ -345,6 +375,8 @@ async def execute_cli(
         # Also check stderr for rate limiting signals
         if "rate limit" in stderr_str.lower() or "quota" in stderr_str.lower():
             METRICS["rate_limit_hits"] += 1
+            _record_security_event("rate_limit", "medium", "execute_cli",
+                                   {"detail": stderr_str[:500]})
             raise CLIRateLimitError(f"Rate limit exceeded: {stderr_str}")
 
         if process.returncode != 0 or has_error_in_stdout:
@@ -370,6 +402,8 @@ async def execute_cli(
         raise
     except FileNotFoundError:
         METRICS["commands_failed"] += 1
+        _record_security_event("cli_not_found", "high", "execute_cli",
+                               {"path": CLI_COMMAND_PATH})
         raise CLIExecutionError(
             f"Antigravity CLI not found at: {CLI_COMMAND_PATH}. "
             "Please ensure agy is installed and in PATH."
