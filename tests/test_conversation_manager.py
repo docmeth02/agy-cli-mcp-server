@@ -7,16 +7,13 @@ without requiring a real agy installation.
 import asyncio
 import json
 import os
-import tempfile
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
 from modules.services.conversation_manager import (
     _load_metadata,
     _save_metadata,
-    METADATA_FILE,
 )
 
 

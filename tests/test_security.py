@@ -4,10 +4,6 @@ Unit tests for the security framework modules.
 These tests verify the credential sanitizer and security monitor
 without requiring a real agy installation.
 """
-import time
-
-import pytest
-
 from security.credential_sanitizer import (
     sanitize_credentials,
     check_for_credentials,

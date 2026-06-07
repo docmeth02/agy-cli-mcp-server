@@ -1,3 +1,3 @@
 """
-Core tool implementations for Gemini CLI MCP Server
+Core tool implementations for Antigravity CLI MCP Server.
 """

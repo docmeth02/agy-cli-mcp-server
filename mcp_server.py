@@ -34,14 +34,12 @@ mcp = FastMCP("gemini-cli-mcp-server")
 
 # Import utilities
 from modules.utils.cli_utils import (
-    execute_cli,
     execute_cli_with_retry,
     extract_file_refs,
     _build_cli_args,
     get_cli_help,
     get_cli_version,
     get_available_models,
-    validate_model,
     get_metrics,
     validate_cli_setup,
     CLIExecutionError,

@@ -525,30 +525,6 @@ async def get_available_models() -> list[str]:
     return []
 
 
-async def validate_model(model: str) -> tuple[bool, str]:
-    """
-    Validate a model name against the available models list.
-
-    Returns (True, "") if valid or unverifiable (fail-open),
-    (False, warning_message) if the model is not in the known list.
-    """
-    models = await get_available_models()
-    if not models:
-        return (True, "")
-
-    lower_model = model.lower()
-    for m in models:
-        if lower_model == m.lower() or lower_model in m.lower():
-            return (True, "")
-
-    available = ", ".join(models)
-    return (
-        False,
-        f"Unknown model '{model}'. Available models: {available}. "
-        "agy may silently fall back to its default model."
-    )
-
-
 def get_metrics() -> dict:
     """Get current metrics."""
     uptime = time.time() - METRICS["start_time"]
