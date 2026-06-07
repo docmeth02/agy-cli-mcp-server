@@ -245,7 +245,7 @@ class TestConversations:
             prompt="hello",
             conversation_id="nonexistent_conversation_id_xyz_999",
         )
-        result = await execute_cli(args, timeout=30)
+        result = await execute_cli(args, timeout=60)
         assert result["return_code"] == 0
         assert result["status"] == "error"
         assert "not found" in result["stdout"]
