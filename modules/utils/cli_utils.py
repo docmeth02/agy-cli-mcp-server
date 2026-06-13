@@ -48,6 +48,10 @@ MODELS_CACHE: TTLCache = TTLCache(maxsize=1, ttl=1800)  # 30 min
 # Minimum agy version that supports --model
 _MIN_MODEL_VERSION = (1, 0, 5)
 
+# Short names agy accepts for --model without needing the full display name.
+# Accepted directly (no `agy models` discovery call needed) when validating.
+MODEL_SHORT_NAMES = frozenset({"pro", "flash", "claude"})
+
 # Metrics tracking
 METRICS = {
     "commands_executed": 0,
@@ -349,7 +353,9 @@ async def execute_cli(
             _record_security_event("timeout", "low", "execute_cli",
                                    {"timeout_seconds": timeout})
             raise CLITimeoutError(
-                f"Command timed out after {timeout} seconds"
+                f"Command timed out after {timeout} seconds. "
+                f"Raise the budget via CLI_TIMEOUT (global) or "
+                f"CLI_TIMEOUT_<TASK> (per tool); timeouts are not retried."
             )
 
         execution_time = time.time() - start_time
@@ -422,7 +428,9 @@ async def execute_cli_with_retry(
     """
     Execute Antigravity CLI with exponential backoff retry.
 
-    Retries are for transient errors (rate limits, timeouts) only.
+    Retries are for transient rate-limit errors only. Timeouts are NOT retried
+    (a blind re-run rarely succeeds and would multiply the per-task budget), and
+    non-transient execution errors are not retried.
 
     Args:
         args: Command line arguments for agy
@@ -454,11 +462,10 @@ async def execute_cli_with_retry(
                 await asyncio.sleep(delay)
 
         except CLITimeoutError as e:
+            # Don't retry timeouts: a blind re-run rarely succeeds and would
+            # multiply the (now per-task, possibly 900s) budget by max_attempts.
             last_error = e
-            if attempt < max_attempts:
-                logger.warning(
-                    f"Timeout on attempt {attempt}/{max_attempts}, retrying..."
-                )
+            break
 
         except CLIExecutionError as e:
             last_error = e
@@ -523,6 +530,76 @@ async def get_available_models() -> list[str]:
         logger.warning(f"Failed to fetch models list: {e}")
 
     return []
+
+
+async def validate_model(model: Optional[str]) -> dict:
+    """
+    Validate a requested model name against what agy actually accepts.
+
+    agy silently ignores an unknown --model name (returns its default model,
+    exit 0, no error), so a caller's typo would otherwise pass unnoticed. This
+    surfaces that as metadata rather than blocking the run.
+
+    Returns a dict that is empty when there is nothing to report, otherwise
+    carries a "warning" and/or "model_validation" key to merge into the
+    tool response:
+      - {}                                  model accepted / nothing to flag
+      - {"warning": ...}                    --model skipped (old agy) OR unknown name
+      - {"model_validation": "unverified"}  could not confirm (models list unavailable)
+    """
+    if not model:
+        return {}
+
+    # Mirror the version gate in _build_cli_args: on older agy, --model is not
+    # passed at all — a distinct situation from an unrecognized model name.
+    cached_version = _get_cached_or_sync_version()
+    if not cached_version or _parse_version(cached_version) < _MIN_MODEL_VERSION:
+        return {
+            "warning": (
+                f"--model '{model}' was not applied: agy "
+                f">= {'.'.join(str(v) for v in _MIN_MODEL_VERSION)} is required "
+                f"(found {cached_version or 'unknown'}). agy used its default model."
+            )
+        }
+
+    # Short names are accepted by agy directly; no discovery call needed.
+    if model.strip().lower() in MODEL_SHORT_NAMES:
+        return {}
+
+    available = await get_available_models()
+    if not available:
+        # Discovery failed/empty — don't false-warn on a possibly-valid model.
+        return {"model_validation": "unverified"}
+
+    # Case-insensitive: `agy models` emits title-case display names.
+    if model.strip().lower() in {m.strip().lower() for m in available}:
+        return {}
+
+    return {
+        "warning": (
+            f"Model '{model}' was not recognized (not a short name "
+            f"{sorted(MODEL_SHORT_NAMES)} and not in `agy models`). agy may "
+            f"silently fall back to its default model."
+        )
+    }
+
+
+def add_model_metadata(result: dict, model_meta: dict) -> dict:
+    """
+    Merge model-validation metadata (from validate_model) into a result dict,
+    without disturbing the standard response shape. No-op when metadata is empty.
+
+    A model warning never clobbers an existing "warning" (e.g. a conversation
+    "metadata update failed" notice) — the two are concatenated instead.
+    """
+    if not (isinstance(result, dict) and model_meta):
+        return result
+    for key, value in model_meta.items():
+        if key == "warning" and result.get("warning"):
+            result["warning"] = f"{result['warning']} | {value}"
+        else:
+            result[key] = value
+    return result
 
 
 def get_metrics() -> dict:

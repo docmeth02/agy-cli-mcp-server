@@ -12,6 +12,8 @@ from modules.utils.cli_utils import (
     execute_cli_with_retry,
     extract_file_refs,
     _build_cli_args,
+    validate_model,
+    add_model_metadata,
     CLIExecutionError,
     CLITimeoutError,
     CLIRateLimitError,
@@ -21,6 +23,7 @@ from modules.config.cli_config import (
     GEMINI_EXTRACT_STRUCTURED_LIMIT,
     GEMINI_GIT_DIFF_LIMIT,
     get_task_model,
+    get_task_timeout,
 )
 
 logger = logging.getLogger(__name__)
@@ -83,7 +86,8 @@ Provide analysis in {output_format} format with severity levels."""
     args = _build_cli_args(prompt=cleaned_prompt, files=files, model=effective_model)
 
     try:
-        result = await execute_cli_with_retry(args)
+        result = await execute_cli_with_retry(args, timeout=get_task_timeout("code_review"))
+        result = add_model_metadata(result, await validate_model(effective_model))
         return json.dumps(result, indent=2)
     except (CLITimeoutError, CLIRateLimitError, CLIExecutionError) as e:
         return json.dumps({
@@ -157,7 +161,8 @@ Return valid JSON matching the schema."""
     args = _build_cli_args(prompt=cleaned_prompt, files=files, model=effective_model)
 
     try:
-        result = await execute_cli_with_retry(args)
+        result = await execute_cli_with_retry(args, timeout=get_task_timeout("extract_structured"))
+        result = add_model_metadata(result, await validate_model(effective_model))
         return json.dumps(result, indent=2)
     except (CLITimeoutError, CLIRateLimitError, CLIExecutionError) as e:
         return json.dumps({
@@ -224,7 +229,8 @@ Provide feedback on:
     args = _build_cli_args(prompt=cleaned_prompt, files=files, model=effective_model)
 
     try:
-        result = await execute_cli_with_retry(args)
+        result = await execute_cli_with_retry(args, timeout=get_task_timeout("git_diff_review"))
+        result = add_model_metadata(result, await validate_model(effective_model))
         return json.dumps(result, indent=2)
     except (CLITimeoutError, CLIRateLimitError, CLIExecutionError) as e:
         return json.dumps({

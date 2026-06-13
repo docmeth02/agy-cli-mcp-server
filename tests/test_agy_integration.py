@@ -30,10 +30,16 @@ from modules.utils.cli_utils import (
     extract_file_refs,
     sanitize_output,
     validate_cli_setup,
+    validate_model,
+    add_model_metadata,
     VERSION_CACHE,
     CLITimeoutError,
 )
-from modules.config.cli_config import CLI_PRINT_TIMEOUT_GRACE, get_task_model
+from modules.config.cli_config import (
+    CLI_PRINT_TIMEOUT_GRACE,
+    get_task_model,
+    get_task_timeout,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -468,6 +474,26 @@ class TestRetryLogic:
         with pytest.raises(CLITimeoutError):
             await execute_cli_with_retry(args, timeout=1, max_attempts=1)
 
+    @pytest.mark.asyncio
+    async def test_timeout_is_not_retried(self, monkeypatch):
+        """A timeout must fail after exactly one attempt, even with max_attempts>1.
+
+        Raising the per-task timeout to 900s makes retrying timeouts dangerous
+        (900s x 3), so execute_cli_with_retry must not re-run on CLITimeoutError.
+        """
+        import modules.utils.cli_utils as cu
+
+        calls = {"n": 0}
+
+        async def fake_execute_cli(args, timeout=None, capture_stderr=True):
+            calls["n"] += 1
+            raise cu.CLITimeoutError("boom")
+
+        monkeypatch.setattr(cu, "execute_cli", fake_execute_cli)
+        with pytest.raises(cu.CLITimeoutError):
+            await cu.execute_cli_with_retry(["--version"], timeout=1, max_attempts=3)
+        assert calls["n"] == 1
+
 
 # ---------------------------------------------------------------------------
 # 10. Full MCP tool round-trip (via mcp_server functions)
@@ -744,3 +770,159 @@ class TestSubprocessEnvironment:
         assert env.get("PATH") == os.environ.get("PATH")
         # --print-timeout injected into the actual argv passed to the subprocess.
         assert "--print-timeout" in captured["args"]
+
+
+# ---------------------------------------------------------------------------
+# 13. Per-task timeout resolution (no agy needed beyond the session gate)
+# ---------------------------------------------------------------------------
+
+class TestTaskTimeout:
+
+    def test_heavy_task_raised_above_default(self):
+        assert get_task_timeout("verify_solution") == 900
+        assert get_task_timeout("code_review") == 900
+        assert get_task_timeout("eval_plan") == 600
+
+    def test_unknown_task_inherits_default(self):
+        from modules.config.cli_config import CLI_TIMEOUT
+        assert get_task_timeout("nonexistent_task") == CLI_TIMEOUT
+
+    def test_explicit_wins(self):
+        assert get_task_timeout("verify_solution", 42) == 42
+
+    def test_env_override(self, monkeypatch):
+        monkeypatch.setenv("CLI_TIMEOUT_VERIFY_SOLUTION", "123")
+        assert get_task_timeout("verify_solution") == 123
+
+    def test_env_override_invalid_falls_through(self, monkeypatch):
+        monkeypatch.setenv("CLI_TIMEOUT_EVAL_PLAN", "not-a-number")
+        assert get_task_timeout("eval_plan") == 600
+
+
+# ---------------------------------------------------------------------------
+# 14. Model validation warnings (deterministic — version/models mocked)
+# ---------------------------------------------------------------------------
+
+class TestModelValidation:
+
+    @pytest.mark.asyncio
+    async def test_none_model_no_metadata(self):
+        assert await validate_model(None) == {}
+        assert await validate_model("") == {}
+
+    @pytest.mark.asyncio
+    async def test_short_names_accepted_without_discovery(self, monkeypatch):
+        import modules.utils.cli_utils as cu
+        monkeypatch.setattr(cu, "_get_cached_or_sync_version", lambda: "1.0.8")
+
+        async def _boom():
+            raise AssertionError("discovery should not be called for short names")
+
+        monkeypatch.setattr(cu, "get_available_models", _boom)
+        assert await validate_model("pro") == {}
+        assert await validate_model("FLASH") == {}
+        assert await validate_model("claude") == {}
+
+    @pytest.mark.asyncio
+    async def test_full_name_in_list_ok(self, monkeypatch):
+        import modules.utils.cli_utils as cu
+        monkeypatch.setattr(cu, "_get_cached_or_sync_version", lambda: "1.0.8")
+
+        async def _models():
+            return ["Gemini 3.1 Pro (High)", "Gemini 3.5 Flash (Medium)"]
+
+        monkeypatch.setattr(cu, "get_available_models", _models)
+        assert await validate_model("Gemini 3.1 Pro (High)") == {}
+
+    @pytest.mark.asyncio
+    async def test_unknown_model_warns(self, monkeypatch):
+        import modules.utils.cli_utils as cu
+        monkeypatch.setattr(cu, "_get_cached_or_sync_version", lambda: "1.0.8")
+
+        async def _models():
+            return ["Gemini 3.1 Pro (High)"]
+
+        monkeypatch.setattr(cu, "get_available_models", _models)
+        meta = await validate_model("typo-model")
+        assert "warning" in meta and "not recognized" in meta["warning"]
+
+    @pytest.mark.asyncio
+    async def test_discovery_failure_marks_unverified(self, monkeypatch):
+        import modules.utils.cli_utils as cu
+        monkeypatch.setattr(cu, "_get_cached_or_sync_version", lambda: "1.0.8")
+
+        async def _models():
+            return []
+
+        monkeypatch.setattr(cu, "get_available_models", _models)
+        assert await validate_model("future-model") == {"model_validation": "unverified"}
+
+    @pytest.mark.asyncio
+    async def test_old_version_warns_not_applied(self, monkeypatch):
+        import modules.utils.cli_utils as cu
+        monkeypatch.setattr(cu, "_get_cached_or_sync_version", lambda: "1.0.4")
+        meta = await validate_model("pro")
+        assert "warning" in meta and "not applied" in meta["warning"]
+
+    def test_add_model_metadata_merges_and_noop(self):
+        d = {"status": "success"}
+        assert add_model_metadata(d, {"warning": "x"}) is d
+        assert d["warning"] == "x"
+        d2 = {"status": "success"}
+        add_model_metadata(d2, {})
+        assert "warning" not in d2
+
+    def test_add_model_metadata_preserves_existing_warning(self):
+        # A model warning must not clobber a pre-existing warning (e.g. a
+        # conversation "metadata update failed" notice) — they concatenate.
+        d = {"status": "success", "warning": "metadata update failed"}
+        add_model_metadata(d, {"warning": "model 'bogus' not recognized"})
+        assert "metadata update failed" in d["warning"]
+        assert "not recognized" in d["warning"]
+
+    @pytest.mark.asyncio
+    async def test_full_name_match_is_case_insensitive(self, monkeypatch):
+        import modules.utils.cli_utils as cu
+        monkeypatch.setattr(cu, "_get_cached_or_sync_version", lambda: "1.0.8")
+
+        async def _models():
+            return ["Gemini 3.1 Pro (High)"]
+
+        monkeypatch.setattr(cu, "get_available_models", _models)
+        assert await validate_model("gemini 3.1 pro (high)") == {}
+
+
+# ---------------------------------------------------------------------------
+# 15. Sandbox scope (real agy; opt-in via RUN_SANDBOX_ISOLATION=1)
+# ---------------------------------------------------------------------------
+# NOTE: agy's --sandbox enables TERMINAL command restrictions, NOT a filesystem
+# jail. With our always-on --dangerously-skip-permissions, the agent's file
+# tools can still write outside the workspace (verified: a --sandbox print run
+# created a file at an absolute tmp path). So there is intentionally no test
+# asserting filesystem isolation — it would encode a guarantee agy does not make.
+# The 1.0.6 print-mode propagation fix is covered by TestSandboxMode
+# (sandbox flag runs and returns success in --print mode).
+
+@pytest.mark.sandbox_isolation
+@pytest.mark.skipif(
+    os.getenv("RUN_SANDBOX_ISOLATION") != "1",
+    reason="slow real-agy behavioral check; set RUN_SANDBOX_ISOLATION=1 to run",
+)
+class TestSandboxScope:
+    """Documents agy --sandbox scope: terminal restrictions, not a file jail."""
+
+    @pytest.mark.asyncio
+    async def test_sandbox_does_not_jail_filesystem(self, tmp_path):
+        # Confirms (and pins) the real boundary: under --sandbox +
+        # --dangerously-skip-permissions, an out-of-workspace write is NOT blocked.
+        outside = tmp_path / "escaped.txt"
+        prompt = (
+            f"Create the file {outside} with the exact contents ESCAPED, using "
+            f"any file tool available."
+        )
+        args = _build_cli_args(prompt=prompt, sandbox=True)
+        await execute_cli_with_retry(args, timeout=get_task_timeout("sandbox"))
+        assert outside.exists(), (
+            "agy --sandbox unexpectedly blocked an out-of-workspace file write; "
+            "if agy added a filesystem jail, update the docs/security model."
+        )
