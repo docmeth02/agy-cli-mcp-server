@@ -40,6 +40,8 @@ from modules.utils.cli_utils import (
     get_cli_help,
     get_cli_version,
     get_available_models,
+    validate_model,
+    add_model_metadata,
     get_metrics,
     validate_cli_setup,
     CLIExecutionError,
@@ -187,6 +189,7 @@ try:
         GEMINI_VERIFY_LIMIT,
         GEMINI_COLLABORATION_LIMIT,
         get_task_model,
+        get_task_timeout,
     )
 except ImportError:
     GEMINI_PROMPT_LIMIT = 100000
@@ -200,6 +203,9 @@ except ImportError:
 
     def get_task_model(task: str, explicit: Optional[str] = None) -> Optional[str]:
         return explicit or None
+
+    def get_task_timeout(task: str, explicit: Optional[int] = None) -> int:
+        return explicit or 300
 
 
 @mcp.tool()
@@ -265,6 +271,7 @@ async def gemini_prompt(
 
     try:
         result = await execute_cli_with_retry(args)
+        result = add_model_metadata(result, await validate_model(effective_model))
         return json.dumps(result, indent=2)
     except CLITimeoutError as e:
         return json.dumps({
@@ -437,7 +444,8 @@ async def gemini_sandbox(
     )
 
     try:
-        result = await execute_cli_with_retry(args)
+        result = await execute_cli_with_retry(args, timeout=get_task_timeout("sandbox"))
+        result = add_model_metadata(result, await validate_model(effective_model))
         return json.dumps(result, indent=2)
     except (CLITimeoutError, CLIRateLimitError, CLIExecutionError) as e:
         return json.dumps({
@@ -555,6 +563,7 @@ async def gemini_summarize(
 
     try:
         result = await execute_cli_with_retry(args)
+        result = add_model_metadata(result, await validate_model(effective_model))
         return json.dumps(result, indent=2)
     except (CLITimeoutError, CLIRateLimitError, CLIExecutionError) as e:
         return json.dumps({
@@ -600,7 +609,8 @@ async def gemini_summarize_files(
     args = _build_cli_args(prompt=cleaned_prompt, files=files, model=effective_model)
 
     try:
-        result = await execute_cli_with_retry(args)
+        result = await execute_cli_with_retry(args, timeout=get_task_timeout("summarize_files"))
+        result = add_model_metadata(result, await validate_model(effective_model))
         return json.dumps(result, indent=2)
     except (CLITimeoutError, CLIRateLimitError, CLIExecutionError) as e:
         return json.dumps({
@@ -673,7 +683,8 @@ Provide a detailed analysis with:
     args = _build_cli_args(prompt=cleaned_prompt, files=files, model=effective_model)
 
     try:
-        result = await execute_cli_with_retry(args)
+        result = await execute_cli_with_retry(args, timeout=get_task_timeout("eval_plan"))
+        result = add_model_metadata(result, await validate_model(effective_model))
         return json.dumps(result, indent=2)
     except (CLITimeoutError, CLIRateLimitError, CLIExecutionError) as e:
         return json.dumps({
@@ -742,7 +753,8 @@ Provide a detailed review covering:
     args = _build_cli_args(prompt=cleaned_prompt, files=files, model=effective_model)
 
     try:
-        result = await execute_cli_with_retry(args)
+        result = await execute_cli_with_retry(args, timeout=get_task_timeout("review_code"))
+        result = add_model_metadata(result, await validate_model(effective_model))
         return json.dumps(result, indent=2)
     except (CLITimeoutError, CLIRateLimitError, CLIExecutionError) as e:
         return json.dumps({
@@ -813,7 +825,8 @@ Verify:
     args = _build_cli_args(prompt=cleaned_prompt, files=files, model=effective_model)
 
     try:
-        result = await execute_cli_with_retry(args)
+        result = await execute_cli_with_retry(args, timeout=get_task_timeout("verify_solution"))
+        result = add_model_metadata(result, await validate_model(effective_model))
         return json.dumps(result, indent=2)
     except (CLITimeoutError, CLIRateLimitError, CLIExecutionError) as e:
         return json.dumps({
@@ -910,6 +923,7 @@ async def gemini_continue_conversation(
             prompt=prompt,
             model=effective_model,
         )
+        result = add_model_metadata(result, await validate_model(effective_model))
         return json.dumps(result, indent=2)
     except ImportError:
         logger.error("Failed to import ConversationManager", exc_info=True)
@@ -918,11 +932,11 @@ async def gemini_continue_conversation(
             prompt=cleaned_prompt, files=files, model=effective_model,
         )
         result = await execute_cli_with_retry(args)
-        return json.dumps({
+        return json.dumps(add_model_metadata({
             "status": "success",
             "conversation_id": conversation_id,
             "response": result
-        }, indent=2)
+        }, await validate_model(effective_model)), indent=2)
 
 
 @mcp.tool()
@@ -1077,7 +1091,8 @@ Provide analysis in {output_format} format with severity levels."""
 
         cleaned_prompt, files = extract_file_refs(prompt)
         args = _build_cli_args(prompt=cleaned_prompt, files=files, model=effective_model)
-        result = await execute_cli_with_retry(args)
+        result = await execute_cli_with_retry(args, timeout=get_task_timeout("code_review"))
+        result = add_model_metadata(result, await validate_model(effective_model))
         return json.dumps(result, indent=2)
 
 
@@ -1130,7 +1145,8 @@ Return valid JSON matching the schema."""
 
         cleaned_prompt, files = extract_file_refs(prompt)
         args = _build_cli_args(prompt=cleaned_prompt, files=files, model=effective_model)
-        result = await execute_cli_with_retry(args)
+        result = await execute_cli_with_retry(args, timeout=get_task_timeout("extract_structured"))
+        result = add_model_metadata(result, await validate_model(effective_model))
         return json.dumps(result, indent=2)
 
 
@@ -1187,7 +1203,8 @@ Provide feedback on:
 
         cleaned_prompt, files = extract_file_refs(prompt)
         args = _build_cli_args(prompt=cleaned_prompt, files=files, model=effective_model)
-        result = await execute_cli_with_retry(args)
+        result = await execute_cli_with_retry(args, timeout=get_task_timeout("git_diff_review"))
+        result = add_model_metadata(result, await validate_model(effective_model))
         return json.dumps(result, indent=2)
 
 
@@ -1243,7 +1260,8 @@ Provide a {output_format} comparison{"with similarity metrics" if include_metric
 
         cleaned_prompt, files = extract_file_refs(prompt)
         args = _build_cli_args(prompt=cleaned_prompt, files=files, model=effective_model)
-        result = await execute_cli_with_retry(args)
+        result = await execute_cli_with_retry(args, timeout=get_task_timeout("content_comparison"))
+        result = add_model_metadata(result, await validate_model(effective_model))
         return json.dumps(result, indent=2)
 
 
@@ -1340,11 +1358,13 @@ async def gemini_ai_collaboration(
                 prompt=cleaned_prompt, files=files, model=m or None,
             )
             try:
-                result = await execute_cli_with_retry(args)
-                results.append({
+                result = await execute_cli_with_retry(
+                    args, timeout=get_task_timeout("ai_collaboration")
+                )
+                results.append(add_model_metadata({
                     "model": m,
                     "response": result.get("stdout", ""),
-                })
+                }, await validate_model(m or None)))
             except Exception as e:
                 results.append({"model": m, "error": str(e)})
 

@@ -11,6 +11,8 @@ from modules.utils.cli_utils import (
     execute_cli_with_retry,
     extract_file_refs,
     _build_cli_args,
+    validate_model,
+    add_model_metadata,
     CLIExecutionError,
     CLITimeoutError,
     CLIRateLimitError,
@@ -18,6 +20,7 @@ from modules.utils.cli_utils import (
 from modules.config.cli_config import (
     GEMINI_CONTENT_COMPARISON_LIMIT,
     get_task_model,
+    get_task_timeout,
 )
 
 logger = logging.getLogger(__name__)
@@ -94,7 +97,8 @@ Provide a {output_format} comparison{"with similarity metrics" if include_metric
     args = _build_cli_args(prompt=cleaned_prompt, files=files, model=effective_model)
 
     try:
-        result = await execute_cli_with_retry(args)
+        result = await execute_cli_with_retry(args, timeout=get_task_timeout("content_comparison"))
+        result = add_model_metadata(result, await validate_model(effective_model))
         return json.dumps(result, indent=2)
     except (CLITimeoutError, CLIRateLimitError, CLIExecutionError) as e:
         return json.dumps({

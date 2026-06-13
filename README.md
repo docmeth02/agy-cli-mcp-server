@@ -923,15 +923,38 @@ The server supports extensive configuration through environment variables:
 
 #### Core Configuration
 ```bash
-export CLI_TIMEOUT=300          # Command timeout (10-3600 seconds)
+export CLI_TIMEOUT=300          # Default command timeout (10-3600 seconds)
+export CLI_TIMEOUT_VERIFY_SOLUTION=900  # Per-tool override: CLI_TIMEOUT_<TASK>
 export CLI_LOG_LEVEL=INFO       # Logging level (DEBUG, INFO, WARNING, ERROR)
 export CLI_COMMAND_PATH=agy     # Path to Antigravity CLI executable
 export GEMINI_TIMEOUT=300       # Fallback for CLI_TIMEOUT
 export GEMINI_LOG_LEVEL=INFO    # Fallback for CLI_LOG_LEVEL
 export GEMINI_COMMAND_PATH=agy  # Fallback for CLI_COMMAND_PATH
-export CLI_PRINT_TIMEOUT_GRACE=30  # Seconds agy's --print-timeout sits above CLI_TIMEOUT
+export CLI_PRINT_TIMEOUT_GRACE=30  # Seconds agy's --print-timeout sits above the resolved timeout
 export CLI_LOG_FILE=            # Optional path for agy diagnostics; keeps stdout clean (do NOT use /dev/null — agy hangs)
 ```
+
+**Per-task timeouts:** heavy tools default above `CLI_TIMEOUT` because agy 1.0.7
+raised the per-run tool-call ceiling to 512. Defaults: `verify_solution`,
+`code_review`, `ai_collaboration` → 900s; `eval_plan`, `sandbox`,
+`summarize_files` → 600s; everything else inherits `CLI_TIMEOUT`. Override any
+tool with `CLI_TIMEOUT_<TASK>`. **Timeouts are not retried**, so the resolved
+value is the true wall-clock cap.
+
+> **G1 credit spend:** As of agy 1.0.8 the CLI inherits the `use_ai_credits`
+> (`UseG1Credits`) setting from `~/.gemini/settings.json` on startup, so a
+> headless server can silently consume paid G1 credits once the standard quota
+> is exhausted. There is no CLI flag or env var to pin this — set it in that
+> global settings file. Raised per-task timeouts amplify worst-case spend.
+
+> **`--sandbox` scope:** agy's `--sandbox` enables *terminal command*
+> restrictions, **not** a filesystem jail. Since the server always passes
+> `--dangerously-skip-permissions`, `gemini_sandbox` can still write files
+> outside the workspace — do not rely on it for filesystem isolation. The flag
+> requires **agy ≥ 1.0.6** to take effect in `-p/--print` mode (propagation fix).
+
+> **agy version floor:** legacy non-AES-NI CPUs require **agy ≥ 1.0.8**
+> (SIGILL crash fix).
 
 `--print-timeout`: agy's internal print-mode timeout defaults to 5 minutes. The
 server passes `--print-timeout (CLI_TIMEOUT + CLI_PRINT_TIMEOUT_GRACE)s` so that

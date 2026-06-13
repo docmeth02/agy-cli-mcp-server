@@ -12,12 +12,15 @@ from modules.utils.cli_utils import (
     execute_cli_with_retry,
     extract_file_refs,
     _build_cli_args,
+    validate_model,
+    add_model_metadata,
     CLIExecutionError,
     CLITimeoutError,
     CLIRateLimitError,
 )
 from modules.config.cli_config import (
     GEMINI_COLLABORATION_LIMIT,
+    get_task_timeout,
 )
 
 logger = logging.getLogger(__name__)
@@ -316,19 +319,22 @@ async def _execute_model(model: str, prompt: str) -> dict:
     args = _build_cli_args(prompt=cleaned_prompt, files=files, model=model or None)
 
     try:
-        result = await execute_cli_with_retry(args)
+        result = await execute_cli_with_retry(args, timeout=get_task_timeout("ai_collaboration"))
         if result.get("status") == "error":
             return {
                 "status": "error",
                 "error": result.get("stdout", "") or result.get("stderr", ""),
                 "source": "antigravity_cli",
             }
-        return {
-            "status": "success",
-            "content": result.get("stdout", ""),
-            "source": "antigravity_cli",
-            "model": model,
-        }
+        return add_model_metadata(
+            {
+                "status": "success",
+                "content": result.get("stdout", ""),
+                "source": "antigravity_cli",
+                "model": model,
+            },
+            await validate_model(model or None),
+        )
     except Exception as e:
         return {"status": "error", "error": str(e)}
 

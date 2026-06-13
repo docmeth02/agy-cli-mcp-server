@@ -40,6 +40,48 @@ RETRY_BASE_DELAY = float(os.getenv("RETRY_BASE_DELAY", "1.0"))
 RETRY_MAX_DELAY = float(os.getenv("RETRY_MAX_DELAY", "30.0"))
 
 # ============================================================================
+# Per-Task Timeout Configuration
+# ============================================================================
+# agy 1.0.7 raised the per-run tool-call ceiling to 512, so agentic tools can
+# legitimately run far longer than the flat CLI_TIMEOUT (300s) allows. Heavy
+# tools get a larger budget; everything else inherits CLI_TIMEOUT. Override any
+# task via CLI_TIMEOUT_{TASK} or GEMINI_TIMEOUT_{TASK}. Note: timeouts are NOT
+# retried (see execute_cli_with_retry), so this value is the true wall-clock cap.
+
+TASK_TIMEOUT_DEFAULTS: dict[str, int] = {
+    "verify_solution": 900,
+    "code_review": 900,
+    "review_code": 600,
+    "eval_plan": 600,
+    "ai_collaboration": 900,
+    "summarize_files": 600,
+    "content_comparison": 600,
+    "sandbox": 600,
+}
+
+
+def get_task_timeout(task: str, explicit: Optional[int] = None) -> int:
+    """
+    Resolve the effective subprocess timeout (seconds) for a tool invocation.
+
+    Resolution: explicit > CLI_TIMEOUT_{TASK} env > task default > CLI_TIMEOUT.
+    """
+    if explicit:
+        return explicit
+
+    env_key = task.upper()
+    env_timeout = os.getenv(
+        f"CLI_TIMEOUT_{env_key}", os.getenv(f"GEMINI_TIMEOUT_{env_key}", "")
+    )
+    if env_timeout:
+        try:
+            return int(env_timeout)
+        except ValueError:
+            pass
+
+    return TASK_TIMEOUT_DEFAULTS.get(task, CLI_TIMEOUT)
+
+# ============================================================================
 # Tool-Specific Character Limits
 # ============================================================================
 # Kept under original GEMINI_* names for backward compatibility of callers.
