@@ -44,9 +44,13 @@ from modules.config.cli_config import (
 HELP_CACHE: TTLCache = TTLCache(maxsize=1, ttl=1800)  # 30 min
 VERSION_CACHE: TTLCache = TTLCache(maxsize=1, ttl=1800)  # 30 min
 MODELS_CACHE: TTLCache = TTLCache(maxsize=1, ttl=1800)  # 30 min
+AGENTS_CACHE: TTLCache = TTLCache(maxsize=1, ttl=1800)  # 30 min
 
-# Minimum agy version that supports --model
-_MIN_MODEL_VERSION = (1, 0, 5)
+# Minimum agy versions for feature-gated CLI flags
+_MIN_MODEL_VERSION = (1, 0, 5)     # --model
+_MIN_PROJECT_VERSION = (1, 0, 12)  # --project / --new-project
+_MIN_MODE_VERSION = (1, 1, 0)      # --mode
+_MIN_AGENT_VERSION = (1, 1, 1)     # --agent
 
 # Short names agy accepts for --model without needing the full display name.
 # Accepted directly (no `agy models` discovery call needed) when validating.
@@ -204,12 +208,22 @@ def _build_cli_args(
     conversation_id: Optional[str] = None,
     continue_conversation: bool = False,
     model: Optional[str] = None,
+    agent: Optional[str] = None,
+    project: Optional[str] = None,
+    new_project: bool = False,
 ) -> list[str]:
     """Build argument list for Antigravity CLI execution."""
     args: list[str] = []
+    cached_version = _get_cached_or_sync_version()
+    version = _parse_version(cached_version) if cached_version else (0, 0, 0)
 
     # Always skip permissions for MCP automation
     args.append("--dangerously-skip-permissions")
+
+    # agy 1.1.0 changed the default mode to "request-review" which pauses for
+    # interactive diff review before writes. Force accept-edits for headless use.
+    if cached_version and version >= _MIN_MODE_VERSION:
+        args.extend(["--mode", "accept-edits"])
 
     # Attach files via --add-dir (replaces @filename)
     for f in (files or []):
@@ -222,16 +236,37 @@ def _build_cli_args(
         logger.warning("debug=True ignored: agy --debug produces a system report instead of answering prompts")
 
     if model:
-        cached_version = _get_cached_or_sync_version()
         if not cached_version:
             logger.warning("CLI version could not be resolved; skipping --model flag")
-        elif _parse_version(cached_version) < _MIN_MODEL_VERSION:
+        elif version < _MIN_MODEL_VERSION:
             logger.warning(
                 f"--model requires agy >= {'.'.join(str(v) for v in _MIN_MODEL_VERSION)}, "
                 f"found {cached_version}; skipping --model flag"
             )
         else:
             args.extend(["--model", model])
+
+    if agent:
+        if not cached_version:
+            logger.warning("CLI version could not be resolved; skipping --agent flag")
+        elif version < _MIN_AGENT_VERSION:
+            logger.warning(
+                f"--agent requires agy >= {'.'.join(str(v) for v in _MIN_AGENT_VERSION)}, "
+                f"found {cached_version}; skipping --agent flag"
+            )
+        else:
+            args.extend(["--agent", agent])
+
+    if project:
+        if cached_version and version >= _MIN_PROJECT_VERSION:
+            args.extend(["--project", project])
+        else:
+            logger.warning("--project requires agy >= 1.0.12; skipping")
+    elif new_project:
+        if cached_version and version >= _MIN_PROJECT_VERSION:
+            args.append("--new-project")
+        else:
+            logger.warning("--new-project requires agy >= 1.0.12; skipping")
 
     if conversation_id:
         args.extend(["--conversation", conversation_id])
@@ -366,8 +401,10 @@ async def execute_cli(
             stderr.decode("utf-8", errors="replace") if stderr else ""
         )
 
-        # agy always returns returncode 0, even on errors.
-        # Detect errors by scanning stdout for known error patterns.
+        # Error detection: hybrid strategy for backward compatibility.
+        # - agy < 1.1.1: always exit 0, errors only in stdout patterns.
+        # - agy >= 1.1.1: server-side failures return non-zero exit + stderr.
+        # Both paths are kept so the bridge works across agy versions.
         error_patterns = [
             r'^Error:\s+',
             r'^CLI error:\s+',
@@ -378,7 +415,7 @@ async def execute_cli(
             for p in error_patterns
         )
 
-        # Also check stderr for rate limiting signals
+        # Check stderr for rate limiting signals (takes priority)
         if "rate limit" in stderr_str.lower() or "quota" in stderr_str.lower():
             METRICS["rate_limit_hits"] += 1
             _record_security_event("rate_limit", "medium", "execute_cli",
@@ -387,10 +424,15 @@ async def execute_cli(
 
         if process.returncode != 0 or has_error_in_stdout:
             METRICS["commands_failed"] += 1
+            # On non-zero exit (agy >= 1.1.1), prefer stderr as error content
+            # since stdout may be empty and the real error is in stderr.
+            error_output = stdout_str
+            if process.returncode != 0 and stderr_str.strip() and not stdout_str.strip():
+                error_output = stderr_str
             return {
                 "status": "error",
                 "return_code": process.returncode,
-                "stdout": stdout_str,
+                "stdout": error_output,
                 "stderr": stderr_str,
                 "execution_time": execution_time
             }
@@ -600,6 +642,66 @@ def add_model_metadata(result: dict, model_meta: dict) -> dict:
         else:
             result[key] = value
     return result
+
+
+async def get_available_agents() -> list[str]:
+    """Get available agents from agy with caching."""
+    cache_key = "agents"
+
+    if cache_key in AGENTS_CACHE:
+        METRICS["cache_hits"] += 1
+        return AGENTS_CACHE[cache_key]
+
+    METRICS["cache_misses"] += 1
+    try:
+        result = await execute_cli(["agents"], timeout=30)
+        if result["status"] == "success" and result["stdout"]:
+            agents = [
+                line.strip()
+                for line in result["stdout"].strip().splitlines()
+                if line.strip() and not line.strip().startswith("Available agents")
+            ]
+            AGENTS_CACHE[cache_key] = agents
+            return agents
+    except Exception as e:
+        logger.warning(f"Failed to fetch agents list: {e}")
+
+    return []
+
+
+async def validate_agent(agent: Optional[str]) -> dict:
+    """
+    Validate a requested agent name against what agy knows.
+
+    agy silently ignores an unknown --agent name (exit 0, no error), so a
+    typo would pass unnoticed. Returns metadata to merge into the response.
+    """
+    if not agent:
+        return {}
+
+    cached_version = _get_cached_or_sync_version()
+    if not cached_version or _parse_version(cached_version) < _MIN_AGENT_VERSION:
+        return {
+            "warning": (
+                f"--agent '{agent}' was not applied: agy "
+                f">= {'.'.join(str(v) for v in _MIN_AGENT_VERSION)} is required "
+                f"(found {cached_version or 'unknown'}). agy used its default agent."
+            )
+        }
+
+    available = await get_available_agents()
+    if not available:
+        return {"agent_validation": "unverified"}
+
+    if agent.strip().lower() in {a.strip().lower() for a in available}:
+        return {}
+
+    return {
+        "warning": (
+            f"Agent '{agent}' was not recognized (not in `agy agents`). "
+            f"agy may silently fall back to its default agent."
+        )
+    }
 
 
 def get_metrics() -> dict:
