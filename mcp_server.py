@@ -40,7 +40,9 @@ from modules.utils.cli_utils import (
     get_cli_help,
     get_cli_version,
     get_available_models,
+    get_available_agents,
     validate_model,
+    validate_agent,
     add_model_metadata,
     get_metrics,
     validate_cli_setup,
@@ -212,9 +214,11 @@ except ImportError:
 async def gemini_prompt(
     prompt: str,
     model: Optional[str] = None,
+    agent: Optional[str] = None,
     sandbox: bool = False,
     debug: bool = False,
-    readonly: bool = False
+    readonly: bool = False,
+    project: Optional[str] = None,
 ) -> str:
     """
     Send prompts to Antigravity CLI for execution (100,000 char limit).
@@ -229,11 +233,14 @@ async def gemini_prompt(
         model: Model to use. Use "pro" for complex reasoning or "flash" for
                speed. Short names and full names both work. Defaults to agy's
                default (Flash). See gemini_models() for the full list.
+        agent: Custom agent to use (agy >= 1.1.1). See gemini_agents() for
+               available agents. Omit to use the default agent.
         sandbox: Whether to run in sandbox mode
         debug: Whether to enable debug output (ignored for agy)
         readonly: When True, instructs the AI to only respond with text and not
                   create, modify, or delete any files. Use for brainstorming,
                   analysis, opinions, and planning tasks.
+        project: Project ID for session isolation (agy >= 1.0.12).
 
     Returns:
         JSON string with the response
@@ -267,11 +274,14 @@ async def gemini_prompt(
         debug=debug,
         files=files,
         model=effective_model,
+        agent=agent,
+        project=project,
     )
 
     try:
         result = await execute_cli_with_retry(args)
         result = add_model_metadata(result, await validate_model(effective_model))
+        result = add_model_metadata(result, await validate_agent(agent))
         return json.dumps(result, indent=2)
     except CLITimeoutError as e:
         return json.dumps({
@@ -345,6 +355,35 @@ async def gemini_models() -> str:
 
 
 @mcp.tool()
+async def gemini_agents() -> str:
+    """
+    List available custom agents.
+
+    Agents are specialized personas that can be selected via the `agent`
+    parameter on gemini_prompt and gemini_sandbox (requires agy >= 1.1.1).
+
+    Returns:
+        JSON with available agent names.
+
+    Examples:
+        gemini_agents()
+    """
+    agents = await get_available_agents()
+
+    return json.dumps({
+        "status": "success",
+        "agents": agents,
+        "note": (
+            "Pass an agent name as the `agent` parameter to gemini_prompt "
+            "or gemini_sandbox to use it. Requires agy >= 1.1.1."
+            if agents
+            else "No custom agents found. Create agents via agy's "
+                 "/agents panel or in ~/.gemini/config/agents/."
+        ),
+    }, indent=2)
+
+
+@mcp.tool()
 async def gemini_metrics() -> str:
     """
     Get comprehensive server performance metrics and statistics.
@@ -408,7 +447,9 @@ async def gemini_metrics() -> str:
 async def gemini_sandbox(
     prompt: str,
     model: Optional[str] = None,
-    sandbox_image: Optional[str] = None
+    agent: Optional[str] = None,
+    sandbox_image: Optional[str] = None,
+    project: Optional[str] = None,
 ) -> str:
     """
     Execute prompts in sandbox mode for code execution (200,000 char limit).
@@ -417,7 +458,9 @@ async def gemini_sandbox(
         prompt: The prompt to execute in sandbox mode
         model: Model to use. Use "pro" for complex reasoning or "flash" for
                speed. Defaults to agy's default (Flash).
+        agent: Custom agent to use (agy >= 1.1.1). See gemini_agents().
         sandbox_image: Optional Docker image for sandbox (e.g., python:3.11-slim)
+        project: Project ID for session isolation (agy >= 1.0.12).
 
     Returns:
         JSON string with execution results
@@ -441,11 +484,14 @@ async def gemini_sandbox(
         sandbox=True,
         files=files,
         model=effective_model,
+        agent=agent,
+        project=project,
     )
 
     try:
         result = await execute_cli_with_retry(args, timeout=get_task_timeout("sandbox"))
         result = add_model_metadata(result, await validate_model(effective_model))
+        result = add_model_metadata(result, await validate_agent(agent))
         return json.dumps(result, indent=2)
     except (CLITimeoutError, CLIRateLimitError, CLIExecutionError) as e:
         return json.dumps({
@@ -896,7 +942,8 @@ async def gemini_start_conversation(
 async def gemini_continue_conversation(
     conversation_id: str,
     prompt: str,
-    model: Optional[str] = None
+    model: Optional[str] = None,
+    project: Optional[str] = None,
 ) -> str:
     """
     Continue an existing conversation with context history.
@@ -906,6 +953,7 @@ async def gemini_continue_conversation(
         prompt: The new prompt/message
         model: Model to use. If omitted, reuses the model from the conversation
                or falls back to agy's default.
+        project: Project ID for session isolation (agy >= 1.0.12).
 
     Returns:
         JSON with response and updated conversation state
@@ -930,6 +978,7 @@ async def gemini_continue_conversation(
         cleaned_prompt, files = extract_file_refs(prompt)
         args = _build_cli_args(
             prompt=cleaned_prompt, files=files, model=effective_model,
+            project=project,
         )
         result = await execute_cli_with_retry(args)
         return json.dumps(add_model_metadata({

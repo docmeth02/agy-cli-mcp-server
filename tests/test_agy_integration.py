@@ -31,6 +31,7 @@ from modules.utils.cli_utils import (
     sanitize_output,
     validate_cli_setup,
     validate_model,
+    validate_agent,
     add_model_metadata,
     VERSION_CACHE,
     CLITimeoutError,
@@ -244,17 +245,18 @@ class TestConversations:
         assert "--continue" not in args
 
     @pytest.mark.asyncio
-    async def test_nonexistent_conversation_detected_as_error(self):
-        """agy returns exit 0 but warns on missing conversations.
-        Our error detection should catch the warning pattern and set status=error."""
+    async def test_nonexistent_conversation_treated_as_new(self):
+        """agy >= 1.0.9 silently ignores unknown conversation IDs and runs the
+        prompt normally (exit 0, no warning). Older agy emitted a "not found"
+        warning; our error patterns still catch that for backward compat, but
+        on current agy the result is a successful prompt execution."""
         args = _build_cli_args(
-            prompt="hello",
+            prompt="Reply with only the word OK",
             conversation_id="nonexistent_conversation_id_xyz_999",
         )
         result = await execute_cli(args, timeout=120)
         assert result["return_code"] == 0
-        assert result["status"] == "error"
-        assert "not found" in result["stdout"]
+        assert result["status"] == "success"
 
 
 # ---------------------------------------------------------------------------
@@ -312,7 +314,10 @@ class TestBuildCliArgs:
 
     def test_no_files_no_flags(self):
         args = _build_cli_args(prompt="hello")
-        assert args == ["--dangerously-skip-permissions", "--print", "hello"]
+        assert args[0] == "--dangerously-skip-permissions"
+        assert args[-2:] == ["--print", "hello"]
+        assert "--sandbox" not in args
+        assert "--model" not in args
 
     def test_sandbox_and_files(self, sample_file):
         args = _build_cli_args(
@@ -366,6 +371,49 @@ class TestBuildCliArgs:
         assert "--model" in args
         assert "--sandbox" in args
         assert "--add-dir" in args
+
+    def test_mode_accept_edits_always_injected(self):
+        args = _build_cli_args(prompt="hello")
+        assert "--mode" in args
+        assert args[args.index("--mode") + 1] == "accept-edits"
+
+    def test_mode_before_print(self):
+        args = _build_cli_args(prompt="hello")
+        assert args.index("--mode") < args.index("--print")
+
+    def test_agent_flag_injected(self):
+        args = _build_cli_args(prompt="hello", agent="my-agent")
+        assert "--agent" in args
+        assert args[args.index("--agent") + 1] == "my-agent"
+
+    def test_agent_none_omits_flag(self):
+        args = _build_cli_args(prompt="hello", agent=None)
+        assert "--agent" not in args
+
+    def test_project_flag_injected(self):
+        args = _build_cli_args(prompt="hello", project="proj-123")
+        assert "--project" in args
+        assert args[args.index("--project") + 1] == "proj-123"
+
+    def test_new_project_flag(self):
+        args = _build_cli_args(prompt="hello", new_project=True)
+        assert "--new-project" in args
+
+    def test_project_takes_precedence_over_new_project(self):
+        args = _build_cli_args(prompt="hello", project="proj-123", new_project=True)
+        assert "--project" in args
+        assert "--new-project" not in args
+
+    def test_all_new_flags_together(self, sample_file):
+        args = _build_cli_args(
+            prompt="test", sandbox=True, files=[str(sample_file)],
+            model="pro", agent="reviewer", project="proj-1",
+        )
+        assert "--mode" in args
+        assert "--model" in args
+        assert "--agent" in args
+        assert "--project" in args
+        assert "--sandbox" in args
 
 
 # ---------------------------------------------------------------------------
@@ -893,7 +941,118 @@ class TestModelValidation:
 
 
 # ---------------------------------------------------------------------------
-# 15. Sandbox scope (real agy; opt-in via RUN_SANDBOX_ISOLATION=1)
+# 15. Agent validation (deterministic — version/agents mocked)
+# ---------------------------------------------------------------------------
+
+class TestAgentValidation:
+
+    @pytest.mark.asyncio
+    async def test_none_agent_no_metadata(self):
+        assert await validate_agent(None) == {}
+        assert await validate_agent("") == {}
+
+    @pytest.mark.asyncio
+    async def test_old_version_warns_not_applied(self, monkeypatch):
+        import modules.utils.cli_utils as cu
+        monkeypatch.setattr(cu, "_get_cached_or_sync_version", lambda: "1.1.0")
+        meta = await validate_agent("my-agent")
+        assert "warning" in meta and "not applied" in meta["warning"]
+
+    @pytest.mark.asyncio
+    async def test_unknown_agent_warns(self, monkeypatch):
+        import modules.utils.cli_utils as cu
+        monkeypatch.setattr(cu, "_get_cached_or_sync_version", lambda: "1.1.1")
+
+        async def _agents():
+            return ["reviewer", "coder"]
+
+        monkeypatch.setattr(cu, "get_available_agents", _agents)
+        meta = await validate_agent("nonexistent")
+        assert "warning" in meta and "not recognized" in meta["warning"]
+
+    @pytest.mark.asyncio
+    async def test_known_agent_no_warning(self, monkeypatch):
+        import modules.utils.cli_utils as cu
+        monkeypatch.setattr(cu, "_get_cached_or_sync_version", lambda: "1.1.1")
+
+        async def _agents():
+            return ["reviewer"]
+
+        monkeypatch.setattr(cu, "get_available_agents", _agents)
+        assert await validate_agent("reviewer") == {}
+
+    @pytest.mark.asyncio
+    async def test_empty_list_marks_unverified(self, monkeypatch):
+        import modules.utils.cli_utils as cu
+        monkeypatch.setattr(cu, "_get_cached_or_sync_version", lambda: "1.1.1")
+
+        async def _agents():
+            return []
+
+        monkeypatch.setattr(cu, "get_available_agents", _agents)
+        assert await validate_agent("x") == {"agent_validation": "unverified"}
+
+
+# ---------------------------------------------------------------------------
+# 16. Error detection prefers stderr on non-zero exit (agy >= 1.1.1)
+# ---------------------------------------------------------------------------
+
+class TestErrorDetectionStderr:
+
+    @pytest.mark.asyncio
+    async def test_nonzero_exit_surfaces_stderr(self, monkeypatch):
+        """When agy returns non-zero exit + stderr (1.1.1+), the error result
+        should carry stderr in stdout for callers that key off stdout."""
+        import modules.utils.cli_utils as cu
+
+        class _FakeProc:
+            returncode = 1
+
+            async def communicate(self):
+                return (b"", b"server error: model not available\n")
+
+            def kill(self):
+                pass
+
+            async def wait(self):
+                return 1
+
+        async def _fake_exec(*args, **kwargs):
+            return _FakeProc()
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+        result = await execute_cli(["--print", "hi"], timeout=10)
+        assert result["status"] == "error"
+        assert "server error" in result["stdout"]
+
+    @pytest.mark.asyncio
+    async def test_zero_exit_with_stdout_error_still_detected(self, monkeypatch):
+        """Backward compat: exit 0 + stdout error pattern → error result."""
+        import modules.utils.cli_utils as cu
+
+        class _FakeProc:
+            returncode = 0
+
+            async def communicate(self):
+                return (b"Error: something went wrong\n", b"")
+
+            def kill(self):
+                pass
+
+            async def wait(self):
+                return 0
+
+        async def _fake_exec(*args, **kwargs):
+            return _FakeProc()
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+        result = await execute_cli(["--print", "hi"], timeout=10)
+        assert result["status"] == "error"
+        assert "something went wrong" in result["stdout"]
+
+
+# ---------------------------------------------------------------------------
+# 17. Sandbox scope (real agy; opt-in via RUN_SANDBOX_ISOLATION=1)
 # ---------------------------------------------------------------------------
 # NOTE: agy's --sandbox enables TERMINAL command restrictions, NOT a filesystem
 # jail. With our always-on --dangerously-skip-permissions, the agent's file
