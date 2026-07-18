@@ -230,9 +230,8 @@ async def gemini_prompt(
 
     Args:
         prompt: The prompt to send to Antigravity CLI
-        model: Model to use. Use "pro" for complex reasoning or "flash" for
-               speed. Short names and full names both work. Defaults to agy's
-               default (Flash). See gemini_models() for the full list.
+        model: Model to use (full display name required, e.g. "Gemini 3.1 Pro (High)").
+               Defaults to agy's default. See gemini_models() for the full list.
         agent: Custom agent to use (agy >= 1.1.1). See gemini_agents() for
                available agents. Omit to use the default agent.
         sandbox: Whether to run in sandbox mode
@@ -248,7 +247,7 @@ async def gemini_prompt(
     Examples:
         gemini_prompt(prompt="Explain quantum computing")
         gemini_prompt(prompt="Analyze @src/auth.py", readonly=True)
-        gemini_prompt(prompt="Complex analysis", model="pro")
+        gemini_prompt(prompt="Complex analysis", model="Gemini 3.1 Pro (High)")
     """
     if readonly:
         prompt = (
@@ -337,15 +336,11 @@ async def gemini_models() -> str:
     return json.dumps({
         "status": "success",
         "models": categorized,
-        "short_names": {
-            "flash": "Gemini 3.5 Flash (agy resolves tier automatically)",
-            "pro": "Gemini 3.1 Pro (agy resolves tier automatically)",
-            "claude": "Claude (agy resolves to available Claude model)",
-        },
         "guidance": (
-            "Use 'pro' for complex reasoning, code review, and analysis. "
-            "Use 'flash' (or omit model) for fast responses and simple tasks. "
-            "Short names and full display names both work."
+            "Use full display names from the models list above (e.g. "
+            "'Gemini 3.1 Pro (High)' for complex reasoning, "
+            "'Gemini 3.5 Flash (Medium)' for fast responses). "
+            "Short names (pro/flash/claude) are no longer accepted as of agy 1.1.4."
         ),
         "task_defaults": {
             k: v or "(agy default)"
@@ -448,7 +443,6 @@ async def gemini_sandbox(
     prompt: str,
     model: Optional[str] = None,
     agent: Optional[str] = None,
-    sandbox_image: Optional[str] = None,
     project: Optional[str] = None,
 ) -> str:
     """
@@ -456,10 +450,8 @@ async def gemini_sandbox(
 
     Args:
         prompt: The prompt to execute in sandbox mode
-        model: Model to use. Use "pro" for complex reasoning or "flash" for
-               speed. Defaults to agy's default (Flash).
+        model: Model to use (full display name required). Defaults to agy's default.
         agent: Custom agent to use (agy >= 1.1.1). See gemini_agents().
-        sandbox_image: Optional Docker image for sandbox (e.g., python:3.11-slim)
         project: Project ID for session isolation (agy >= 1.0.12).
 
     Returns:
@@ -467,7 +459,7 @@ async def gemini_sandbox(
 
     Examples:
         gemini_sandbox(prompt="Write and run a Python script to analyze data")
-        gemini_sandbox(prompt="Test this code", sandbox_image="node:18-alpine")
+        gemini_sandbox(prompt="Test this code in sandbox mode")
     """
     if len(prompt) > GEMINI_SANDBOX_LIMIT:
         return json.dumps({
@@ -577,7 +569,7 @@ async def gemini_summarize(
     Args:
         content: Content to summarize (supports @filename syntax)
         focus: Optional focus area (e.g., "architecture and design patterns")
-        model: Model to use. Defaults to agy's default (Flash). Use "pro" for
+        model: Model to use (full display name). Defaults to agy's default. Use Pro for
                deeper analysis of complex content.
 
     Returns:
@@ -630,7 +622,7 @@ async def gemini_summarize_files(
     Args:
         files: Files to summarize using @filename syntax (e.g., "@src/ @docs/")
         focus: Optional focus area for analysis
-        model: Model to use. Defaults to agy's default (Flash). Use "pro" for
+        model: Model to use (full display name). Defaults to agy's default. Use Pro for
                deeper analysis.
 
     Returns:
@@ -684,7 +676,7 @@ async def gemini_eval_plan(
         plan: The plan, idea, or proposal to evaluate
         context: Optional context (e.g., "Node.js REST API with MongoDB")
         requirements: Optional requirements or constraints
-        model: Model to use. Defaults to "pro" for deeper analysis. Use "flash"
+        model: Model to use (full display name). Defaults to Pro (High). Use Flash
                for quick evaluations.
 
     Returns:
@@ -755,7 +747,7 @@ async def gemini_review_code(
         purpose: Purpose of the review (e.g., "Security review")
         context: Additional context
         language: Programming language
-        model: Model to use. Defaults to "pro" for thorough reviews.
+        model: Model to use (full display name). Defaults to Pro (High) for thorough reviews.
 
     Returns:
         JSON string with review results
@@ -825,7 +817,7 @@ async def gemini_verify_solution(
         requirements: Original requirements
         test_criteria: Testing and performance criteria
         context: Deployment context
-        model: Model to use. Defaults to "pro" for thorough verification.
+        model: Model to use (full display name). Defaults to Pro (High) for thorough verification.
 
     Returns:
         JSON string with verification results
@@ -1109,7 +1101,7 @@ async def gemini_code_review(
         focus_areas: Comma-separated focus areas (security,performance,quality,best_practices)
         severity_threshold: Minimum severity to report (info, warning, error, critical)
         output_format: Output format (structured, markdown, json)
-        model: Model to use. Defaults to "pro" for thorough code reviews.
+        model: Model to use (full display name). Defaults to Pro (High) for thorough code reviews.
 
     Returns:
         JSON with structured code review
@@ -1161,7 +1153,7 @@ async def gemini_extract_structured(
         schema: JSON schema defining the output structure
         examples: Optional examples of expected output
         strict_mode: Whether to enforce strict schema compliance
-        model: Model to use. Defaults to "pro" for accurate extraction.
+        model: Model to use (full display name). Defaults to Pro (High) for accurate extraction.
 
     Returns:
         JSON with extracted structured data
@@ -1217,7 +1209,7 @@ async def gemini_git_diff_review(
         review_type: Review type (comprehensive, security_only, performance_only, quick)
         base_branch: Base branch for context
         commit_message: Associated commit message
-        model: Model to use. Defaults to "pro" for thorough diff analysis.
+        model: Model to use (full display name). Defaults to Pro (High) for thorough diff analysis.
 
     Returns:
         JSON with diff analysis
@@ -1279,7 +1271,7 @@ async def gemini_content_comparison(
         output_format: Output format (structured, matrix, summary, detailed, json)
         include_metrics: Include similarity scores and metrics
         focus_areas: Comma-separated focus areas
-        model: Model to use. Defaults to "pro" for thorough comparison.
+        model: Model to use (full display name). Defaults to Pro (High) for thorough comparison.
 
     Returns:
         JSON with comparison results
@@ -1391,7 +1383,7 @@ async def gemini_ai_collaboration(
             focus=focus
         )
     except ImportError:
-        model_list = (models or "flash").split(",")
+        model_list = (models or "Gemini 3.5 Flash (Medium)").split(",")
         results = []
 
         for m in model_list:
@@ -1425,6 +1417,297 @@ async def gemini_ai_collaboration(
 
 
 # ============================================================================
+# MCP Resources: Read-only repository access
+# ============================================================================
+
+import re as _re
+import subprocess as _subprocess
+
+
+def _resolve_workspace_root() -> Path:
+    """Resolve workspace root to the git repository root, falling back to cwd."""
+    try:
+        result = _subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return Path(result.stdout.strip()).resolve()
+    except (OSError, _subprocess.TimeoutExpired):
+        pass
+    return Path(os.getcwd()).resolve()
+
+
+_WORKSPACE_ROOT = _resolve_workspace_root()
+
+
+def _patch_template_matching():
+    """Patch ResourceTemplate.matches to allow multi-segment paths (slashes in {param}).
+
+    The default implementation uses [^/]+ which rejects nested paths like
+    'modules/utils/cli_utils.py'. We override at the class level to use .+
+    """
+    from mcp.server.fastmcp.resources.templates import ResourceTemplate
+
+    def _matches_with_slashes(self, uri: str):
+        pattern = _re.sub(r'\{([^}]+)\}', r'(?P<\1>.+)', self.uri_template)
+        match = _re.match(f"^{pattern}$", uri)
+        if match:
+            return match.groupdict()
+        return None
+
+    ResourceTemplate.matches = _matches_with_slashes
+
+_BINARY_EXTENSIONS = frozenset({
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp", ".svg",
+    ".pdf", ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z",
+    ".woff", ".woff2", ".ttf", ".otf", ".eot",
+    ".exe", ".dll", ".so", ".dylib", ".o", ".a",
+    ".pyc", ".pyo", ".class", ".jar",
+    ".mp3", ".mp4", ".wav", ".avi", ".mov", ".mkv",
+    ".sqlite", ".db", ".pb",
+})
+
+_IGNORE_DIRS = frozenset({
+    ".git", "__pycache__", "node_modules", ".venv", "venv",
+    ".mypy_cache", ".pytest_cache", ".tox", "dist", "build",
+    ".eggs", "*.egg-info",
+})
+
+_MAX_FILE_SIZE = 1_048_576  # 1 MB
+
+
+def _is_safe_repo_path(path: Path) -> bool:
+    """Ensure path is within workspace and not a symlink escape."""
+    resolved = path.resolve()
+    try:
+        resolved.relative_to(_WORKSPACE_ROOT)
+        return True
+    except ValueError:
+        return False
+
+
+def _should_skip_dir(name: str) -> bool:
+    """Check if a directory name should be excluded from listings."""
+    return name in _IGNORE_DIRS or name.endswith(".egg-info")
+
+
+@mcp.resource(
+    "repo://tree/{path}",
+    name="repo_tree",
+    title="Repository directory listing",
+    description="List files and subdirectories at a path in the repository. "
+                "Use empty path or '.' for the root.",
+    mime_type="application/json",
+)
+def repo_tree(path: str = ".") -> str:
+    target = (_WORKSPACE_ROOT / path).resolve()
+    if not _is_safe_repo_path(target):
+        return json.dumps({"error": "Path is outside the repository"})
+    if not target.is_dir():
+        return json.dumps({"error": f"Not a directory: {path}"})
+
+    entries = []
+    try:
+        for item in sorted(target.iterdir()):
+            if item.name.startswith(".") and item.is_dir():
+                if item.name in (".github", ".claude"):
+                    pass  # include these
+                else:
+                    continue
+            if item.is_dir() and _should_skip_dir(item.name):
+                continue
+
+            rel = item.relative_to(_WORKSPACE_ROOT)
+            if item.is_dir():
+                entries.append({"name": item.name, "type": "directory", "path": str(rel)})
+            else:
+                size = item.stat().st_size
+                entries.append({
+                    "name": item.name,
+                    "type": "file",
+                    "path": str(rel),
+                    "size": size,
+                })
+    except PermissionError:
+        return json.dumps({"error": f"Permission denied: {path}"})
+
+    return json.dumps({
+        "directory": str(target.relative_to(_WORKSPACE_ROOT)) if target != _WORKSPACE_ROOT else ".",
+        "entries": entries,
+        "count": len(entries),
+    }, indent=2)
+
+
+@mcp.resource(
+    "repo://file/{path}",
+    name="repo_file",
+    title="Repository file content",
+    description="Read the contents of a file in the repository. "
+                "Returns text content for text files, metadata for binary files.",
+    mime_type="text/plain",
+)
+def repo_file(path: str) -> str:
+    target = (_WORKSPACE_ROOT / path).resolve()
+    if not _is_safe_repo_path(target):
+        return json.dumps({"error": "Path is outside the repository"})
+    if not target.is_file():
+        return json.dumps({"error": f"Not a file: {path}"})
+
+    if target.stat().st_size > _MAX_FILE_SIZE:
+        return json.dumps({
+            "error": f"File too large ({target.stat().st_size:,} bytes, limit {_MAX_FILE_SIZE:,})",
+            "path": path,
+        })
+
+    suffix = target.suffix.lower()
+    if suffix in _BINARY_EXTENSIONS:
+        return json.dumps({
+            "type": "binary",
+            "path": path,
+            "size": target.stat().st_size,
+            "extension": suffix,
+            "note": "Binary file — content not returned. Use the path with gemini_prompt @ref if needed.",
+        })
+
+    try:
+        return target.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        try:
+            return target.read_text(encoding="latin-1")
+        except Exception:
+            return json.dumps({"error": f"Could not decode file: {path}", "type": "binary"})
+
+
+@mcp.resource(
+    "repo://search/{pattern}",
+    name="repo_search",
+    title="Repository file search",
+    description="Search for files by glob pattern (e.g. '**/*.py', 'modules/**/*.py'). "
+                "Returns matching file paths relative to the repo root.",
+    mime_type="application/json",
+)
+def repo_search(pattern: str) -> str:
+    if not pattern or not pattern.strip():
+        return json.dumps({"error": "Pattern cannot be empty"})
+
+    matches = []
+    limit = 500
+    for match in _WORKSPACE_ROOT.glob(pattern):
+        if not match.is_file():
+            continue
+        if not _is_safe_repo_path(match):
+            continue
+        parts = match.relative_to(_WORKSPACE_ROOT).parts
+        if any(_should_skip_dir(p) for p in parts[:-1]):
+            continue
+        matches.append({
+            "path": str(match.relative_to(_WORKSPACE_ROOT)),
+            "size": match.stat().st_size,
+        })
+        if len(matches) >= limit:
+            break
+
+    return json.dumps({
+        "pattern": pattern,
+        "matches": matches,
+        "count": len(matches),
+        "truncated": len(matches) >= limit,
+    }, indent=2)
+
+
+@mcp.resource(
+    "repo://grep/{query}",
+    name="repo_grep",
+    title="Repository content search",
+    description="Search file contents for a text pattern (case-insensitive substring match). "
+                "Returns matching lines with file paths and line numbers.",
+    mime_type="application/json",
+)
+def repo_grep(query: str) -> str:
+    if not query or not query.strip():
+        return json.dumps({"error": "Query cannot be empty"})
+
+    limit = 100
+    results = _grep_with_git(query, limit) or _grep_fallback(query, limit)
+
+    return json.dumps({
+        "query": query,
+        "results": results,
+        "count": len(results),
+        "truncated": len(results) >= limit,
+    }, indent=2)
+
+
+def _grep_with_git(query: str, limit: int) -> list[dict] | None:
+    """Fast path: use git grep if inside a git repo."""
+    try:
+        result = _subprocess.run(
+            ["git", "grep", "-inI", "--line-number", f"--max-count={limit}", "--", query],
+            capture_output=True, text=True, timeout=30,
+            cwd=str(_WORKSPACE_ROOT),
+        )
+        if result.returncode > 1:
+            return None
+    except (OSError, _subprocess.TimeoutExpired):
+        return None
+
+    results = []
+    for line in result.stdout.splitlines():
+        parts = line.split(":", 2)
+        if len(parts) >= 3:
+            file_path, lineno_str, content = parts[0], parts[1], parts[2]
+            try:
+                results.append({
+                    "file": file_path,
+                    "line": int(lineno_str),
+                    "content": content.rstrip()[:200],
+                })
+            except ValueError:
+                continue
+        if len(results) >= limit:
+            break
+    return results
+
+
+def _grep_fallback(query: str, limit: int) -> list[dict]:
+    """Fallback: Python-based search when git grep is unavailable."""
+    results = []
+    query_lower = query.lower()
+
+    for root, dirs, files in os.walk(_WORKSPACE_ROOT):
+        dirs[:] = [d for d in dirs if not _should_skip_dir(d) and not d.startswith(".")]
+        root_path = Path(root)
+
+        for fname in files:
+            fpath = root_path / fname
+            suffix = fpath.suffix.lower()
+            if suffix in _BINARY_EXTENSIONS:
+                continue
+            try:
+                if fpath.stat().st_size > _MAX_FILE_SIZE:
+                    continue
+            except OSError:
+                continue
+
+            try:
+                with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                    for lineno, line in enumerate(f, 1):
+                        if query_lower in line.lower():
+                            results.append({
+                                "file": str(fpath.relative_to(_WORKSPACE_ROOT)),
+                                "line": lineno,
+                                "content": line.rstrip()[:200],
+                            })
+                            if len(results) >= limit:
+                                return results
+            except (PermissionError, OSError):
+                continue
+
+    return results
+
+
+# ============================================================================
 # Server Entry Point
 # ============================================================================
 
@@ -1438,6 +1721,7 @@ def main():
     else:
         logger.warning("Antigravity CLI not found - some features may not work")
 
+    _patch_template_matching()
     mcp.run()
 
 

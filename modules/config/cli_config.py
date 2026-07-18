@@ -102,8 +102,9 @@ GEMINI_CONTENT_COMPARISON_LIMIT = int(os.getenv("GEMINI_CONTENT_COMPARISON_LIMIT
 # ============================================================================
 # Model Configuration (agy 1.0.5+)
 # ============================================================================
-# agy supports --model with short names ("pro", "flash", "claude") or full
-# display names ("Gemini 3.5 Flash (Medium)"). Empty string = let agy decide.
+# agy >= 1.1.4 requires full display names (e.g. "Gemini 3.1 Pro (High)").
+# Short names ("pro", "flash", "claude") were dropped in 1.1.4.
+# Empty string = let agy decide.
 
 DEFAULT_MODEL = os.getenv(
     "CLI_DEFAULT_MODEL", os.getenv("GEMINI_DEFAULT_MODEL", "")
@@ -118,16 +119,16 @@ ENABLE_FALLBACK = os.getenv(
     "CLI_ENABLE_FALLBACK", os.getenv("GEMINI_ENABLE_FALLBACK", "false")
 ).lower() == "true"
 
-# Per-task default models. "pro" for complex reasoning, None for agy's default.
+# Per-task default models. Full display names required for agy >= 1.1.4.
 # Override any task via CLI_MODEL_{TASK} or GEMINI_MODEL_{TASK} env vars.
 TASK_MODEL_DEFAULTS: dict[str, Optional[str]] = {
-    "eval_plan": "pro",
-    "review_code": "pro",
-    "verify_solution": "pro",
-    "code_review": "pro",
-    "extract_structured": "pro",
-    "git_diff_review": "pro",
-    "content_comparison": "pro",
+    "eval_plan": "Gemini 3.1 Pro (High)",
+    "review_code": "Gemini 3.1 Pro (High)",
+    "verify_solution": "Gemini 3.1 Pro (High)",
+    "code_review": "Gemini 3.1 Pro (High)",
+    "extract_structured": "Gemini 3.1 Pro (High)",
+    "git_diff_review": "Gemini 3.1 Pro (High)",
+    "content_comparison": "Gemini 3.1 Pro (High)",
     "prompt": None,
     "summarize": None,
     "summarize_files": None,

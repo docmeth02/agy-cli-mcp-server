@@ -52,8 +52,8 @@ _MIN_PROJECT_VERSION = (1, 0, 12)  # --project / --new-project
 _MIN_MODE_VERSION = (1, 1, 0)      # --mode
 _MIN_AGENT_VERSION = (1, 1, 1)     # --agent
 
-# Short names agy accepts for --model without needing the full display name.
-# Accepted directly (no `agy models` discovery call needed) when validating.
+# Short names agy accepted prior to 1.1.4. Kept for backward-compat validation
+# on older agy installs; on >= 1.1.4 these are rejected (full names required).
 MODEL_SHORT_NAMES = frozenset({"pro", "flash", "claude"})
 
 # Metrics tracking
@@ -578,9 +578,11 @@ async def validate_model(model: Optional[str]) -> dict:
     """
     Validate a requested model name against what agy actually accepts.
 
-    agy silently ignores an unknown --model name (returns its default model,
-    exit 0, no error), so a caller's typo would otherwise pass unnoticed. This
-    surfaces that as metadata rather than blocking the run.
+    As of agy >= 1.1.2, print mode hard-fails (non-zero exit + stderr listing
+    available models) on an unrecognized --model name. execute_cli() catches
+    that via the returncode check, so this pre-validation now serves as an
+    additional safety net and metadata enrichment rather than the primary
+    detection mechanism.
 
     Returns a dict that is empty when there is nothing to report, otherwise
     carries a "warning" and/or "model_validation" key to merge into the
@@ -620,8 +622,9 @@ async def validate_model(model: Optional[str]) -> dict:
     return {
         "warning": (
             f"Model '{model}' was not recognized (not a short name "
-            f"{sorted(MODEL_SHORT_NAMES)} and not in `agy models`). agy may "
-            f"silently fall back to its default model."
+            f"{sorted(MODEL_SHORT_NAMES)} and not in `agy models`). "
+            f"agy >= 1.1.2 will hard-fail in print mode; older versions "
+            f"silently fall back to the default model."
         )
     }
 
