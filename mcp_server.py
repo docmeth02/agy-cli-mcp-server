@@ -308,7 +308,7 @@ async def gemini_models() -> str:
     List all available AI models with selection guidance.
 
     Returns:
-        JSON with available models, short names, and per-tool defaults.
+        JSON with available models and per-tool defaults.
 
     Examples:
         gemini_models()
@@ -319,8 +319,8 @@ async def gemini_models() -> str:
         return json.dumps({
             "status": "success",
             "models": [],
-            "note": "Could not fetch models list. Use short names like "
-                    "'pro' or 'flash' which agy resolves automatically."
+            "note": "Could not fetch models list. Try full display names "
+                    "like 'Gemini 3.5 Flash (Medium)' or 'Gemini 3.1 Pro (High)'."
         }, indent=2)
 
     categorized = []
@@ -569,8 +569,8 @@ async def gemini_summarize(
     Args:
         content: Content to summarize (supports @filename syntax)
         focus: Optional focus area (e.g., "architecture and design patterns")
-        model: Model to use (full display name). Defaults to agy's default. Use Pro for
-               deeper analysis of complex content.
+        model: Model to use (full display name, e.g. "Gemini 3.1 Pro (High)").
+               Defaults to agy's default.
 
     Returns:
         JSON string with summarization results
@@ -622,8 +622,8 @@ async def gemini_summarize_files(
     Args:
         files: Files to summarize using @filename syntax (e.g., "@src/ @docs/")
         focus: Optional focus area for analysis
-        model: Model to use (full display name). Defaults to agy's default. Use Pro for
-               deeper analysis.
+        model: Model to use (full display name, e.g. "Gemini 3.1 Pro (High)").
+               Defaults to agy's default.
 
     Returns:
         JSON string with summarization results
@@ -676,8 +676,8 @@ async def gemini_eval_plan(
         plan: The plan, idea, or proposal to evaluate
         context: Optional context (e.g., "Node.js REST API with MongoDB")
         requirements: Optional requirements or constraints
-        model: Model to use (full display name). Defaults to Pro (High). Use Flash
-               for quick evaluations.
+        model: Model to use (full display name, e.g. "Gemini 3.5 Flash (Medium)").
+               Defaults to "Gemini 3.1 Pro (High)".
 
     Returns:
         JSON string with evaluation results
@@ -747,7 +747,8 @@ async def gemini_review_code(
         purpose: Purpose of the review (e.g., "Security review")
         context: Additional context
         language: Programming language
-        model: Model to use (full display name). Defaults to Pro (High) for thorough reviews.
+        model: Model to use (full display name, e.g. "Gemini 3.1 Pro (High)").
+               Defaults to "Gemini 3.1 Pro (High)".
 
     Returns:
         JSON string with review results
@@ -817,7 +818,8 @@ async def gemini_verify_solution(
         requirements: Original requirements
         test_criteria: Testing and performance criteria
         context: Deployment context
-        model: Model to use (full display name). Defaults to Pro (High) for thorough verification.
+        model: Model to use (full display name, e.g. "Gemini 3.1 Pro (High)").
+               Defaults to "Gemini 3.1 Pro (High)".
 
     Returns:
         JSON string with verification results
@@ -1101,7 +1103,8 @@ async def gemini_code_review(
         focus_areas: Comma-separated focus areas (security,performance,quality,best_practices)
         severity_threshold: Minimum severity to report (info, warning, error, critical)
         output_format: Output format (structured, markdown, json)
-        model: Model to use (full display name). Defaults to Pro (High) for thorough code reviews.
+        model: Model to use (full display name, e.g. "Gemini 3.1 Pro (High)").
+               Defaults to "Gemini 3.1 Pro (High)".
 
     Returns:
         JSON with structured code review
@@ -1153,7 +1156,8 @@ async def gemini_extract_structured(
         schema: JSON schema defining the output structure
         examples: Optional examples of expected output
         strict_mode: Whether to enforce strict schema compliance
-        model: Model to use (full display name). Defaults to Pro (High) for accurate extraction.
+        model: Model to use (full display name, e.g. "Gemini 3.1 Pro (High)").
+               Defaults to "Gemini 3.1 Pro (High)".
 
     Returns:
         JSON with extracted structured data
@@ -1209,7 +1213,8 @@ async def gemini_git_diff_review(
         review_type: Review type (comprehensive, security_only, performance_only, quick)
         base_branch: Base branch for context
         commit_message: Associated commit message
-        model: Model to use (full display name). Defaults to Pro (High) for thorough diff analysis.
+        model: Model to use (full display name, e.g. "Gemini 3.1 Pro (High)").
+               Defaults to "Gemini 3.1 Pro (High)".
 
     Returns:
         JSON with diff analysis
@@ -1271,7 +1276,8 @@ async def gemini_content_comparison(
         output_format: Output format (structured, matrix, summary, detailed, json)
         include_metrics: Include similarity scores and metrics
         focus_areas: Comma-separated focus areas
-        model: Model to use (full display name). Defaults to Pro (High) for thorough comparison.
+        model: Model to use (full display name, e.g. "Gemini 3.1 Pro (High)").
+               Defaults to "Gemini 3.1 Pro (High)".
 
     Returns:
         JSON with comparison results
@@ -1339,7 +1345,8 @@ async def gemini_ai_collaboration(
     Args:
         collaboration_mode: Mode (sequential, debate, validation)
         content: Content to analyze
-        models: Comma-separated model list (e.g., "pro,flash,claude" for diverse debate)
+        models: Comma-separated model list using full display names
+               (e.g., "Gemini 3.1 Pro (High),Gemini 3.5 Flash (Medium)")
         context: Additional context
         conversation_id: For stateful conversations
         budget_limit: Deprecated (agy does not support cost budgeting)

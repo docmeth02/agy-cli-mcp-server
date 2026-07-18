@@ -19,7 +19,7 @@ CREDENTIAL_PATTERNS = [
 
     # AWS
     (r'AKIA[0-9A-Z]{16}', '[REDACTED_AWS_ACCESS_KEY]'),
-    (r'(?<![A-Za-z0-9/+])[A-Za-z0-9/+=]{40}(?![A-Za-z0-9/+=])', '[REDACTED_AWS_SECRET]'),
+    (r'(?:aws_secret_access_key|AWS_SECRET_ACCESS_KEY|aws_secret|SecretAccessKey)\s*[:=]\s*(?:"([^"]{40})"|\'([^\']{40})\'|([A-Za-z0-9/+=]{40}))', '[REDACTED_AWS_SECRET]'),
 
     # Bearer tokens
     (r'Bearer\s+[a-zA-Z0-9._~+/=-]+', 'Bearer [REDACTED]'),
