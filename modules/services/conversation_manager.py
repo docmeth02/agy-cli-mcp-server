@@ -2,8 +2,9 @@
 Conversation management backed by Antigravity CLI native conversations.
 
 This module provides a thin wrapper around agy's native conversation storage
-(~/.gemini/antigravity-cli/conversations/<uuid>.pb) with metadata tracking
-in a local JSON sidecar file.
+(~/.gemini/antigravity-cli/conversations/<uuid>.db for recent conversations,
+legacy <uuid>.pb for older ones) with metadata tracking in a local JSON
+sidecar file.
 """
 import asyncio
 import json
@@ -48,9 +49,13 @@ def _is_valid_conversation_id(conversation_id: str) -> bool:
         return False
     if not _CONVERSATION_ID_RE.match(conversation_id):
         return False
-    # Belt and braces: confirm the resolved path really is a direct child.
-    candidate = (CONVERSATIONS_DIR / f"{conversation_id}.pb").resolve()
-    return candidate.parent == CONVERSATIONS_DIR.resolve()
+    # Belt and braces: confirm the path lands directly inside the store.
+    # Resolve the *parent*, not the leaf — resolving the leaf would follow a
+    # symlink at the conversation file itself, so a stray or dangling
+    # "<id>.pb" symlink pointing elsewhere would make us reject an otherwise
+    # perfectly valid (and possibly .db-backed) conversation.
+    parent = (CONVERSATIONS_DIR / f"{conversation_id}{_CONVERSATION_SUFFIXES[0]}").parent.resolve()
+    return parent == CONVERSATIONS_DIR.resolve()
 
 
 def _invalid_id_error(conversation_id: str) -> dict:
@@ -262,7 +267,7 @@ class ConversationManager:
         # (verified on 1.1.11, in both text and JSON output modes). Since
         # create_conversation() mints its own uuid4 that agy never sees, passing
         # it through would produce a fresh, historyless context on every call
-        # while still reporting success. Require a real agy-side .pb instead of
+        # while still reporting success. Require a real agy-side store instead of
         # silently losing history — this subsumes the sidecar-metadata check,
         # because a sidecar entry alone is not something agy can resume. The
         # real fix, binding the sidecar entry to the id agy reports back in its
@@ -279,8 +284,6 @@ class ConversationManager:
                 ),
                 "error_code": "CONVERSATION_NOT_BOUND",
             }
-
-        metadata = _load_metadata()
 
         from modules.utils.cli_utils import _build_cli_args
         args = _build_cli_args(
@@ -328,15 +331,34 @@ class ConversationManager:
         limit: int = 20,
         status_filter: Optional[str] = None
     ) -> list[dict]:
-        """List conversations from agy storage and metadata."""
+        """
+        List conversations from agy storage and metadata, most recent first.
+
+        Ordered by recency rather than metadata-first. Sidecar-only entries (from
+        gemini_start_conversation, which agy never learns about) would otherwise
+        occupy the head of the list permanently and push real, resumable
+        conversations past `limit` — starving the very workflow the tool
+        docstrings prescribe, which is to pick an id whose has_native_file is
+        true from this listing.
+        """
         metadata = _load_metadata()
         agy_ids = _list_agy_conversations()
 
         # Merge: include all IDs that exist in either metadata or agy storage
-        all_ids = list(dict.fromkeys(list(metadata.keys()) + agy_ids))
+        all_ids = list(dict.fromkeys(agy_ids + list(metadata.keys())))
 
         conversations = []
         now = time.time()
+
+        def _recency(cid: str) -> float:
+            meta = metadata.get(cid, {})
+            return max(
+                _get_conversation_mtime(cid),
+                meta.get("updated_at") or 0,
+                meta.get("created_at") or 0,
+            )
+
+        all_ids.sort(key=_recency, reverse=True)
 
         for cid in all_ids:
             meta = metadata.get(cid, {})
@@ -344,9 +366,13 @@ class ConversationManager:
             created_at = meta.get("created_at", mtime or now)
             expiration_hours = meta.get("expiration_hours", DEFAULT_EXPIRATION_HOURS)
 
-            if status_filter == "active":
-                if now > created_at + (expiration_hours * 3600):
-                    continue
+            expired = now > created_at + (expiration_hours * 3600)
+            # "expired" was previously accepted and silently ignored, so the
+            # filter returned every conversation.
+            if status_filter == "active" and expired:
+                continue
+            if status_filter == "expired" and not expired:
+                continue
 
             conversations.append({
                 "conversation_id": cid,
@@ -415,6 +441,8 @@ class ConversationManager:
 
         total_size = 0
         for cid in agy_ids:
+            if not _is_valid_conversation_id(cid):
+                continue
             path = _conversation_path(cid)
             if path is not None:
                 try:

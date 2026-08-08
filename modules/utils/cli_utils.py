@@ -255,7 +255,10 @@ def _build_cli_args(
     # unknown we therefore assume a modern agy and pass the flags anyway; the
     # worst case on a genuinely ancient install is an unknown-flag error, which
     # is a loud, correct failure rather than a silent unsafe one.
-    version_unknown = not cached_version
+    # Also treat an unparseable version as unknown: a string like "2.0" or "v2"
+    # is truthy but _parse_version() yields (0,0,0), which would silently fail
+    # every gate below open — exactly what this fail-closed block prevents.
+    version_unknown = not cached_version or version == (0, 0, 0)
 
     # agy 1.1.0 changed the default mode to "request-review" which pauses for
     # interactive diff review before writes. Force accept-edits for headless use.
@@ -305,16 +308,28 @@ def _build_cli_args(
         else:
             args.extend(["--agent", agent])
 
+    # --project/--new-project also fail CLOSED, for the same reason as --mode and
+    # --disable-slash-commands above: dropping them silently merges what the
+    # caller asked to keep isolated. Contrast --model/--agent, which fail open
+    # because their absence only means "agy picks the default" — benign.
     if project:
-        if cached_version and version >= _MIN_PROJECT_VERSION:
+        if version_unknown or version >= _MIN_PROJECT_VERSION:
             args.extend(["--project", project])
         else:
-            logger.warning("--project requires agy >= 1.0.12; skipping")
+            logger.warning(
+                f"--project requires agy >= "
+                f"{'.'.join(str(v) for v in _MIN_PROJECT_VERSION)}, "
+                f"found {cached_version}; skipping (session NOT isolated)"
+            )
     elif new_project:
-        if cached_version and version >= _MIN_PROJECT_VERSION:
+        if version_unknown or version >= _MIN_PROJECT_VERSION:
             args.append("--new-project")
         else:
-            logger.warning("--new-project requires agy >= 1.0.12; skipping")
+            logger.warning(
+                f"--new-project requires agy >= "
+                f"{'.'.join(str(v) for v in _MIN_PROJECT_VERSION)}, "
+                f"found {cached_version}; skipping (session NOT isolated)"
+            )
 
     if conversation_id:
         args.extend(["--conversation", conversation_id])
@@ -333,7 +348,11 @@ _RATE_LIMIT_PATTERNS = (
     r'quota',
     r'resource[-_\s]*exhausted',
     r'too\s+many\s+requests',
-    r'\b429\b',
+    # HTTP 429 needs status context: a bare 429 also appears in durations
+    # ("took 1.429 seconds"), stack traces ("index.js:429:12") and counts
+    # ("Read 429 files"). The canonical "429 Too Many Requests" text is already
+    # covered by the too-many-requests pattern above.
+    r'(?:http|status|statuscode|code)\s*[:=]?\s*429\b',
     # "weekly/daily/5-hour limit reached" phrasing, which names no quota at all.
     r'(?:weekly|daily|5[-\s]?hour|hourly)\s+limit\s+(?:reached|exceeded|hit)',
     r'reached\s+your\s+(?:weekly|daily|hourly|5[-\s]?hour)\s+limit',
@@ -361,6 +380,17 @@ def _is_rate_limit_signal(text: str) -> bool:
         return False
     return any(
         re.search(p, text, re.IGNORECASE) for p in _RATE_LIMIT_PATTERNS
+    )
+
+
+_PRINT_FLAGS = ("--print", "-p", "--prompt")
+
+
+def _is_print_invocation(args: list[str]) -> bool:
+    """Whether these args invoke agy's print mode (as opposed to a subcommand)."""
+    return any(
+        a in _PRINT_FLAGS or any(a.startswith(f + "=") for f in _PRINT_FLAGS)
+        for a in args
     )
 
 
@@ -502,11 +532,16 @@ async def execute_cli(
             for p in error_patterns
         )
 
-        # Check stderr for rate limiting signals (takes priority).
-        # Deliberately specific: a bare "quota" substring also matches ordinary
-        # quota *reporting* (agy 1.1.11 added `/usage` and `/quota`), which would
-        # turn a successful status read into a spurious CLIRateLimitError.
-        if _is_rate_limit_signal(stderr_str):
+        # Check stderr for rate limiting signals (takes priority). Matching is
+        # deliberately inclusive — see _is_rate_limit_signal for why that is safe
+        # here and why narrowing it to exact phrasings caused a regression.
+        #
+        # Restricted to --print runs: only those can actually be rate limited,
+        # and agy routes some subcommand output entirely to stderr (`agy help`
+        # writes ~2KB there and nothing to stdout). Scanning that would let one
+        # future help line naming a rate limit turn gemini_help into three
+        # retries followed by a bogus CLIRateLimitError.
+        if _is_print_invocation(args) and _is_rate_limit_signal(stderr_str):
             METRICS["rate_limit_hits"] += 1
             _record_security_event("rate_limit", "medium", "execute_cli",
                                    {"detail": stderr_str[:500]})
@@ -824,10 +859,13 @@ async def run_readonly_slash_command(command: str, timeout: int = 60) -> dict:
     leaving a conversation behind (verified: empty conversation_id and all-zero
     usage counters). That makes these safe and cheap to expose.
 
-    On agy >= 1.1.8 the JSON envelope carries a fully structured
-    ``command.data`` payload, which is preferred: it has full-precision values
-    (e.g. remaining_fraction) where the text form rounds to whole percent.
-    Below that, the tab-separated text records are returned instead.
+    Always requests ``--output-format json``: the 1.1.11 floor above is higher
+    than the 1.1.8 floor for structured output, so every version that answers
+    these commands at all also carries the structured ``command.data`` payload.
+    That payload is preferred over the tab-separated text form because it holds
+    full-precision values (e.g. remaining_fraction) where the text rounds to
+    whole percent. ``records`` is still returned alongside it, parsed from the
+    envelope's human-readable ``response``.
 
     Args are built directly rather than via _build_cli_args() because these
     invocations must NOT get --disable-slash-commands (they *are* slash
@@ -858,11 +896,10 @@ async def run_readonly_slash_command(command: str, timeout: int = 60) -> dict:
             "error_code": "UNSUPPORTED_AGY_VERSION",
         }
 
-    structured = version >= _MIN_COMMAND_JSON_VERSION
-
-    args = ["-p", command]
-    if structured:
-        args.extend(["--output-format", "json"])
+    # Unconditional: _MIN_READONLY_SLASH_VERSION (1.1.11) already exceeds
+    # _MIN_COMMAND_JSON_VERSION (1.1.8), so anything past the gate above
+    # supports the JSON envelope.
+    args = ["-p", command, "--output-format", "json"]
 
     result = await execute_cli(args, timeout=timeout)
     if result["status"] != "success":
@@ -874,56 +911,67 @@ async def run_readonly_slash_command(command: str, timeout: int = 60) -> dict:
         }
 
     raw = result.get("stdout", "") or ""
-    data = None
-    text = raw
 
-    if structured:
-        try:
-            envelope = json.loads(raw)
-        except (ValueError, TypeError):
-            # Never fall through to "success" on an unparseable envelope: we
-            # asked for JSON, so exit 0 no longer proves anything, and handing
-            # back line-split raw text would look like a real reading.
-            logger.warning(f"'{command}' returned an unparseable JSON envelope")
-            return {
-                "status": "error",
-                "error": f"'{command}' returned an unparseable JSON envelope",
-                "error_code": "MALFORMED_ENVELOPE",
-            }
+    try:
+        envelope = json.loads(raw)
+    except (ValueError, TypeError):
+        # Never fall through to "success" on an unparseable envelope: we asked
+        # for JSON, so exit 0 no longer proves anything, and handing back
+        # line-split raw text would look like a real reading.
+        logger.warning(f"'{command}' returned an unparseable JSON envelope")
+        return {
+            "status": "error",
+            "error": f"'{command}' returned an unparseable JSON envelope",
+            "error_code": "MALFORMED_ENVELOPE",
+        }
 
-        # Anything that is not an explicit SUCCESS is a failure. Checking only
-        # for == "ERROR" would let an unknown future status through as success.
-        if envelope.get("status") != "SUCCESS":
-            return {
-                "status": "error",
-                "error": (
-                    envelope.get("error")
-                    or f"'{command}' returned status {envelope.get('status')!r}"
-                ),
-                "error_code": "COMMAND_FAILED",
-            }
+    # `null`, `[]`, `123` and `"str"` are all valid JSON but not an envelope.
+    # Without this the .get() calls below raise AttributeError, which escapes
+    # the tool and bypasses the whole error-code contract.
+    if not isinstance(envelope, dict):
+        logger.warning(f"'{command}' returned a non-object JSON root")
+        return {
+            "status": "error",
+            "error": (
+                f"'{command}' returned a non-object JSON root "
+                f"({type(envelope).__name__})"
+            ),
+            "error_code": "MALFORMED_ENVELOPE",
+        }
 
-        # A genuine command answer carries a `command` payload and burns nothing.
-        # If agy instead executed the text as a prompt, `command` is absent and
-        # the turn/token counters are non-zero. Treat that as a failure: it means
-        # this agy does not answer the command, and reporting success would
-        # present model prose as a quota reading.
-        usage = envelope.get("usage") or {}
-        spent = usage.get("total_tokens") or 0
-        turns = envelope.get("num_turns") or 0
-        if "command" not in envelope or turns or spent:
-            return {
-                "status": "error",
-                "error": (
-                    f"'{command}' was executed as a prompt rather than answered "
-                    f"as a command (num_turns={turns}, total_tokens={spent}). "
-                    f"This agy build does not support it in print mode."
-                ),
-                "error_code": "NOT_A_COMMAND",
-            }
+    # Anything that is not an explicit SUCCESS is a failure. Checking only for
+    # == "ERROR" would let an unknown future status through as success.
+    if envelope.get("status") != "SUCCESS":
+        return {
+            "status": "error",
+            "error": (
+                envelope.get("error")
+                or f"'{command}' returned status {envelope.get('status')!r}"
+            ),
+            "error_code": "COMMAND_FAILED",
+        }
 
-        data = (envelope.get("command") or {}).get("data")
-        text = envelope.get("response", "") or ""
+    # A genuine command answer carries a `command` payload and burns nothing.
+    # If agy instead executed the text as a prompt, `command` is absent and the
+    # turn/token counters are non-zero. Treat that as a failure: it means this
+    # agy does not answer the command, and reporting success would present model
+    # prose as a quota reading.
+    usage = envelope.get("usage") or {}
+    spent = usage.get("total_tokens") or 0
+    turns = envelope.get("num_turns") or 0
+    if "command" not in envelope or turns or spent:
+        return {
+            "status": "error",
+            "error": (
+                f"'{command}' was executed as a prompt rather than answered "
+                f"as a command (num_turns={turns}, total_tokens={spent}). "
+                f"This agy build does not support it in print mode."
+            ),
+            "error_code": "NOT_A_COMMAND",
+        }
+
+    data = (envelope.get("command") or {}).get("data")
+    text = envelope.get("response", "") or ""
 
     records = [
         line.split("\t")

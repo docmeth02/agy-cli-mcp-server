@@ -271,3 +271,63 @@ class TestRateLimitSignal:
         # stderr in both text and JSON modes — so there is no quota-reporting
         # false positive to guard against here.
         assert _is_rate_limit_signal(text) is False
+
+
+# ---------------------------------------------------------------------------
+# Version gating: safety flags must fail CLOSED
+# ---------------------------------------------------------------------------
+
+class TestSafetyFlagsFailClosed:
+    """
+    --mode accept-edits, --disable-slash-commands and --project must be injected
+    even when the version probe fails. Gating them on a *successful* probe means
+    a transient hiccup silently reverts to interactive-review mode, lets caller
+    text be expanded as an agy command, and merges sessions meant to be isolated.
+    """
+
+    @pytest.mark.parametrize("version", [
+        "",             # probe failed outright
+        "garbage",      # non-empty but no version in it
+        "2.0",          # two components — _parse_version yields (0,0,0)
+        "v2",
+        "agy (dev build)",
+    ])
+    def test_unresolvable_version_still_injects_safety_flags(self, version, monkeypatch):
+        import modules.utils.cli_utils as cu
+        monkeypatch.setattr(cu, "_get_cached_or_sync_version", lambda: version)
+
+        args = cu._build_cli_args(prompt="/schedule something", project="p1")
+
+        assert "--mode" in args, f"version={version!r} dropped --mode"
+        assert args[args.index("--mode") + 1] == "accept-edits"
+        assert "--disable-slash-commands" in args, (
+            f"version={version!r} dropped --disable-slash-commands, so a caller "
+            f"prompt beginning with '/' would be expanded as an agy command"
+        )
+        assert "--project" in args, f"version={version!r} dropped session isolation"
+
+    def test_opt_in_still_honoured_when_version_unknown(self, monkeypatch):
+        import modules.utils.cli_utils as cu
+        monkeypatch.setattr(cu, "_get_cached_or_sync_version", lambda: "")
+        args = cu._build_cli_args(prompt="/skills", interpret_slash_commands=True)
+        assert "--disable-slash-commands" not in args
+
+
+class TestPrintInvocationDetection:
+    """The rate-limit scan is restricted to print runs: `agy help` writes its
+    entire payload to stderr, so scanning it for every invocation would let one
+    future help line naming a rate limit break gemini_help."""
+
+    @pytest.mark.parametrize("args,expected", [
+        (["--print", "hi"], True),
+        (["-p", "hi"], True),
+        (["--prompt", "hi"], True),
+        (["--print=hi"], True),
+        (["help"], False),
+        (["models"], False),
+        (["agents"], False),
+        (["--version"], False),
+    ])
+    def test_detection(self, args, expected):
+        from modules.utils.cli_utils import _is_print_invocation
+        assert _is_print_invocation(args) is expected

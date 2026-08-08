@@ -22,7 +22,13 @@ from typing import Optional
 from mcp.server.fastmcp import FastMCP
 
 # Configure logging
-log_level = os.getenv("GEMINI_LOG_LEVEL", "INFO").upper()
+# CLI_LOG_LEVEL is the documented primary name, with GEMINI_LOG_LEVEL kept as a
+# backward-compatible fallback (matching every other setting in cli_config.py).
+# Read directly rather than via cli_config, because logging must be configured
+# before that import happens.
+log_level = os.getenv(
+    "CLI_LOG_LEVEL", os.getenv("GEMINI_LOG_LEVEL", "INFO")
+).upper()
 logging.basicConfig(
     level=getattr(logging, log_level, logging.INFO),
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -542,22 +548,36 @@ async def gemini_cache_stats() -> str:
     Examples:
         gemini_cache_stats()
     """
-    from modules.utils.cli_utils import HELP_CACHE, VERSION_CACHE
+    # "All cache backends" means all of them: reporting only help/version left
+    # four of six invisible, including the two added for quota state.
+    from modules.utils.cli_utils import (
+        HELP_CACHE, VERSION_CACHE, MODELS_CACHE, AGENTS_CACHE,
+        USAGE_CACHE, CREDITS_CACHE,
+    )
 
-    stats = {
-        "help_cache": {
-            "size": len(HELP_CACHE),
-            "maxsize": HELP_CACHE.maxsize,
-            "ttl_seconds": HELP_CACHE.ttl,
-            "items": list(HELP_CACHE.keys())
-        },
-        "version_cache": {
-            "size": len(VERSION_CACHE),
-            "maxsize": VERSION_CACHE.maxsize,
-            "ttl_seconds": VERSION_CACHE.ttl,
-            "items": list(VERSION_CACHE.keys())
-        },
+    caches = {
+        "help_cache": HELP_CACHE,
+        "version_cache": VERSION_CACHE,
+        "models_cache": MODELS_CACHE,
+        "agents_cache": AGENTS_CACHE,
+        "usage_cache": USAGE_CACHE,
+        "credits_cache": CREDITS_CACHE,
     }
+    stats = {
+        name: {
+            "size": len(cache),
+            "maxsize": cache.maxsize,
+            "ttl_seconds": cache.ttl,
+            "items": list(cache.keys()),
+        }
+        for name, cache in caches.items()
+    }
+
+    try:
+        from prompts.template_loader import get_template_stats
+        stats["template_cache"] = get_template_stats()
+    except Exception:
+        pass
 
     return json.dumps({
         "status": "success",
@@ -623,33 +643,49 @@ async def gemini_usage() -> str:
             "status": "error",
             "error": result.get("error", "Failed to read usage"),
             "error_code": "USAGE_FAILED",
+            "underlying_error_code": result.get("error_code"),
             "note": "Requires agy >= 1.1.11 for print-mode /usage support.",
         })
 
+    # Type-guard every level rather than only truthiness-guard it. agy is Go, so
+    # a nil slice marshals to JSON null (which `or []` handles), but an
+    # unexpected shape — an object where a list was expected, or a null element —
+    # would otherwise raise AttributeError straight out of the tool, bypassing
+    # the error contract entirely.
+    def _percent(value) -> Optional[float]:
+        # bool is an int subclass; True must not become 100%.
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return round(value * 100, 2)
+
     groups = []
-    data = result.get("data") or {}
-    for group in (data.get("groups") or []):
+    data = result.get("data")
+    if not isinstance(data, dict):
+        data = {}
+    raw_groups = data.get("groups")
+    for group in (raw_groups if isinstance(raw_groups, list) else []):
+        if not isinstance(group, dict):
+            continue
+        raw_buckets = group.get("buckets")
         groups.append({
             "group": group.get("name"),
             "models": group.get("description"),
             "buckets": [
                 {
                     "window": b.get("window"),
-                    "remaining_percent": (
-                        round(b["remaining_fraction"] * 100, 2)
-                        if isinstance(b.get("remaining_fraction"), (int, float))
-                        else None
-                    ),
+                    "remaining_percent": _percent(b.get("remaining_fraction")),
                     "resets_at": b.get("reset_time"),
                     "detail": b.get("description"),
                 }
-                for b in (group.get("buckets") or [])
+                for b in (raw_buckets if isinstance(raw_buckets, list) else [])
+                if isinstance(b, dict)
             ],
         })
 
     payload = {"status": "success", "groups": groups}
     if not groups:
-        # agy < 1.1.8 has no structured payload; hand back the text records.
+        # No parsed groups (unexpected payload shape) — hand back the raw
+        # tab-separated records so the caller still sees something actionable.
         payload["records"] = result.get("records", [])
     # Cached for 60s, so stamp the reading: an unchanged percentage after a heavy
     # run is otherwise indistinguishable from a stale cache hit.
@@ -702,17 +738,21 @@ async def gemini_credits() -> str:
             "status": "error",
             "error": result.get("error", "Failed to read credits"),
             "error_code": "CREDITS_FAILED",
+            "underlying_error_code": result.get("error_code"),
             "note": "Requires agy >= 1.1.11 for print-mode /credits support.",
         })
 
-    data = result.get("data") or {}
+    data = result.get("data")
+    if not isinstance(data, dict):
+        data = {}
     payload = {"status": "success"}
     if "remaining_credits" in data:
         payload["remaining_credits"] = data["remaining_credits"]
         if data.get("upgrade_uri"):
             payload["upgrade_uri"] = data["upgrade_uri"]
     else:
-        # agy < 1.1.8: no structured payload, return the text records.
+        # No parsed balance (unexpected payload shape) — hand back the raw
+        # tab-separated records rather than silently reporting nothing.
         payload["records"] = result.get("records", [])
     payload["retrieved_at"] = _utc_now_iso()
     payload["cache_ttl_seconds"] = CREDITS_CACHE.ttl
@@ -1547,7 +1587,8 @@ async def gemini_ai_collaboration(
         models: Comma-separated model list using slugs or display names
                (e.g., "gemini-3.1-pro-high,gemini-3.6-flash-medium")
         context: Additional context
-        conversation_id: For stateful conversations
+        conversation_id: Accepted for backward compatibility but NOT used;
+                the collaboration engine does not thread it through
         budget_limit: Deprecated (agy does not support cost budgeting)
         pipeline_stages: Stages for sequential mode
         handoff_criteria: Handoff criteria for sequential

@@ -11,7 +11,7 @@ A Model Context Protocol (MCP) server that bridges Google's **Antigravity CLI** 
 - **4 MCP Resources** - Read-only repository access (tree, file, search, grep) without AI invocation
 - **Antigravity CLI Integration** - Direct bridge to Google's `agy` CLI with native conversation support
 - **Enterprise Architecture** - Refactored modular design with specialized modules
-- **Conversation History** - Stateful multi-turn conversations via agy native `.pb` files
+- **Conversation History** - Stateful multi-turn conversations via agy's native conversation stores (SQLite `.db`, legacy `.pb`)
 - **Dynamic Token Limits** - Tool-specific limits from 100K-800K characters
 - **Multi-AI Workflows** - Purpose-built tools for plan evaluation, code review, and collaboration
 - **@filename Support** - Direct file reading with intelligent expansion for 23 tools
@@ -87,7 +87,7 @@ The Gemini CLI MCP Server features a modular, enterprise-grade architecture desi
 - **FastMCP Framework**: Official MCP Python SDK with JSON-RPC 2.0 compliance
 - **Direct Subprocess Execution**: Avoids shell injection vulnerabilities by using `subprocess` directly (not shell)
 - **@filename Server-Side Expansion**: `extract_file_refs()` parses prompts for `@path` tokens, expands globs, and converts them to `--add-dir` flags for agy
-- **Agy-Native Conversations**: Conversation state managed by agy's native `.pb` protobuf files; metadata tracked in JSON sidecar
+- **Agy-Native Conversations**: Conversation state managed by agy's own stores — SQLite `<uuid>.db` for recent conversations, legacy protobuf `<uuid>.pb` for older ones; metadata tracked in a JSON sidecar
 - **Structured Error Classification**: Hybrid error detection — on agy >= 1.1.1, non-zero exit + stderr; on older versions, stdout pattern scanning for `^Error:`, `^CLI error:`, `^Warning: conversation "..." not found`
 - **Multi-Tier TTL Caching**: Different cache durations optimized for each use case
 - **Full Async/Await**: High-concurrency architecture supporting 1,000-10,000+ requests
@@ -915,6 +915,20 @@ Complex tools (eval_plan, review_code, verify_solution, code_review, extract_str
 
 The server ensures agy always runs with its own isolated backend by unsetting `ANTIGRAVITY_LS_ADDRESS`, preventing interference from any IDE language server running in the same environment.
 
+### Error Codes
+
+Failure responses carry a machine-readable `error_code`:
+
+| Code | Meaning |
+|---|---|
+| `INVALID_INPUT`, `INPUT_TOO_LARGE`, `INVALID_COMMAND` | Caller-side validation failed |
+| `TIMEOUT` | Exceeded the resolved per-task timeout (not retried) |
+| `RATE_LIMIT` | agy reported quota/rate exhaustion after retries |
+| `EXECUTION_ERROR`, `INTERNAL_ERROR` | Subprocess or unexpected server failure |
+| `INVALID_CONVERSATION_ID` | `conversation_id` is not a valid agy id (see below) |
+| `CONVERSATION_NOT_BOUND` | Well-formed id with no agy-side conversation store behind it |
+| `USAGE_FAILED` / `CREDITS_FAILED` | `gemini_usage` / `gemini_credits` could not read state. The specific cause is in `underlying_error_code`: `UNSUPPORTED_AGY_VERSION` (needs agy >= 1.1.11), `NOT_A_COMMAND` (this agy ran the command as a prompt), `MALFORMED_ENVELOPE`, or `COMMAND_FAILED` |
+
 ### Slash Command Handling
 
 agy 1.1.9 began expanding slash commands and skills in print mode, and 1.1.11 made the interactive-only ones hard-fail there:
@@ -953,10 +967,13 @@ Stateful multi-turn conversations via agy's native conversation stores:
 
 ### Advanced Caching
 
-**TTL-Based Caching**:
-- Help/version commands: 30 minutes
-- Prompt results: 5 minutes
+**TTL-Based Caching** (all reported by `gemini_cache_stats`):
+- Help, version, models, agents: 30 minutes
 - Template loading: 30 minutes
+- Quota (`gemini_usage`): 60 seconds
+- Credits (`gemini_credits`): 5 minutes
+
+There is no prompt-result cache — every prompt reaches agy.
 
 **Cache Features**:
 - Atomic operations prevent race conditions
@@ -966,7 +983,7 @@ Stateful multi-turn conversations via agy's native conversation stores:
 
 ### @filename Syntax Support
 
-13 of the 27 tools support `@filename` syntax for optimal token efficiency:
+12 of the 27 tools support `@filename` syntax for optimal token efficiency:
 
 ```python
 # Single file
@@ -1036,8 +1053,9 @@ export CLI_LOG_FILE=            # Optional path for agy diagnostics; keeps stdou
 
 **Per-task timeouts:** heavy tools default above `CLI_TIMEOUT` because agy 1.0.7
 raised the per-run tool-call ceiling to 512. Defaults: `verify_solution`,
-`code_review`, `ai_collaboration` → 900s; `eval_plan`, `sandbox`,
-`summarize_files` → 600s; everything else inherits `CLI_TIMEOUT`. Override any
+`code_review`, `ai_collaboration` → 900s; `eval_plan`, `review_code`, `sandbox`,
+`summarize_files`, `content_comparison` → 600s; everything else inherits
+`CLI_TIMEOUT`. Override any
 tool with `CLI_TIMEOUT_<TASK>`. **Timeouts are not retried**, so the resolved
 value is the true wall-clock cap.
 
@@ -1080,52 +1098,42 @@ export GEMINI_VERIFY_LIMIT=800000      # gemini_verify_solution character limit
 export GEMINI_SUMMARIZE_LIMIT=400000   # gemini_summarize character limit
 export GEMINI_SUMMARIZE_FILES_LIMIT=800000  # gemini_summarize_files character limit
 export GEMINI_CONTENT_COMPARISON_LIMIT=400000  # gemini_content_comparison character limit
-export GEMINI_AI_COLLABORATION_LIMIT=500000  # gemini_ai_collaboration character limit
+export GEMINI_COLLABORATION_LIMIT=500000  # gemini_ai_collaboration character limit
 export GEMINI_CODE_REVIEW_LIMIT=300000  # gemini_code_review character limit
 export GEMINI_EXTRACT_STRUCTURED_LIMIT=200000  # gemini_extract_structured character limit
-export GEMINI_GIT_DIFF_REVIEW_LIMIT=150000  # gemini_git_diff_review character limit
+export GEMINI_GIT_DIFF_LIMIT=150000  # gemini_git_diff_review character limit
 ```
 
-#### Model Fallback
+#### Model Defaults
 ```bash
-export GEMINI_ENABLE_FALLBACK=true     # Enable automatic model fallback
-export GEMINI_DEFAULT_MODEL=                       # Global default model (empty = let agy decide)
-export GEMINI_FALLBACK_MODEL=                      # Fallback model (empty = none)
+export CLI_DEFAULT_MODEL=              # Global default model (empty = let agy decide)
 ```
 
-#### Rate Limiting
-```bash
-export GEMINI_RATE_LIMIT_REQUESTS=100  # Requests per time window
-export GEMINI_RATE_LIMIT_WINDOW=60     # Time window in seconds
-```
-
-#### Conversation Management
-```bash
-export GEMINI_CONVERSATION_ENABLED="true"          # Enable conversation history
-export GEMINI_CONVERSATION_EXPIRATION_HOURS="24"   # Auto-cleanup time
-export GEMINI_CONVERSATION_MAX_MESSAGES="10"       # Message history limit
-export GEMINI_CONVERSATION_MAX_TOKENS="20000"      # Token history limit
-```
-
-#### Enterprise Monitoring (Optional)
-```bash
-export ENABLE_MONITORING=true          # Master control for all monitoring features
-export ENABLE_OPENTELEMETRY=true       # Enable OpenTelemetry distributed tracing
-export ENABLE_PROMETHEUS=true          # Enable Prometheus metrics collection
-export ENABLE_HEALTH_CHECKS=true       # Enable health check system
-export PROMETHEUS_PORT=8000             # Prometheus metrics endpoint port
-export OPENTELEMETRY_ENDPOINT="https://otel-collector:4317"  # OpenTelemetry endpoint
-export OPENTELEMETRY_SERVICE_NAME="antigravity-cli-mcp-server"    # Service name for tracing
-```
+> **Not implemented:** `GEMINI_ENABLE_FALLBACK` / `CLI_ENABLE_FALLBACK` and
+> `GEMINI_FALLBACK_MODEL` / `CLI_FALLBACK_MODEL` are parsed by `cli_config.py`
+> but no module reads them — automatic model fallback mid-session is not wired
+> up. Setting them has no effect, and the `fallback_count` figure reported by
+> `gemini_rate_limiting_stats` is therefore always 0.
 
 #### Security Configuration (Advanced)
 ```bash
 export JSONRPC_MAX_REQUEST_SIZE=1048576     # Max JSON-RPC request size (1MB default)
 export JSONRPC_MAX_NESTING_DEPTH=10        # Max object/array nesting depth
 export JSONRPC_STRICT_MODE=true            # Enable strict JSON-RPC validation
-export GEMINI_SUBPROCESS_MAX_CPU_TIME=300  # Subprocess CPU time limit (seconds)
-export GEMINI_SUBPROCESS_MAX_MEMORY_MB=512 # Subprocess memory limit (MB)
 ```
+
+#### Not implemented
+
+These names have appeared in this README but are read by **no code**. They are
+listed here so nobody configures them expecting an effect:
+
+| Variable(s) | Status |
+|---|---|
+| `GEMINI_RATE_LIMIT_REQUESTS`, `GEMINI_RATE_LIMIT_WINDOW` | No server-side request limiter exists. Retries are driven by `RETRY_*` and apply to agy rate-limit responses only. |
+| `GEMINI_CONVERSATION_ENABLED`, `GEMINI_CONVERSATION_EXPIRATION_HOURS`, `GEMINI_CONVERSATION_MAX_MESSAGES`, `GEMINI_CONVERSATION_MAX_TOKENS` | Conversation expiry is stored per-conversation and reported by `gemini_list_conversations`, but nothing deletes on expiry and no pruning is performed. `message_count` is always 0. |
+| `ENABLE_MONITORING`, `ENABLE_OPENTELEMETRY`, `ENABLE_PROMETHEUS`, `ENABLE_HEALTH_CHECKS`, `PROMETHEUS_PORT`, `OPENTELEMETRY_*` | No OpenTelemetry, Prometheus or health-check subsystem is present. |
+| `GEMINI_SUBPROCESS_MAX_CPU_TIME`, `GEMINI_SUBPROCESS_MAX_MEMORY_MB` | No rlimits are applied to the agy subprocess. `CLI_TIMEOUT` is the only enforced bound. |
+| `CLI_OUTPUT_FORMAT` / `GEMINI_OUTPUT_FORMAT` | Parsed by `cli_config.py` but never read. The server chooses its own output format per call. |
 
 ### Configuration Examples
 
