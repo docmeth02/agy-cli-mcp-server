@@ -12,6 +12,9 @@ These tests validate every agy calling pattern used by the MCP server:
   --version                       (version query)
 
 Each test exercises the real subprocess path through execute_cli / execute_cli_with_retry.
+
+This module requires `agy` on PATH; the autouse fixture below skips it when the
+CLI is absent. Other test modules stay runnable without a real installation.
 """
 import json
 import os
@@ -20,6 +23,16 @@ from pathlib import Path
 import pytest
 
 import asyncio
+
+from tests.conftest import AGY_AVAILABLE
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _require_agy_for_module():
+    """Skip this module when agy is not installed (the rest of the suite runs)."""
+    if not AGY_AVAILABLE:
+        pytest.skip("Antigravity CLI (agy) not found in PATH")
+
 
 from modules.utils.cli_utils import (
     execute_cli,
@@ -426,9 +439,11 @@ class TestModelConfig:
         assert get_task_model("prompt", "claude") == "claude"
 
     def test_task_default_pro(self):
-        assert get_task_model("eval_plan") == "pro"
-        assert get_task_model("code_review") == "pro"
-        assert get_task_model("review_code") == "pro"
+        # agy 1.1.5 added stable slugs; TASK_MODEL_DEFAULTS uses them because
+        # display names track marketing labels and change between releases.
+        assert get_task_model("eval_plan") == "gemini-3.1-pro-high"
+        assert get_task_model("code_review") == "gemini-3.1-pro-high"
+        assert get_task_model("review_code") == "gemini-3.1-pro-high"
 
     def test_task_default_none_for_lightweight(self):
         assert get_task_model("prompt") is None
@@ -488,16 +503,38 @@ class TestVersionGuard:
 class TestModelIntegration:
 
     @pytest.mark.asyncio
-    async def test_model_flag_works_with_pro(self):
-        args = _build_cli_args(prompt="Reply with only the word OK", model="pro")
+    async def test_model_flag_works_with_pro_slug(self):
+        # Pro (Low) rather than (High): this asserts the slug *form* is accepted,
+        # which needs no reasoning depth, and High is the priciest tier.
+        args = _build_cli_args(
+            prompt="Reply with only the word OK", model="gemini-3.1-pro-low"
+        )
         result = await execute_cli_with_retry(args)
         assert result["status"] == "success"
 
     @pytest.mark.asyncio
-    async def test_model_flag_works_with_flash(self):
-        args = _build_cli_args(prompt="Reply with only the word OK", model="flash")
+    async def test_model_flag_works_with_flash_slug(self):
+        args = _build_cli_args(
+            prompt="Reply with only the word OK", model="gemini-3.5-flash-low"
+        )
         result = await execute_cli_with_retry(args)
         assert result["status"] == "success"
+
+    @pytest.mark.asyncio
+    async def test_model_flag_works_with_display_name(self):
+        # Both columns of `agy models` are accepted by --model.
+        args = _build_cli_args(
+            prompt="Reply with only the word OK", model="Gemini 3.5 Flash (Low)"
+        )
+        result = await execute_cli_with_retry(args)
+        assert result["status"] == "success"
+
+    @pytest.mark.asyncio
+    async def test_short_name_is_rejected_by_agy(self):
+        # Re-verified on 1.1.11: short names hard-fail rather than falling back.
+        args = _build_cli_args(prompt="Reply with only the word OK", model="pro")
+        result = await execute_cli_with_retry(args)
+        assert result["status"] == "error"
 
 
 # ---------------------------------------------------------------------------
@@ -614,7 +651,7 @@ class TestMCPToolRoundTrip:
         result = json.loads(raw)
         assert result["status"] == "success"
         assert "metrics" in result
-        assert result["server_info"]["tools_available"] == 24
+        assert result["server_info"]["tools_available"] == 27
 
     @pytest.mark.asyncio
     async def test_gemini_cache_stats_tool(self):
@@ -859,7 +896,7 @@ class TestModelValidation:
         assert await validate_model("") == {}
 
     @pytest.mark.asyncio
-    async def test_short_names_accepted_without_discovery(self, monkeypatch):
+    async def test_short_names_accepted_below_1_1_4(self, monkeypatch):
         import modules.utils.cli_utils as cu
         monkeypatch.setattr(cu, "_get_cached_or_sync_version", lambda: "1.0.8")
 
@@ -877,7 +914,10 @@ class TestModelValidation:
         monkeypatch.setattr(cu, "_get_cached_or_sync_version", lambda: "1.0.8")
 
         async def _models():
-            return ["Gemini 3.1 Pro (High)", "Gemini 3.5 Flash (Medium)"]
+            return [
+                {"slug": "gemini-3.1-pro-high", "display_name": "Gemini 3.1 Pro (High)"},
+                {"slug": "gemini-3.5-flash-medium", "display_name": "Gemini 3.5 Flash (Medium)"},
+            ]
 
         monkeypatch.setattr(cu, "get_available_models", _models)
         assert await validate_model("Gemini 3.1 Pro (High)") == {}
@@ -888,7 +928,9 @@ class TestModelValidation:
         monkeypatch.setattr(cu, "_get_cached_or_sync_version", lambda: "1.0.8")
 
         async def _models():
-            return ["Gemini 3.1 Pro (High)"]
+            return [
+                {"slug": "gemini-3.1-pro-high", "display_name": "Gemini 3.1 Pro (High)"}
+            ]
 
         monkeypatch.setattr(cu, "get_available_models", _models)
         meta = await validate_model("typo-model")
@@ -934,7 +976,9 @@ class TestModelValidation:
         monkeypatch.setattr(cu, "_get_cached_or_sync_version", lambda: "1.0.8")
 
         async def _models():
-            return ["Gemini 3.1 Pro (High)"]
+            return [
+                {"slug": "gemini-3.1-pro-high", "display_name": "Gemini 3.1 Pro (High)"}
+            ]
 
         monkeypatch.setattr(cu, "get_available_models", _models)
         assert await validate_model("gemini 3.1 pro (high)") == {}

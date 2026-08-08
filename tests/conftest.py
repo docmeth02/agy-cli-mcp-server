@@ -1,5 +1,15 @@
 """
-Shared fixtures for integration tests against a real Antigravity CLI installation.
+Shared fixtures for the test suite.
+
+Only the tests that shell out to a real Antigravity CLI need `agy` on PATH.
+The pure unit tests (security, conversation metadata, parsers, validation)
+must stay runnable without it — an earlier session-wide skip here meant that
+when agy was absent *nothing* ran, which let upstream drift go uncaught.
+
+Modules that need the real CLI gate themselves on the `AGY_AVAILABLE` flag
+below, via their own module-scoped autouse fixture (see
+`tests/test_agy_integration.py`). Deliberately not a shared autouse fixture
+here: that is exactly what caused the over-broad skip.
 """
 import shutil
 import sys
@@ -11,12 +21,7 @@ PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-
-@pytest.fixture(scope="session", autouse=True)
-def require_agy():
-    """Skip the entire test session if agy is not installed."""
-    if not shutil.which("agy"):
-        pytest.skip("Antigravity CLI (agy) not found in PATH")
+AGY_AVAILABLE = shutil.which("agy") is not None
 
 
 @pytest.fixture

@@ -102,8 +102,11 @@ GEMINI_CONTENT_COMPARISON_LIMIT = int(os.getenv("GEMINI_CONTENT_COMPARISON_LIMIT
 # ============================================================================
 # Model Configuration (agy 1.0.5+)
 # ============================================================================
-# agy >= 1.1.4 requires full display names (e.g. "Gemini 3.1 Pro (High)").
-# Short names ("pro", "flash", "claude") were dropped in 1.1.4.
+# Short names ("pro", "flash", "claude") were dropped in agy 1.1.4. From 1.1.5
+# on, `agy models` emits two accepted forms per model: a stable slug
+# ("gemini-3.1-pro-high") and a display name ("Gemini 3.1 Pro (High)"). Slugs
+# are preferred here because they are explicitly documented as stable across
+# releases, while display names track marketing labels.
 # Empty string = let agy decide.
 
 DEFAULT_MODEL = os.getenv(
@@ -119,16 +122,18 @@ ENABLE_FALLBACK = os.getenv(
     "CLI_ENABLE_FALLBACK", os.getenv("GEMINI_ENABLE_FALLBACK", "false")
 ).lower() == "true"
 
-# Per-task default models. Full display names required for agy >= 1.1.4.
+# Per-task default models, as stable slugs (agy >= 1.1.5). Display names such as
+# "Gemini 3.1 Pro (High)" are equally accepted if overridden via env.
 # Override any task via CLI_MODEL_{TASK} or GEMINI_MODEL_{TASK} env vars.
+# Note: Gemini 3.1 Pro has no Medium tier — only High and Low.
 TASK_MODEL_DEFAULTS: dict[str, Optional[str]] = {
-    "eval_plan": "Gemini 3.1 Pro (High)",
-    "review_code": "Gemini 3.1 Pro (High)",
-    "verify_solution": "Gemini 3.1 Pro (High)",
-    "code_review": "Gemini 3.1 Pro (High)",
-    "extract_structured": "Gemini 3.1 Pro (High)",
-    "git_diff_review": "Gemini 3.1 Pro (High)",
-    "content_comparison": "Gemini 3.1 Pro (High)",
+    "eval_plan": "gemini-3.1-pro-high",
+    "review_code": "gemini-3.1-pro-high",
+    "verify_solution": "gemini-3.1-pro-high",
+    "code_review": "gemini-3.1-pro-high",
+    "extract_structured": "gemini-3.1-pro-high",
+    "git_diff_review": "gemini-3.1-pro-high",
+    "content_comparison": "gemini-3.1-pro-high",
     "prompt": None,
     "summarize": None,
     "summarize_files": None,

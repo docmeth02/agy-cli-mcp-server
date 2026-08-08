@@ -24,11 +24,16 @@ CREDENTIAL_PATTERNS = [
     # Bearer tokens
     (r'Bearer\s+[a-zA-Z0-9._~+/=-]+', 'Bearer [REDACTED]'),
 
-    # Generic secrets (handles quoted multi-word values)
-    (r'password\s*[:=]\s*(?:"[^"]*"|\'[^\']*\'|[^\s"\']+)', 'password=[REDACTED]'),
-    (r'secret\s*[:=]\s*(?:"[^"]*"|\'[^\']*\'|[^\s"\']+)', 'secret=[REDACTED]'),
-    (r'token\s*[:=]\s*(?:"[^"]*"|\'[^\']*\'|[^\s"\']+)', 'token=[REDACTED]'),
-    (r'api[_-]?key\s*[:=]\s*(?:"[^"]*"|\'[^\']*\'|[^\s"\']+)', 'api_key=[REDACTED]'),
+    # Generic secrets (handles quoted multi-word values).
+    # The unquoted alternative deliberately excludes backslash: agy output is
+    # increasingly JSON (--output-format json), and consuming the backslash of a
+    # JSON-escaped \" would leave a stray quote behind and make the envelope
+    # unparseable. Losing the tail of a backslash-containing secret is a far
+    # better failure than corrupting the payload it lives in.
+    (r'password\s*[:=]\s*(?:"[^"]*"|\'[^\']*\'|[^\s"\'\\]+)', 'password=[REDACTED]'),
+    (r'secret\s*[:=]\s*(?:"[^"]*"|\'[^\']*\'|[^\s"\'\\]+)', 'secret=[REDACTED]'),
+    (r'token\s*[:=]\s*(?:"[^"]*"|\'[^\']*\'|[^\s"\'\\]+)', 'token=[REDACTED]'),
+    (r'api[_-]?key\s*[:=]\s*(?:"[^"]*"|\'[^\']*\'|[^\s"\'\\]+)', 'api_key=[REDACTED]'),
 
     # Private keys
     (r'-----BEGIN (RSA |EC |DSA )?PRIVATE KEY-----[\s\S]*?-----END (RSA |EC |DSA )?PRIVATE KEY-----',

@@ -25,11 +25,18 @@ from modules.config.cli_config import (
 
 logger = logging.getLogger(__name__)
 
+# Stable model slugs (agy >= 1.1.5). The short names these replaced
+# ("flash", "pro", "claude") were dropped in agy 1.1.4 and now hard-fail, which
+# meant every default collaboration run errored out.
 DEFAULT_MODELS = {
-    "sequential": "flash,pro",
-    "debate": "pro,flash,claude",
-    "validation": "pro,flash",
+    "sequential": "gemini-3.6-flash-medium,gemini-3.1-pro-high",
+    "debate": "gemini-3.1-pro-high,gemini-3.6-flash-medium,claude-sonnet-4-6",
+    "validation": "gemini-3.1-pro-high,gemini-3.6-flash-medium",
 }
+
+# Model used for the cheap aggregation steps (pipeline summary, debate
+# synthesis, consensus building) rather than the per-stage reasoning.
+SYNTHESIS_MODEL = "gemini-3.6-flash-medium"
 
 
 async def execute_collaboration(
@@ -60,7 +67,8 @@ async def execute_collaboration(
     Args:
         collaboration_mode: Mode (sequential, debate, validation)
         content: Content to analyze
-        models: Comma-separated model list (e.g., "pro,flash,claude" for debate)
+        models: Comma-separated model list of slugs or display names
+                (e.g., "gemini-3.1-pro-high,gemini-3.6-flash-medium" for debate)
         context: Additional context
         Other mode-specific parameters
 
@@ -353,7 +361,7 @@ async def _generate_pipeline_summary(
         )
         prompt = get_pipeline_summary_prompt(original_content, all_outputs, stages)
 
-        result = await _execute_model("flash", prompt)
+        result = await _execute_model(SYNTHESIS_MODEL, prompt)
         return result.get("content", result.get("stdout", "Pipeline complete"))
     except Exception as e:
         logger.error(f"Error generating pipeline summary: {e}")
@@ -375,7 +383,7 @@ async def _generate_debate_synthesis(
         )
         prompt = get_debate_synthesis_prompt(topic, args_text, debate_style, total_rounds)
 
-        result = await _execute_model("flash", prompt)
+        result = await _execute_model(SYNTHESIS_MODEL, prompt)
         return result.get("content", result.get("stdout", "Debate concluded"))
     except Exception as e:
         logger.error(f"Error generating debate synthesis: {e}")
@@ -400,7 +408,7 @@ async def _build_consensus(
             content, all_validations, validation_criteria, consensus_method, conflict_resolution
         )
 
-        result = await _execute_model("flash", prompt)
+        result = await _execute_model(SYNTHESIS_MODEL, prompt)
         return result.get("content", result.get("stdout", "Consensus reached"))
     except Exception as e:
         logger.error(f"Error building consensus: {e}")
