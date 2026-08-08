@@ -35,12 +35,36 @@ CREDENTIAL_PATTERNS = [
     (r'token\s*[:=]\s*(?:"[^"]*"|\'[^\']*\'|[^\s"\'\\]+)', 'token=[REDACTED]'),
     (r'api[_-]?key\s*[:=]\s*(?:"[^"]*"|\'[^\']*\'|[^\s"\'\\]+)', 'api_key=[REDACTED]'),
 
-    # Private keys
-    (r'-----BEGIN (RSA |EC |DSA )?PRIVATE KEY-----[\s\S]*?-----END (RSA |EC |DSA )?PRIVATE KEY-----',
+    # Private keys.
+    # The body is `(?:[^-]|-(?!----))` — any character except the start of a
+    # "-----" run — rather than a lazy `[\s\S]*?`. That matters for cost, not
+    # just tidiness: with a permissive body, every BEGIN marker rescans forward
+    # looking for an END, which is quadratic in the number of markers. A payload
+    # of repeated BEGIN markers (no real key needed) then stalls the server,
+    # because sanitization is synchronous and runs outside the asyncio timeout.
+    # Measured on 1MB of repeated markers plus one trailing END: 6.7s with a lazy
+    # body, 0.007s with this one. A length-bound alone is NOT sufficient — one
+    # trailing END marker restores the full cost, since the bound is still scanned
+    # per marker.
+    # The 16KB cap comfortably covers real keys (a 4096-bit RSA key is ~3.2KB);
+    # a longer BEGIN/END block is left unredacted rather than scanned unboundedly.
+    (r'-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED |PGP )?PRIVATE KEY(?: BLOCK)?-----'
+     r'(?:[^-]|-(?!----)){0,16384}'
+     r'-----END (?:RSA |EC |DSA |OPENSSH |ENCRYPTED |PGP )?PRIVATE KEY(?: BLOCK)?-----',
      '[REDACTED_PRIVATE_KEY]'),
 
-    # JWT tokens
-    (r'eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+', '[REDACTED_JWT]'),
+    # JWT tokens.
+    # The leading lookbehind is a cost fix, not a precision one: without it every
+    # third character of a base64 run like "eyJeyJeyJ..." starts a fresh
+    # candidate (e, y and J are all in the character class) and each scans to
+    # end-of-string looking for a '.'. That is quadratic — measured 1.1s at 64KB
+    # and 4.5s at 128KB, extrapolating to minutes at 1MB, all synchronous and
+    # outside the asyncio timeout. Anchoring to a token boundary makes those
+    # interior positions non-starts; segment bounds cap the remaining work.
+    # (Possessive quantifiers do NOT help here, and a '.' prefilter is defeated
+    # by a single dot anywhere in the payload.)
+    (r'(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{1,8192}\.[A-Za-z0-9_-]{1,8192}\.[A-Za-z0-9_-]{1,8192}',
+     '[REDACTED_JWT]'),
 ]
 
 # Compile patterns for performance
@@ -48,6 +72,26 @@ COMPILED_PATTERNS = [
     (re.compile(pattern, re.IGNORECASE), replacement)
     for pattern, replacement in CREDENTIAL_PATTERNS
 ]
+
+# Cheap literal prefilters: a plain substring scan is O(n) in C, so when a
+# pattern's mandatory anchor is absent, skipping it avoids the regex engine
+# entirely.
+#
+# This is an optimisation only — NOT the ReDoS defence. Requiring "-----END"
+# does not bound the work, because a single trailing marker anywhere satisfies
+# the check while every BEGIN marker still gets scanned; that was measured at
+# 6.7s for 1MB. The cost fix is the private-key pattern's body, which cannot
+# consume a "-----" run (see above).
+# Keyed by the compiled pattern object, not by replacement text: keying on the
+# replacement would let a caller-supplied additional_pattern reusing the same
+# placeholder silently inherit this gate and skip its own redaction.
+_PRIVATE_KEY_PATTERN_INDEX = next(
+    i for i, (_p, r) in enumerate(CREDENTIAL_PATTERNS)
+    if r == '[REDACTED_PRIVATE_KEY]'
+)
+PATTERN_PREFILTERS: dict[re.Pattern, str] = {
+    COMPILED_PATTERNS[_PRIVATE_KEY_PATTERN_INDEX][0]: '-----END',
+}
 
 
 class CredentialSanitizer:
@@ -83,6 +127,9 @@ class CredentialSanitizer:
 
         result = content
         for pattern, replacement in self.patterns:
+            prefilter = PATTERN_PREFILTERS.get(pattern)
+            if prefilter and prefilter.lower() not in result.lower():
+                continue
             result = pattern.sub(replacement, result)
 
         return result
@@ -100,7 +147,10 @@ class CredentialSanitizer:
         if not content:
             return False
 
-        for pattern, _ in self.patterns:
+        for pattern, replacement in self.patterns:
+            prefilter = PATTERN_PREFILTERS.get(pattern)
+            if prefilter and prefilter.lower() not in content.lower():
+                continue
             if pattern.search(content):
                 return True
 
@@ -121,6 +171,9 @@ class CredentialSanitizer:
 
         locations = []
         for pattern, replacement in self.patterns:
+            prefilter = PATTERN_PREFILTERS.get(pattern)
+            if prefilter and prefilter.lower() not in content.lower():
+                continue
             for match in pattern.finditer(content):
                 locations.append({
                     "start": match.start(),

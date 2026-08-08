@@ -52,6 +52,8 @@ from modules.utils.cli_utils import (
     run_readonly_slash_command,
     validate_model,
     validate_agent,
+    validate_effort,
+    cli_error_code,
     add_model_metadata,
     get_metrics,
     validate_cli_setup,
@@ -208,6 +210,7 @@ try:
         GEMINI_COLLABORATION_LIMIT,
         get_task_model,
         get_task_timeout,
+        get_task_effort,
     )
 except ImportError:
     GEMINI_PROMPT_LIMIT = 100000
@@ -225,6 +228,9 @@ except ImportError:
     def get_task_timeout(task: str, explicit: Optional[int] = None) -> int:
         return explicit or 300
 
+    def get_task_effort(task: str, explicit: Optional[str] = None) -> Optional[str]:
+        return explicit or None
+
 
 @mcp.tool()
 async def gemini_prompt(
@@ -236,6 +242,7 @@ async def gemini_prompt(
     readonly: bool = False,
     project: Optional[str] = None,
     interpret_slash_commands: bool = False,
+    effort: Optional[str] = None,
 ) -> str:
     """
     Send prompts to Antigravity CLI for execution (100,000 char limit).
@@ -258,6 +265,12 @@ async def gemini_prompt(
                   create, modify, or delete any files. Use for brainstorming,
                   analysis, opinions, and planning tasks.
         project: Project ID for session isolation (agy >= 1.0.12).
+        effort: Reasoning effort — "low", "medium" or "high" (agy >= 1.1.10;
+               the flag exists from 1.1.5 but was silently ignored in headless
+               runs before 1.1.10).
+               Only needed with a base model slug such as "gemini-3.5-flash";
+               most slugs already pin a tier (e.g. "gemini-3.1-pro-high"), and
+               passing both is flagged as a conflict.
         interpret_slash_commands: When False (default) the prompt is sent to the
                   model verbatim, even if it begins with "/". Set True to let
                   agy expand its own slash commands and skills (agy >= 1.1.9),
@@ -291,6 +304,7 @@ async def gemini_prompt(
         })
 
     effective_model = get_task_model("prompt", model)
+    effective_effort = get_task_effort("prompt", effort)
 
     cleaned_prompt, files = extract_file_refs(prompt)
     args = _build_cli_args(
@@ -302,12 +316,23 @@ async def gemini_prompt(
         agent=agent,
         project=project,
         interpret_slash_commands=interpret_slash_commands,
+        effort=effective_effort,
     )
 
     try:
-        result = await execute_cli_with_retry(args)
+        # Deliberately mutating=True even when readonly=True: `readonly` only
+        # prepends a preamble asking the model not to write. Nothing enforces it —
+        # --dangerously-skip-permissions and --mode accept-edits are still passed,
+        # and `--mode plan` was tested and does not block writes either. Treating
+        # a prompt instruction as a safety boundary is what the --sandbox lesson
+        # warns against. The work_done check in execute_cli_with_retry still
+        # allows a retry when agy provably did nothing.
+        result = await execute_cli_with_retry(args, mutating=True)
         result = add_model_metadata(result, await validate_model(effective_model))
         result = add_model_metadata(result, await validate_agent(agent))
+        result = add_model_metadata(
+            result, await validate_effort(effective_effort, effective_model)
+        )
         return json.dumps(result, indent=2)
     except CLITimeoutError as e:
         return json.dumps({
@@ -480,6 +505,7 @@ async def gemini_sandbox(
     agent: Optional[str] = None,
     project: Optional[str] = None,
     interpret_slash_commands: bool = False,
+    effort: Optional[str] = None,
 ) -> str:
     """
     Execute prompts in sandbox mode for code execution (200,000 char limit).
@@ -496,6 +522,12 @@ async def gemini_sandbox(
         interpret_slash_commands: When False (default) the prompt is sent
                   verbatim, even if it begins with "/". Set True to let agy
                   expand its own slash commands and skills (agy >= 1.1.9).
+        effort: Reasoning effort — "low", "medium" or "high" (agy >= 1.1.10;
+               the flag exists from 1.1.5 but was silently ignored in headless
+               runs before 1.1.10).
+               Only needed with a base model slug such as "gemini-3.5-flash";
+               most slugs already pin a tier (e.g. "gemini-3.1-pro-high"), and
+               passing both is flagged as a conflict.
 
     Returns:
         JSON string with execution results
@@ -512,6 +544,7 @@ async def gemini_sandbox(
         })
 
     effective_model = get_task_model("sandbox", model)
+    effective_effort = get_task_effort("sandbox", effort)
 
     cleaned_prompt, files = extract_file_refs(prompt)
     args = _build_cli_args(
@@ -522,18 +555,22 @@ async def gemini_sandbox(
         agent=agent,
         project=project,
         interpret_slash_commands=interpret_slash_commands,
+        effort=effective_effort,
     )
 
     try:
         result = await execute_cli_with_retry(args, timeout=get_task_timeout("sandbox"))
         result = add_model_metadata(result, await validate_model(effective_model))
         result = add_model_metadata(result, await validate_agent(agent))
+        result = add_model_metadata(
+            result, await validate_effort(effective_effort, effective_model)
+        )
         return json.dumps(result, indent=2)
     except (CLITimeoutError, CLIRateLimitError, CLIExecutionError) as e:
         return json.dumps({
             "status": "error",
             "error": str(e),
-            "error_code": type(e).__name__.replace("CLI", "").replace("Error", "").upper()
+            "error_code": cli_error_code(e)
         })
 
 
@@ -813,7 +850,7 @@ async def gemini_summarize(
     args = _build_cli_args(prompt=cleaned_prompt, files=files, model=effective_model)
 
     try:
-        result = await execute_cli_with_retry(args)
+        result = await execute_cli_with_retry(args, mutating=False)
         result = add_model_metadata(result, await validate_model(effective_model))
         return json.dumps(result, indent=2)
     except (CLITimeoutError, CLIRateLimitError, CLIExecutionError) as e:
@@ -860,7 +897,7 @@ async def gemini_summarize_files(
     args = _build_cli_args(prompt=cleaned_prompt, files=files, model=effective_model)
 
     try:
-        result = await execute_cli_with_retry(args, timeout=get_task_timeout("summarize_files"))
+        result = await execute_cli_with_retry(args, mutating=False, timeout=get_task_timeout("summarize_files"))
         result = add_model_metadata(result, await validate_model(effective_model))
         return json.dumps(result, indent=2)
     except (CLITimeoutError, CLIRateLimitError, CLIExecutionError) as e:
@@ -934,7 +971,7 @@ Provide a detailed analysis with:
     args = _build_cli_args(prompt=cleaned_prompt, files=files, model=effective_model)
 
     try:
-        result = await execute_cli_with_retry(args, timeout=get_task_timeout("eval_plan"))
+        result = await execute_cli_with_retry(args, mutating=False, timeout=get_task_timeout("eval_plan"))
         result = add_model_metadata(result, await validate_model(effective_model))
         return json.dumps(result, indent=2)
     except (CLITimeoutError, CLIRateLimitError, CLIExecutionError) as e:
@@ -1005,7 +1042,7 @@ Provide a detailed review covering:
     args = _build_cli_args(prompt=cleaned_prompt, files=files, model=effective_model)
 
     try:
-        result = await execute_cli_with_retry(args, timeout=get_task_timeout("review_code"))
+        result = await execute_cli_with_retry(args, mutating=False, timeout=get_task_timeout("review_code"))
         result = add_model_metadata(result, await validate_model(effective_model))
         return json.dumps(result, indent=2)
     except (CLITimeoutError, CLIRateLimitError, CLIExecutionError) as e:
@@ -1078,7 +1115,7 @@ Verify:
     args = _build_cli_args(prompt=cleaned_prompt, files=files, model=effective_model)
 
     try:
-        result = await execute_cli_with_retry(args, timeout=get_task_timeout("verify_solution"))
+        result = await execute_cli_with_retry(args, mutating=False, timeout=get_task_timeout("verify_solution"))
         result = add_model_metadata(result, await validate_model(effective_model))
         return json.dumps(result, indent=2)
     except (CLITimeoutError, CLIRateLimitError, CLIExecutionError) as e:
@@ -1100,20 +1137,24 @@ async def gemini_start_conversation(
     expiration_hours: int = 24
 ) -> str:
     """
-    Register conversation metadata (title, tags, expiration) in the local sidecar.
+    Start a new conversation and get a stable id for multi-turn interactions.
 
-    IMPORTANT — this does NOT create a conversation inside agy. It only records
-    metadata against a freshly minted id, and agy never learns about that id.
-    Because agy silently ignores an unknown --conversation id (it starts a new
-    context under a different id and reports success), the id returned here is
-    NOT yet usable with gemini_continue_conversation, which will refuse it with
-    CONVERSATION_NOT_BOUND rather than silently discard your history.
+    The id returned is an MCP-level handle: it stays the same for the whole
+    conversation, and this call spends no quota. agy does not know it yet — the
+    first gemini_continue_conversation() call starts the conversation for real
+    and binds the handle to agy's own id (reported as agy_conversation_id).
+    Every later call resumes that conversation with full history.
 
-    To hold a real multi-turn conversation today:
-      1. call gemini_prompt(...) for the first turn, then
-      2. call gemini_list_conversations() and take a conversation_id whose
-         has_native_file is true, then
-      3. pass that id to gemini_continue_conversation().
+    Typical use:
+      1. gemini_start_conversation(title="Refactor plan")
+      2. gemini_continue_conversation(conversation_id=<id>, prompt="...")
+         -> bound_on_this_turn: true
+      3. gemini_continue_conversation(conversation_id=<id>, prompt="...")
+         -> resumes with history
+
+    Requires agy >= 1.1.8 for the binding step (it needs agy's JSON envelope to
+    learn the conversation id). On older agy, use gemini_prompt for the first
+    turn and continue an id from gemini_list_conversations instead.
 
     Args:
         title: Optional title for the conversation
@@ -1122,8 +1163,8 @@ async def gemini_start_conversation(
         expiration_hours: Hours until conversation expires (default: 24)
 
     Returns:
-        JSON with conversation_id and details. The id is metadata-only until an
-        agy-side conversation file exists for it.
+        JSON with conversation_id and details, plus bound=False — the handle is
+        bound on its first turn.
 
     Examples:
         gemini_start_conversation(title="Python Help", tags="python,development")
@@ -1167,17 +1208,19 @@ async def gemini_continue_conversation(
     project: Optional[str] = None,
 ) -> str:
     """
-    Continue an existing agy conversation with its context history.
+    Continue a conversation with its full context history.
 
-    The conversation_id must be one agy actually knows about — take it from
-    gemini_list_conversations() where has_native_file is true. An id from
-    gemini_start_conversation() is metadata-only and is rejected with
-    CONVERSATION_NOT_BOUND, because agy silently ignores an unknown
-    --conversation id and would start a fresh, historyless context instead.
+    Accepts either an id from gemini_start_conversation() — the first call binds
+    it to a real agy conversation — or an existing id from
+    gemini_list_conversations(). Both resume with history on later calls.
+
+    The response carries agy_conversation_id (agy's own id for the conversation)
+    and bound_on_this_turn=true on the turn that created it. Your conversation_id
+    handle never changes, so keep passing the same one.
 
     Args:
-        conversation_id: ID of an existing agy conversation (a UUID). Must have
-               has_native_file true in gemini_list_conversations().
+        conversation_id: A handle from gemini_start_conversation(), or an
+               existing agy conversation id from gemini_list_conversations().
         prompt: The new prompt/message
         model: Model to use (slug or display name, e.g. "gemini-3.1-pro-high").
                Defaults to agy's default; the model is not carried over from
@@ -1227,7 +1270,14 @@ async def gemini_list_conversations(
     status_filter: Optional[str] = None
 ) -> str:
     """
-    List active conversations with metadata.
+    List conversations with metadata, most recent first.
+
+    Each entry carries:
+      has_native_file  — true when this id can be continued. Resolves through the
+                         binding, so a bound handle reports true even though the
+                         handle itself has no store of its own.
+      bound            — true when the id is bound to an agy conversation
+      agy_conversation_id — agy's own id for it, or null when unbound
 
     Args:
         limit: Maximum number of conversations to return
@@ -1374,7 +1424,7 @@ Provide analysis in {output_format} format with severity levels."""
 
         cleaned_prompt, files = extract_file_refs(prompt)
         args = _build_cli_args(prompt=cleaned_prompt, files=files, model=effective_model)
-        result = await execute_cli_with_retry(args, timeout=get_task_timeout("code_review"))
+        result = await execute_cli_with_retry(args, mutating=False, timeout=get_task_timeout("code_review"))
         result = add_model_metadata(result, await validate_model(effective_model))
         return json.dumps(result, indent=2)
 
@@ -1390,16 +1440,25 @@ async def gemini_extract_structured(
     """
     Extract structured data using JSON schemas (200,000 char limit).
 
+    On agy >= 1.1.8 the schema is enforced by agy itself (via --json-schema), and
+    the validated result comes back as a parsed object in `structured_output` —
+    not as text you have to re-parse and hope matches.
+
     Args:
         content: Content to analyze
-        schema: JSON schema defining the output structure
+        schema: JSON schema defining the output structure. Must be a JSON
+               **object**; anything else is rejected as INVALID_SCHEMA.
         examples: Optional examples of expected output
-        strict_mode: Whether to enforce strict schema compliance
+        strict_mode: True (default) enforces the schema upstream and returns
+               `structured_output`. False uses prompt-only extraction, where the
+               model is merely asked to follow the schema.
         model: Model to use (slug or display name, e.g. "gemini-3.1-pro-high").
                Defaults to "gemini-3.1-pro-high".
 
     Returns:
-        JSON with extracted structured data
+        JSON with `schema_validation` set to "enforced" or "prompt_only". When
+        enforced, `structured_output` holds the validated object. Below agy
+        1.1.8, or with CLI_OUTPUT_FORMAT=text, it falls back to "prompt_only".
 
     Examples:
         gemini_extract_structured(content="@src/", schema='{"type":"object",...}')
@@ -1417,7 +1476,9 @@ async def gemini_extract_structured(
         effective_model = get_task_model("extract_structured", model)
         strict_text = " Strictly follow the schema." if strict_mode else ""
         example_text = f"\n\nExamples:\n{examples}" if examples else ""
-        prompt = f"""Extract structured data from the following content according to this schema.{strict_text}
+        prompt = f"""IMPORTANT: This is an analysis-only task. Do NOT create, modify, or delete any files. Do NOT execute any code. Only return the extracted data.
+
+Extract structured data from the following content according to this schema.{strict_text}
 
 Schema:
 {schema}{example_text}
@@ -1429,8 +1490,23 @@ Return valid JSON matching the schema."""
 
         cleaned_prompt, files = extract_file_refs(prompt)
         args = _build_cli_args(prompt=cleaned_prompt, files=files, model=effective_model)
-        result = await execute_cli_with_retry(args, timeout=get_task_timeout("extract_structured"))
+        try:
+            result = await execute_cli_with_retry(
+                args, mutating=False, timeout=get_task_timeout("extract_structured")
+            )
+        except CLIExecutionError as e:
+            # Without this the exception escapes the tool, bypassing the
+            # error-code contract this docstring advertises.
+            return json.dumps({
+                "status": "error",
+                "error": str(e),
+                "error_code": cli_error_code(e),
+                "schema_validation": "prompt_only",
+            })
         result = add_model_metadata(result, await validate_model(effective_model))
+        # This fallback never passes --json-schema, so the schema is only ever
+        # requested in the prompt.
+        result["schema_validation"] = "prompt_only"
         return json.dumps(result, indent=2)
 
 
@@ -1488,7 +1564,7 @@ Provide feedback on:
 
         cleaned_prompt, files = extract_file_refs(prompt)
         args = _build_cli_args(prompt=cleaned_prompt, files=files, model=effective_model)
-        result = await execute_cli_with_retry(args, timeout=get_task_timeout("git_diff_review"))
+        result = await execute_cli_with_retry(args, mutating=False, timeout=get_task_timeout("git_diff_review"))
         result = add_model_metadata(result, await validate_model(effective_model))
         return json.dumps(result, indent=2)
 
@@ -1546,7 +1622,7 @@ Provide a {output_format} comparison{"with similarity metrics" if include_metric
 
         cleaned_prompt, files = extract_file_refs(prompt)
         args = _build_cli_args(prompt=cleaned_prompt, files=files, model=effective_model)
-        result = await execute_cli_with_retry(args, timeout=get_task_timeout("content_comparison"))
+        result = await execute_cli_with_retry(args, mutating=False, timeout=get_task_timeout("content_comparison"))
         result = add_model_metadata(result, await validate_model(effective_model))
         return json.dumps(result, indent=2)
 

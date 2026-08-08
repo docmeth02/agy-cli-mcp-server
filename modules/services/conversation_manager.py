@@ -71,6 +71,46 @@ def _invalid_id_error(conversation_id: str) -> dict:
     }
 
 _metadata_locks: dict = {}
+_handle_locks: dict = {}
+
+
+def _get_handle_lock(conversation_id: str) -> asyncio.Lock:
+    """
+    Get a per-conversation lock, bound to the current event loop.
+
+    Held across the whole resolve -> run -> bind sequence. Deliberately NOT the
+    global metadata lock: that is also used for short sidecar writes, and holding
+    it for the duration of an agy run (up to the per-task timeout) would serialise
+    every conversation in the server. Two concurrent turns on the *same* handle
+    genuinely must serialise, though — otherwise both take the binding path, each
+    creates an agy conversation, and the second binding orphans the first.
+    """
+    loop = asyncio.get_running_loop()
+    key = (id(loop), conversation_id)
+    lock = _handle_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _handle_locks[key] = lock
+    return lock
+
+
+def _release_handle_lock(conversation_id: str) -> None:
+    """
+    Drop a per-handle lock once nobody holds or awaits it.
+
+    Without this the table grows one entry per distinct id forever, and a caller
+    passing many ids (including ones rejected early) could grow it without bound.
+    Keeping the entry while it is held or contended is essential — removing it
+    then would let a second turn create a fresh lock and defeat the serialisation.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    key = (id(loop), conversation_id)
+    lock = _handle_locks.get(key)
+    if lock is not None and not lock.locked():
+        _handle_locks.pop(key, None)
 
 
 def _get_metadata_lock() -> asyncio.Lock:
@@ -93,7 +133,17 @@ def _load_metadata() -> dict:
     if METADATA_FILE.exists():
         try:
             with open(METADATA_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+                loaded = json.load(f)
+            # The sidecar is user-editable, so the root may be any JSON value.
+            # Callers all treat it as a mapping; returning a list or string would
+            # surface as an AttributeError escaping the MCP tool.
+            if isinstance(loaded, dict):
+                return loaded
+            logger.error(
+                f"Conversation metadata root is {type(loaded).__name__}, "
+                f"expected object; ignoring it."
+            )
+            return {}
         except json.JSONDecodeError as e:
             backup = METADATA_FILE.with_suffix(f".corrupt.{int(time.time())}.json")
             try:
@@ -216,7 +266,16 @@ class ConversationManager:
         tags: Optional[list[str]] = None,
         expiration_hours: int = DEFAULT_EXPIRATION_HOURS
     ) -> dict:
-        """Create a new conversation."""
+        """
+        Create a conversation handle.
+
+        The id minted here is an MCP-level handle, deliberately stable for the
+        caller's whole session. agy does not know it yet: nothing is created
+        server-side and no quota is spent. The handle is *bound* to a real agy
+        conversation on the first continue_conversation() call, which runs without
+        --conversation and records the id agy reports back in its JSON envelope
+        (see agy_conversation_id below).
+        """
         conversation_id = str(uuid.uuid4())
         now = time.time()
 
@@ -229,6 +288,10 @@ class ConversationManager:
                 "created_at": now,
                 "updated_at": now,
                 "expiration_hours": expiration_hours,
+                # None until the first turn binds this handle to an agy-side
+                # conversation. An unbound handle is not resumable, because agy
+                # silently ignores an id it has never seen.
+                "agy_conversation_id": None,
             }
             saved = _save_metadata(metadata)
 
@@ -246,6 +309,12 @@ class ConversationManager:
             "created_at": now,
             "expiration_hours": expiration_hours,
             "message_count": 0,
+            "bound": False,
+            "note": (
+                "Not yet backed by an agy conversation. The first "
+                "gemini_continue_conversation call on this id starts the "
+                "conversation and binds it; subsequent calls resume it."
+            ),
         }
 
     async def continue_conversation(
@@ -255,40 +324,113 @@ class ConversationManager:
         model: Optional[str] = None,
         project: Optional[str] = None,
     ) -> dict:
-        """Continue an existing conversation via agy."""
+        """
+        Continue a conversation via agy, binding the handle on its first turn.
+
+        agy silently ignores an unknown ``--conversation`` id: it starts a
+        brand-new conversation under a different id, exits 0, and emits no
+        warning (verified on 1.1.11 in both text and JSON output modes). So the
+        id must be one agy actually knows.
+
+        Resolution order for the agy-side id:
+          1. a recorded ``agy_conversation_id`` binding, else
+          2. the handle itself, when a store already exists under that name
+             (covers ids taken straight from gemini_list_conversations), else
+          3. unbound — run WITHOUT ``--conversation`` and adopt the id agy
+             reports in its JSON envelope, recording it as the binding.
+
+        Case 3 needs the JSON transport to learn the id. On the text transport
+        there is nothing to read it from, so an unbound handle is refused rather
+        than silently starting a context that can never be resumed.
+        """
         if not prompt or not prompt.strip():
             return {"status": "error", "error": "Prompt cannot be empty"}
 
         if not _is_valid_conversation_id(conversation_id):
             return _invalid_id_error(conversation_id)
 
-        # agy silently ignores an unknown --conversation id: it starts a brand-new
-        # conversation under a different id, exits 0, and emits no warning
-        # (verified on 1.1.11, in both text and JSON output modes). Since
-        # create_conversation() mints its own uuid4 that agy never sees, passing
-        # it through would produce a fresh, historyless context on every call
-        # while still reporting success. Require a real agy-side store instead of
-        # silently losing history — this subsumes the sidecar-metadata check,
-        # because a sidecar entry alone is not something agy can resume. The
-        # real fix, binding the sidecar entry to the id agy reports back in its
-        # JSON envelope, needs the JSON transport.
-        if not _conversation_exists(conversation_id):
-            return {
-                "status": "error",
-                "error": (
-                    f"Conversation {conversation_id} has no agy-side history yet, "
-                    f"so continuing it would silently start a new context instead "
-                    f"of resuming. Use gemini_prompt for a one-shot request, or "
-                    f"pass a conversation_id from gemini_list_conversations whose "
-                    f"has_native_file is true."
-                ),
-                "error_code": "CONVERSATION_NOT_BOUND",
-            }
+        # Held for the whole resolve -> run -> bind sequence, so two concurrent
+        # turns on this handle cannot both take the binding path (which would
+        # create two agy conversations and orphan one, quota already spent).
+        lock = _get_handle_lock(conversation_id)
+        try:
+            async with lock:
+                return await self._continue_locked(
+                    conversation_id, prompt, model, project
+                )
+        finally:
+            _release_handle_lock(conversation_id)
 
-        from modules.utils.cli_utils import _build_cli_args
+    async def _continue_locked(
+        self,
+        conversation_id: str,
+        prompt: str,
+        model: Optional[str],
+        project: Optional[str],
+    ) -> dict:
+        metadata = _load_metadata()
+        raw_meta = metadata.get(conversation_id)
+        meta = raw_meta if isinstance(raw_meta, dict) else {}
+        bound_id = meta.get("agy_conversation_id")
+        if bound_id and not _is_valid_conversation_id(bound_id):
+            logger.warning(
+                f"Ignoring malformed agy_conversation_id for {conversation_id}"
+            )
+            bound_id = None
+
+        # Distinguish "never bound" from "binding broke": agy stores can be
+        # cleaned up or expire, and silently rebinding would drop the history
+        # while reporting a fresh successful binding.
+        stale_binding = None
+        if bound_id and _conversation_exists(bound_id):
+            agy_id = bound_id
+        elif _conversation_exists(conversation_id):
+            agy_id = conversation_id
+        else:
+            agy_id = None  # unbound — this turn will create and adopt one
+            if bound_id:
+                stale_binding = bound_id
+
+        from modules.utils.cli_utils import (
+            _build_cli_args, resolve_output_format, _get_cached_or_sync_version,
+            _parse_version,
+        )
+
+        if agy_id is None:
+            cached_version = _get_cached_or_sync_version()
+            try:
+                transport = resolve_output_format(
+                    _parse_version(cached_version) if cached_version else (0, 0, 0),
+                    bool(cached_version),
+                )
+            except Exception as e:
+                # CLI_OUTPUT_FORMAT=json on an agy that cannot produce it.
+                return {
+                    "status": "error",
+                    "error": str(e),
+                    "error_code": "CONFIG_ERROR",
+                }
+            if transport != "json":
+                return {
+                    "status": "error",
+                    "error": (
+                        f"Conversation {conversation_id} is not yet bound to an agy "
+                        f"conversation, and binding requires agy's JSON transport "
+                        f"(agy >= 1.1.8 with CLI_OUTPUT_FORMAT=auto or json). "
+                        f"Without it the new conversation's id cannot be captured, "
+                        f"so this turn would start a context that can never be "
+                        f"resumed. Use gemini_prompt for a one-shot request, or "
+                        f"pass an id from gemini_list_conversations whose "
+                        f"has_native_file is true."
+                    ),
+                    "error_code": "CONVERSATION_NOT_BOUND",
+                }
+
         args = _build_cli_args(
             prompt=prompt,
-            conversation_id=conversation_id,
+            # Omitted on the binding turn: passing an id agy does not know would
+            # be silently discarded anyway.
+            conversation_id=agy_id,
             model=model,
             project=project,
         )
@@ -296,28 +438,77 @@ class ConversationManager:
         try:
             result = await execute_cli_with_retry(args)
 
+            # Adopt whatever id agy actually used. On the binding turn this is
+            # the new conversation; on later turns it should echo agy_id back,
+            # and if it ever differs, agy started a different conversation and
+            # the binding must follow it or every later turn loses history.
+            reported = result.get("conversation_id")
+            if reported and not _is_valid_conversation_id(reported):
+                logger.warning(f"agy reported a malformed conversation id: {reported!r}")
+                reported = None
+
             async with _get_metadata_lock():
                 metadata = _load_metadata()
                 now = time.time()
-                if conversation_id in metadata:
-                    metadata[conversation_id]["updated_at"] = now
-                    if model:
-                        metadata[conversation_id]["model"] = model
-                    saved = _save_metadata(metadata)
-                else:
-                    saved = True
+                entry = metadata.setdefault(conversation_id, {
+                    "title": f"Conversation {conversation_id[:8]}",
+                    "created_at": now,
+                    "expiration_hours": DEFAULT_EXPIRATION_HOURS,
+                })
+                entry["updated_at"] = now
+                if model:
+                    entry["model"] = model
+                if reported:
+                    entry["agy_conversation_id"] = reported
+                saved = _save_metadata(metadata)
 
             self._stats["messages_added"] += 1
 
             response = {
                 "status": result.get("status", "success"),
+                # The caller's stable handle, not agy's internal id.
                 "conversation_id": conversation_id,
                 "response": result.get("stdout", ""),
             }
+            warnings: list[str] = []
+            if stale_binding:
+                warnings.append(
+                    f"previous agy conversation {stale_binding} no longer exists, "
+                    f"so earlier history was not carried forward"
+                )
+
+            if reported:
+                response["agy_conversation_id"] = reported
+                response["bound"] = True
+                if agy_id is None:
+                    response["bound_on_this_turn"] = True
+                elif reported != agy_id:
+                    warnings.append(
+                        f"agy resumed a different conversation ({reported}) than "
+                        f"requested ({agy_id}); the binding has been updated"
+                    )
+            elif agy_id is None:
+                # The binding turn captured no usable id, so the handle is still
+                # unbound: every later turn would take this path again and start
+                # a fresh context while reporting success. Say so rather than
+                # letting history silently fail to accumulate.
+                response["bound"] = False
+                warnings.append(
+                    "this turn could not be bound to an agy conversation (no "
+                    "usable conversation_id was reported), so its history will "
+                    "not carry forward to the next turn"
+                )
+            else:
+                response["bound"] = True
+            for key in ("usage", "num_turns", "error"):
+                if result.get(key) is not None:
+                    response[key] = result[key]
             if model:
                 response["model"] = model
             if not saved:
-                response["warning"] = "metadata update failed"
+                warnings.append("metadata update failed")
+            if warnings:
+                response["warning"] = " | ".join(warnings)
             if result.get("stderr"):
                 response["stderr"] = result["stderr"]
             return response
@@ -334,12 +525,14 @@ class ConversationManager:
         """
         List conversations from agy storage and metadata, most recent first.
 
-        Ordered by recency rather than metadata-first. Sidecar-only entries (from
-        gemini_start_conversation, which agy never learns about) would otherwise
-        occupy the head of the list permanently and push real, resumable
-        conversations past `limit` — starving the very workflow the tool
-        docstrings prescribe, which is to pick an id whose has_native_file is
-        true from this listing.
+        Ordered by recency rather than metadata-first. An unbound sidecar entry
+        (a handle from gemini_start_conversation whose first turn has not run
+        yet) would otherwise occupy the head of the list permanently and push
+        resumable conversations past `limit`.
+
+        `has_native_file` reports whether an id can be continued, resolving
+        through `agy_conversation_id` when the handle is bound. `bound` and
+        `agy_conversation_id` expose the binding itself.
         """
         metadata = _load_metadata()
         agy_ids = _list_agy_conversations()
@@ -363,17 +556,23 @@ class ConversationManager:
             return float(value)
 
         def _recency(cid: str) -> float:
-            meta = metadata.get(cid, {})
-            return max(
+            meta = metadata.get(cid)
+            meta = meta if isinstance(meta, dict) else {}
+            bound_id = meta.get("agy_conversation_id")
+            candidates = [
                 _get_conversation_mtime(cid),
                 _num(meta.get("updated_at"), 0.0),
                 _num(meta.get("created_at"), 0.0),
-            )
+            ]
+            if bound_id and _is_valid_conversation_id(bound_id):
+                candidates.append(_get_conversation_mtime(bound_id))
+            return max(candidates)
 
         all_ids.sort(key=_recency, reverse=True)
 
         for cid in all_ids:
-            meta = metadata.get(cid, {})
+            raw = metadata.get(cid)
+            meta = raw if isinstance(raw, dict) else {}
             mtime = _get_conversation_mtime(cid)
             created_at = _num(meta.get("created_at"), mtime or now)
             expiration_hours = _num(
@@ -388,6 +587,17 @@ class ConversationManager:
             if status_filter == "expired" and not expired:
                 continue
 
+            # Resolve through the binding: a handle from start_conversation has
+            # no store of its own, but once bound it is fully resumable. Reporting
+            # has_native_file from the handle alone would tell callers a working
+            # conversation is unusable.
+            bound_id = meta.get("agy_conversation_id")
+            if bound_id and not _is_valid_conversation_id(bound_id):
+                bound_id = None
+            resumable = _conversation_exists(cid) or bool(
+                bound_id and _conversation_exists(bound_id)
+            )
+
             conversations.append({
                 "conversation_id": cid,
                 "title": meta.get("title", f"Conversation {cid[:8]}"),
@@ -397,7 +607,11 @@ class ConversationManager:
                 "updated_at": meta.get("updated_at", mtime or created_at),
                 "expiration_hours": expiration_hours,
                 "message_count": 0,
-                "has_native_file": _conversation_exists(cid),
+                # True when this id can be continued, whether directly or via a
+                # binding. Kept under the original name for compatibility.
+                "has_native_file": resumable,
+                "bound": bool(bound_id and _conversation_exists(bound_id)),
+                "agy_conversation_id": bound_id,
             })
 
             if len(conversations) >= limit:
@@ -415,13 +629,30 @@ class ConversationManager:
 
         deleted = False
 
+        # Delete the store the handle is BOUND to, not just the handle's own
+        # name. Deleting only the latter would remove the sidecar entry — the
+        # sole pointer to agy's conversation — leaving that conversation on disk,
+        # unreachable and undeletable, while reporting success.
+        metadata_snapshot = _load_metadata()
+        entry = metadata_snapshot.get(conversation_id)
+        targets = [conversation_id]
+        if isinstance(entry, dict):
+            bound = entry.get("agy_conversation_id")
+            if (
+                bound
+                and bound != conversation_id
+                and _is_valid_conversation_id(bound)
+            ):
+                targets.append(bound)
+
         # Remove every known store format, plus SQLite's -wal/-shm companions —
         # leaving those behind would strand write-ahead data for a deleted id.
-        for suffix in _CONVERSATION_SUFFIXES:
+        for target in targets:
+          for suffix in _CONVERSATION_SUFFIXES:
             for candidate in (
-                CONVERSATIONS_DIR / f"{conversation_id}{suffix}",
-                CONVERSATIONS_DIR / f"{conversation_id}{suffix}-wal",
-                CONVERSATIONS_DIR / f"{conversation_id}{suffix}-shm",
+                CONVERSATIONS_DIR / f"{target}{suffix}",
+                CONVERSATIONS_DIR / f"{target}{suffix}-wal",
+                CONVERSATIONS_DIR / f"{target}{suffix}-shm",
             ):
                 if not candidate.exists():
                     continue

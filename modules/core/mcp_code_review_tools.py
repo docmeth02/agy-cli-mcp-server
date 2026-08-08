@@ -9,6 +9,7 @@ import logging
 from typing import Optional
 
 from modules.utils.cli_utils import (
+    cli_error_code,
     execute_cli_with_retry,
     extract_file_refs,
     _build_cli_args,
@@ -86,7 +87,7 @@ Provide analysis in {output_format} format with severity levels."""
     args = _build_cli_args(prompt=cleaned_prompt, files=files, model=effective_model)
 
     try:
-        result = await execute_cli_with_retry(args, timeout=get_task_timeout("code_review"))
+        result = await execute_cli_with_retry(args, mutating=False, timeout=get_task_timeout("code_review"))
         result = add_model_metadata(result, await validate_model(effective_model))
         return json.dumps(result, indent=2)
     except (CLITimeoutError, CLIRateLimitError, CLIExecutionError) as e:
@@ -108,30 +109,51 @@ async def execute_extract_structured(
 
     Args:
         content: Content to analyze
-        schema: JSON schema for output
+        schema: JSON schema for output (must be a JSON object)
         examples: Optional examples
-        strict_mode: Enforce strict schema compliance
+        strict_mode: True enforces the schema upstream via agy's --json-schema
+                     (agy >= 1.1.8), returning a validated `structured_output`.
+                     False uses prompt-only extraction.
         model: Model to use. Resolved via get_task_model().
 
     Returns:
-        JSON string with extracted data
+        JSON string with extracted data. On the enforced path the response
+        carries `structured_output` (already schema-validated by agy) plus
+        `schema_validation: "enforced"`; otherwise `schema_validation` is
+        "prompt_only".
     """
     total_length = len(content) + len(schema) + len(examples or "")
     if total_length > GEMINI_EXTRACT_STRUCTURED_LIMIT:
         return json.dumps({
             "status": "error",
             "error": f"Input exceeds limit of {GEMINI_EXTRACT_STRUCTURED_LIMIT:,} characters",
-            "error_code": "INPUT_TOO_LARGE"
+            "error_code": "INPUT_TOO_LARGE",
+            "schema_validation": "not_attempted",
         })
 
     # Validate schema is valid JSON
     try:
-        json.loads(schema)
+        parsed_schema = json.loads(schema)
     except json.JSONDecodeError as e:
         return json.dumps({
             "status": "error",
             "error": f"Invalid JSON schema: {str(e)}",
-            "error_code": "INVALID_SCHEMA"
+            "error_code": "INVALID_SCHEMA",
+            "schema_validation": "not_attempted",
+        })
+
+    # agy's --json-schema expects a schema object. A bare scalar or array parses
+    # as JSON but is not a usable schema, and passing it through would fail
+    # inside agy with a less specific message.
+    if not isinstance(parsed_schema, dict):
+        return json.dumps({
+            "status": "error",
+            "error": (
+                f"Schema must be a JSON object, got "
+                f"{type(parsed_schema).__name__}."
+            ),
+            "error_code": "INVALID_SCHEMA",
+            "schema_validation": "not_attempted",
         })
 
     try:
@@ -145,7 +167,9 @@ async def execute_extract_structured(
     except ImportError:
         strict_text = " Strictly follow the schema." if strict_mode else ""
         example_text = f"\n\nExamples:\n{examples}" if examples else ""
-        prompt = f"""Extract structured data from the following content according to this schema.{strict_text}
+        prompt = f"""IMPORTANT: This is an analysis-only task. Do NOT create, modify, or delete any files. Do NOT execute any code. Only return the extracted data.
+
+Extract structured data from the following content according to this schema.{strict_text}
 
 Schema:
 {schema}{example_text}
@@ -157,17 +181,54 @@ Return valid JSON matching the schema."""
 
     effective_model = get_task_model("extract_structured", model)
 
+    # Upstream enforcement when available: agy validates the model's output
+    # against the schema and returns it as a parsed `structured_output` object,
+    # instead of us asking nicely in the prompt and hoping.
+    from modules.utils.cli_utils import (
+        resolve_output_format, _get_cached_or_sync_version, _parse_version,
+    )
+    cached_version = _get_cached_or_sync_version()
+    version = _parse_version(cached_version) if cached_version else (0, 0, 0)
+    try:
+        transport = resolve_output_format(version, bool(cached_version))
+    except CLIExecutionError as e:
+        # CLI_OUTPUT_FORMAT=json on an agy that cannot produce it. Return the
+        # documented error shape rather than raising out of the tool.
+        return json.dumps({
+            "status": "error",
+            "error": str(e),
+            "error_code": "CONFIG_ERROR",
+            "schema_validation": "not_attempted",
+        })
+    # transport == "json" already implies version >= 1.1.8, which is also the
+    # --json-schema floor, so no separate version check is needed here.
+    enforce = strict_mode and transport == "json"
+
     cleaned_prompt, files = extract_file_refs(prompt)
-    args = _build_cli_args(prompt=cleaned_prompt, files=files, model=effective_model)
+    args = _build_cli_args(
+        prompt=cleaned_prompt,
+        files=files,
+        model=effective_model,
+        json_schema=schema if enforce else None,
+    )
 
     try:
-        result = await execute_cli_with_retry(args, timeout=get_task_timeout("extract_structured"))
+        result = await execute_cli_with_retry(args, mutating=False, timeout=get_task_timeout("extract_structured"))
         result = add_model_metadata(result, await validate_model(effective_model))
+        result["schema_validation"] = "enforced" if enforce else "prompt_only"
+        if enforce and "structured_output" not in result:
+            result["warning"] = " | ".join(filter(None, [
+                result.get("warning"),
+                "agy did not return a structured_output object despite "
+                "--json-schema; treat the text response as unvalidated.",
+            ]))
         return json.dumps(result, indent=2)
     except (CLITimeoutError, CLIRateLimitError, CLIExecutionError) as e:
         return json.dumps({
             "status": "error",
-            "error": str(e)
+            "error": str(e),
+            "error_code": cli_error_code(e),
+            "schema_validation": "enforced" if enforce else "prompt_only",
         })
 
 
@@ -229,7 +290,7 @@ Provide feedback on:
     args = _build_cli_args(prompt=cleaned_prompt, files=files, model=effective_model)
 
     try:
-        result = await execute_cli_with_retry(args, timeout=get_task_timeout("git_diff_review"))
+        result = await execute_cli_with_retry(args, mutating=False, timeout=get_task_timeout("git_diff_review"))
         result = add_model_metadata(result, await validate_model(effective_model))
         return json.dumps(result, indent=2)
     except (CLITimeoutError, CLIRateLimitError, CLIExecutionError) as e:

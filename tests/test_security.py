@@ -4,6 +4,7 @@ Unit tests for the security framework modules.
 These tests verify the credential sanitizer and security monitor
 without requiring a real agy installation.
 """
+import pytest
 from security.credential_sanitizer import (
     sanitize_credentials,
     check_for_credentials,
@@ -124,3 +125,124 @@ class TestSecurityMonitor:
         m1 = get_security_monitor()
         m2 = get_security_monitor()
         assert m1 is m2
+
+
+class TestPrivateKeyPatternCost:
+    """
+    A permissive body makes every BEGIN marker rescan forward for an END, which is
+    quadratic in the marker count. Sanitization is synchronous and runs outside
+    the asyncio timeout, so one hostile payload would stall the whole server.
+    A length bound alone is NOT sufficient — a single trailing END marker
+    satisfies the literal prefilter and restores the full cost.
+    """
+
+    def test_repeated_begin_markers_with_trailing_end_stay_linear(self):
+        import time
+        from security.credential_sanitizer import sanitize_credentials
+
+        payload = "-----BEGIN PRIVATE KEY-----" * 38_000 + "-----END PRIVATE KEY-----"
+        start = time.perf_counter()
+        sanitize_credentials(payload)
+        elapsed = time.perf_counter() - start
+        assert elapsed < 1.0, f"~1MB took {elapsed:.2f}s — superlinear"
+
+    def test_repeated_begin_markers_without_end_stay_linear(self):
+        import time
+        from security.credential_sanitizer import sanitize_credentials
+
+        payload = "-----BEGIN PRIVATE KEY-----" * 38_000
+        start = time.perf_counter()
+        sanitize_credentials(payload)
+        assert time.perf_counter() - start < 1.0
+
+    @pytest.mark.parametrize("kind", ["", "RSA ", "EC ", "DSA "])
+    def test_real_keys_still_redacted(self, kind):
+        from security.credential_sanitizer import sanitize_credentials
+
+        key = (
+            f"-----BEGIN {kind}PRIVATE KEY-----\n"
+            + "MIIEowIBAAKCAQEA" * 200
+            + f"\n-----END {kind}PRIVATE KEY-----"
+        )
+        assert "[REDACTED_PRIVATE_KEY]" in sanitize_credentials(key)
+
+    def test_lowercase_markers_redacted(self):
+        from security.credential_sanitizer import sanitize_credentials
+        key = "-----begin private key-----\nabc\n-----end private key-----"
+        assert "[REDACTED_PRIVATE_KEY]" in sanitize_credentials(key)
+
+
+class TestJwtPatternCost:
+    """
+    Without a leading token boundary, every third character of a base64 run like
+    "eyJeyJeyJ..." starts a fresh JWT candidate (e, y and J are all in the
+    character class) and each scans to end-of-string for a '.'. That is quadratic
+    — 4.5s at 128KB, minutes at 1MB — and it runs synchronously outside the
+    asyncio timeout, so one payload stalls the whole server. agy output is not
+    length-capped, so this is reachable.
+    """
+
+    @pytest.mark.parametrize("size", [43_600, 350_000])
+    def test_base64_run_stays_linear(self, size):
+        import time
+        from security.credential_sanitizer import sanitize_credentials
+
+        start = time.perf_counter()
+        sanitize_credentials("eyJ" * size)
+        elapsed = time.perf_counter() - start
+        assert elapsed < 1.0, f"{size * 3 // 1024}KB took {elapsed:.2f}s — superlinear"
+
+    def test_dot_in_payload_does_not_restore_cost(self):
+        # A '.' prefilter would be defeated by a single dot; the boundary anchor
+        # is what actually bounds this.
+        import time
+        from security.credential_sanitizer import sanitize_credentials
+
+        start = time.perf_counter()
+        sanitize_credentials("eyJ" * 100_000 + ".")
+        assert time.perf_counter() - start < 1.0
+
+    REAL_JWT = (
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+        ".eyJzdWIiOiIxMjM0NTY3ODkwIn0"
+        ".SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+    )
+
+    @pytest.mark.parametrize("wrap", [
+        "{jwt}",
+        "token is {jwt} end",
+        '{{"t":"{jwt}"}}',
+        "\n{jwt}",
+        "Authorization={jwt}",
+    ])
+    def test_real_jwts_still_redacted(self, wrap):
+        from security.credential_sanitizer import sanitize_credentials
+        text = wrap.format(jwt=self.REAL_JWT)
+        assert "[REDACTED_JWT]" in sanitize_credentials(text)
+
+
+class TestPrivateKeyTypeCoverage:
+    """OPENSSH is ssh-keygen's DEFAULT output format, and was matched by nothing."""
+
+    @pytest.mark.parametrize("kind", [
+        "", "RSA ", "EC ", "DSA ", "OPENSSH ", "ENCRYPTED ",
+    ])
+    def test_key_types_redacted(self, kind):
+        from security.credential_sanitizer import sanitize_credentials
+        key = (
+            f"-----BEGIN {kind}PRIVATE KEY-----\n"
+            + "MIIEowIBAAKCAQEA" * 50
+            + f"\n-----END {kind}PRIVATE KEY-----"
+        )
+        assert "[REDACTED_PRIVATE_KEY]" in sanitize_credentials(key)
+
+    def test_prefilter_is_keyed_by_pattern_not_replacement(self):
+        # Keying on the replacement string let a caller-supplied additional
+        # pattern reusing the same placeholder inherit the "-----END" gate and
+        # silently skip its own redaction.
+        from security.credential_sanitizer import CredentialSanitizer
+        s = CredentialSanitizer(
+            additional_patterns=[(r"CUSTOMSECRET-[0-9]+", "[REDACTED_PRIVATE_KEY]")]
+        )
+        # No "-----END" anywhere, so an inherited gate would skip this.
+        assert "[REDACTED_PRIVATE_KEY]" in s.sanitize("value CUSTOMSECRET-12345 here")
