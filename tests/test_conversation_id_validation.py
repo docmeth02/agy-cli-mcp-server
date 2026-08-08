@@ -362,3 +362,42 @@ class TestContinueConversationArgs:
         seen = self._capture(monkeypatch)
         asyncio.run(ConversationManager().continue_conversation(bound_store, "/clear"))
         assert "--disable-slash-commands" in seen["args"]
+
+
+class TestListConversationsToleratesJunkMetadata:
+    """
+    The sidecar is user-editable JSON, so any field may be null, a string, or the
+    wrong type. Arithmetic on those raises TypeError, which escapes
+    gemini_list_conversations — the listing the conversation docstrings tell
+    callers to use to find a resumable id.
+    """
+
+    @pytest.fixture
+    def store(self, tmp_path, monkeypatch):
+        import modules.services.conversation_manager as cm
+        s = tmp_path / "conversations"
+        s.mkdir()
+        monkeypatch.setattr(cm, "CONVERSATIONS_DIR", s)
+        monkeypatch.setattr(cm, "METADATA_FILE", tmp_path / "mcp_metadata.json")
+        monkeypatch.setattr(cm, "_ensure_dirs", lambda: None)
+        return tmp_path
+
+    @pytest.mark.parametrize("entry", [
+        {"created_at": None},
+        {"created_at": "2026-01-01T00:00:00Z"},
+        {"expiration_hours": None},
+        {"expiration_hours": "24"},
+        {"created_at": True},
+        {"updated_at": "not-a-number"},
+        {"created_at": [], "expiration_hours": {}},
+        {},
+    ])
+    @pytest.mark.parametrize("status_filter", [None, "active", "expired"])
+    def test_does_not_raise(self, store, entry, status_filter):
+        import json as _json
+        (store / "mcp_metadata.json").write_text(
+            _json.dumps({"aaaa1111-0000-0000-0000-00000000000a": entry})
+        )
+        # Must return a list, not raise.
+        result = ConversationManager().list_conversations(status_filter=status_filter)
+        assert isinstance(result, list)

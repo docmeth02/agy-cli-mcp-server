@@ -14,7 +14,7 @@ A Model Context Protocol (MCP) server that bridges Google's **Antigravity CLI** 
 - **Conversation History** - Stateful multi-turn conversations via agy's native conversation stores (SQLite `.db`, legacy `.pb`)
 - **Dynamic Token Limits** - Tool-specific limits from 100K-800K characters
 - **Multi-AI Workflows** - Purpose-built tools for plan evaluation, code review, and collaboration
-- **@filename Support** - Direct file reading with intelligent expansion for 23 tools
+- **@filename Support** - Direct file reading with intelligent expansion for 13 tools
 - **Enterprise Security** - Multi-layer defense with real-time protection
 - **Production Ready** - Async architecture with retry logic and comprehensive error handling
 - **High Concurrency** - Async architecture supporting 1,000-10,000+ concurrent requests
@@ -983,7 +983,7 @@ There is no prompt-result cache — every prompt reaches agy.
 
 ### @filename Syntax Support
 
-12 of the 27 tools support `@filename` syntax for optimal token efficiency:
+13 of the 27 tools support `@filename` syntax for optimal token efficiency:
 
 ```python
 # Single file

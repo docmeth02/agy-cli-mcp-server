@@ -350,12 +350,24 @@ class ConversationManager:
         conversations = []
         now = time.time()
 
+        def _num(value, fallback: float) -> float:
+            """Coerce a sidecar timestamp to a float, tolerating junk.
+
+            The sidecar is user-editable JSON, so any field may be null, a
+            string, or missing. Arithmetic on those raises TypeError, which
+            would escape gemini_list_conversations — the very listing the
+            conversation docstrings tell callers to use to recover.
+            """
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return fallback
+            return float(value)
+
         def _recency(cid: str) -> float:
             meta = metadata.get(cid, {})
             return max(
                 _get_conversation_mtime(cid),
-                meta.get("updated_at") or 0,
-                meta.get("created_at") or 0,
+                _num(meta.get("updated_at"), 0.0),
+                _num(meta.get("created_at"), 0.0),
             )
 
         all_ids.sort(key=_recency, reverse=True)
@@ -363,8 +375,10 @@ class ConversationManager:
         for cid in all_ids:
             meta = metadata.get(cid, {})
             mtime = _get_conversation_mtime(cid)
-            created_at = meta.get("created_at", mtime or now)
-            expiration_hours = meta.get("expiration_hours", DEFAULT_EXPIRATION_HOURS)
+            created_at = _num(meta.get("created_at"), mtime or now)
+            expiration_hours = _num(
+                meta.get("expiration_hours"), DEFAULT_EXPIRATION_HOURS
+            )
 
             expired = now > created_at + (expiration_hours * 3600)
             # "expired" was previously accepted and silently ignored, so the

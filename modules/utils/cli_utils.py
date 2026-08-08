@@ -350,9 +350,17 @@ _RATE_LIMIT_PATTERNS = (
     r'too\s+many\s+requests',
     # HTTP 429 needs status context: a bare 429 also appears in durations
     # ("took 1.429 seconds"), stack traces ("index.js:429:12") and counts
-    # ("Read 429 files"). The canonical "429 Too Many Requests" text is already
-    # covered by the too-many-requests pattern above.
-    r'(?:http|status|statuscode|code)\s*[:=]?\s*429\b',
+    # ("Read 429 files").
+    #
+    # The separator is ONE bounded character class, not adjacent `\s*[:=]?\s*`
+    # groups — those backtrack quadratically on a long whitespace run after a
+    # keyword (measured 4.9s at 80KB, extrapolating to ~860s at 1MB), and this
+    # scan runs synchronously on model-influenceable stderr outside the
+    # asyncio timeout, so it would wedge the event loop.
+    #
+    # The class includes quote characters so the canonical Google API body
+    # `{"error":{"code": 429}}` matches, and `err(?:or)?` covers "Error 429".
+    r'(?:http|status(?:code)?|code|err(?:or)?)[\s"\':=]{0,4}429\b',
     # "weekly/daily/5-hour limit reached" phrasing, which names no quota at all.
     r'(?:weekly|daily|5[-\s]?hour|hourly)\s+limit\s+(?:reached|exceeded|hit)',
     r'reached\s+your\s+(?:weekly|daily|hourly|5[-\s]?hour)\s+limit',

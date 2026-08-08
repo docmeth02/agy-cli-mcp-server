@@ -331,3 +331,48 @@ class TestPrintInvocationDetection:
     def test_detection(self, args, expected):
         from modules.utils.cli_utils import _is_print_invocation
         assert _is_print_invocation(args) is expected
+
+
+class TestRateLimit429Context:
+    """A bare 429 is ambiguous, so status context is required — but the pattern
+    must stay linear, since it scans model-influenceable stderr synchronously."""
+
+    @pytest.mark.parametrize("text", [
+        "took 1.429 seconds",
+        "at index.js:429:12",
+        "Read 429 files",
+        "version 4.29",
+        "processed 429 records",
+    ])
+    def test_bare_429_in_other_contexts_ignored(self, text):
+        assert _is_rate_limit_signal(text) is False
+
+    @pytest.mark.parametrize("text", [
+        "HTTP 429 Too Many Requests",
+        "status: 429",
+        "statusCode=429",
+        "Error 429",
+        # The canonical Google API error body.
+        '{"error":{"code": 429, "message":"Resource has been exhausted"}}',
+    ])
+    def test_http_429_detected(self, text):
+        assert _is_rate_limit_signal(text) is True
+
+    @pytest.mark.parametrize("seed", ["code", "status", "http", "error", "weekly", "rate"])
+    def test_linear_on_adversarial_whitespace(self, seed):
+        """Adjacent `\\s*[:=]?\\s*` groups backtrack quadratically on a long
+        whitespace run (measured 4.9s at 80KB). A bounded single character class
+        stays linear."""
+        import time
+        payload = seed + " " * 200_000
+        start = time.perf_counter()
+        _is_rate_limit_signal(payload)
+        elapsed = time.perf_counter() - start
+        assert elapsed < 1.0, f"{seed!r} + 200k spaces took {elapsed:.2f}s — superlinear"
+
+    def test_linear_on_mixed_whitespace(self):
+        import time
+        payload = "code" + "\t \n" * 60_000
+        start = time.perf_counter()
+        _is_rate_limit_signal(payload)
+        assert time.perf_counter() - start < 1.0
