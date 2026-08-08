@@ -4,7 +4,7 @@ Antigravity CLI MCP Server
 A production-ready Model Context Protocol (MCP) server that bridges Google's
 Antigravity CLI (agy) with MCP-compatible clients like Claude Code and Claude Desktop.
 
-This server provides 26 specialized tools for seamless AI workflows.
+This server provides 27 specialized tools for seamless AI workflows.
 """
 import sys
 from pathlib import Path
@@ -53,6 +53,13 @@ from modules.utils.cli_utils import (
     CLITimeoutError,
     CLIRateLimitError,
 )
+
+
+def _utc_now_iso() -> str:
+    """Current UTC time as an ISO-8601 'Z' string, for stamping cached reads."""
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
 
 # ============================================================================
 # PHASE 1: Core CLI Tools (gemini_cli, gemini_help, gemini_version)
@@ -250,7 +257,9 @@ async def gemini_prompt(
                   agy expand its own slash commands and skills (agy >= 1.1.9),
                   e.g. prompt="/antigravity-guide explain customizations". Note
                   that with this enabled, an interactive-only command such as
-                  "/clear" will fail instead of reaching the model.
+                  "/clear" will fail instead of reaching the model. Has no
+                  effect when readonly=True, which prepends a preamble so the
+                  slash command is no longer at the start of the prompt.
 
     Returns:
         JSON string with the response
@@ -441,7 +450,7 @@ async def gemini_metrics() -> str:
             "security_stats": security_stats,
             "server_info": {
                 "name": "gemini-cli-mcp-server",
-                "tools_available": 26,
+                "tools_available": 27,
                 "python_version": os.sys.version
             }
         }, indent=2)
@@ -619,7 +628,7 @@ async def gemini_usage() -> str:
 
     groups = []
     data = result.get("data") or {}
-    for group in data.get("groups", []):
+    for group in (data.get("groups") or []):
         groups.append({
             "group": group.get("name"),
             "models": group.get("description"),
@@ -634,7 +643,7 @@ async def gemini_usage() -> str:
                     "resets_at": b.get("reset_time"),
                     "detail": b.get("description"),
                 }
-                for b in group.get("buckets", [])
+                for b in (group.get("buckets") or [])
             ],
         })
 
@@ -642,6 +651,10 @@ async def gemini_usage() -> str:
     if not groups:
         # agy < 1.1.8 has no structured payload; hand back the text records.
         payload["records"] = result.get("records", [])
+    # Cached for 60s, so stamp the reading: an unchanged percentage after a heavy
+    # run is otherwise indistinguishable from a stale cache hit.
+    payload["retrieved_at"] = _utc_now_iso()
+    payload["cache_ttl_seconds"] = USAGE_CACHE.ttl
     payload["notes"] = (
         "Quota is consumed proportionally to token cost. This read is free and "
         "does not itself consume quota."
@@ -701,6 +714,12 @@ async def gemini_credits() -> str:
     else:
         # agy < 1.1.8: no structured payload, return the text records.
         payload["records"] = result.get("records", [])
+    payload["retrieved_at"] = _utc_now_iso()
+    payload["cache_ttl_seconds"] = CREDITS_CACHE.ttl
+    payload["notes"] = (
+        "This read is free and does not consume quota. Reported for visibility "
+        "only: no tool is gated on this balance."
+    )
 
     encoded = json.dumps(payload, indent=2)
     CREDITS_CACHE["credits"] = encoded
@@ -1041,7 +1060,20 @@ async def gemini_start_conversation(
     expiration_hours: int = 24
 ) -> str:
     """
-    Start a new conversation with ID for stateful interactions.
+    Register conversation metadata (title, tags, expiration) in the local sidecar.
+
+    IMPORTANT — this does NOT create a conversation inside agy. It only records
+    metadata against a freshly minted id, and agy never learns about that id.
+    Because agy silently ignores an unknown --conversation id (it starts a new
+    context under a different id and reports success), the id returned here is
+    NOT yet usable with gemini_continue_conversation, which will refuse it with
+    CONVERSATION_NOT_BOUND rather than silently discard your history.
+
+    To hold a real multi-turn conversation today:
+      1. call gemini_prompt(...) for the first turn, then
+      2. call gemini_list_conversations() and take a conversation_id whose
+         has_native_file is true, then
+      3. pass that id to gemini_continue_conversation().
 
     Args:
         title: Optional title for the conversation
@@ -1050,7 +1082,8 @@ async def gemini_start_conversation(
         expiration_hours: Hours until conversation expires (default: 24)
 
     Returns:
-        JSON with conversation_id and details
+        JSON with conversation_id and details. The id is metadata-only until an
+        agy-side conversation file exists for it.
 
     Examples:
         gemini_start_conversation(title="Python Help", tags="python,development")
@@ -1094,20 +1127,31 @@ async def gemini_continue_conversation(
     project: Optional[str] = None,
 ) -> str:
     """
-    Continue an existing conversation with context history.
+    Continue an existing agy conversation with its context history.
+
+    The conversation_id must be one agy actually knows about — take it from
+    gemini_list_conversations() where has_native_file is true. An id from
+    gemini_start_conversation() is metadata-only and is rejected with
+    CONVERSATION_NOT_BOUND, because agy silently ignores an unknown
+    --conversation id and would start a fresh, historyless context instead.
 
     Args:
-        conversation_id: ID of the conversation to continue
+        conversation_id: ID of an existing agy conversation (a UUID). Must have
+               has_native_file true in gemini_list_conversations().
         prompt: The new prompt/message
-        model: Model to use. If omitted, reuses the model from the conversation
-               or falls back to agy's default.
+        model: Model to use (slug or display name, e.g. "gemini-3.1-pro-high").
+               Defaults to agy's default; the model is not carried over from
+               earlier turns of the conversation.
         project: Project ID for session isolation (agy >= 1.0.12).
 
     Returns:
         JSON with response and updated conversation state
 
     Examples:
-        gemini_continue_conversation(conversation_id="conv_12345", prompt="How do I optimize this?")
+        gemini_continue_conversation(
+            conversation_id="ea160180-a361-4cd8-808f-3252614f45cd",
+            prompt="How do I optimize this?",
+        )
     """
     effective_model = get_task_model("continue_conversation", model)
 
@@ -1118,6 +1162,7 @@ async def gemini_continue_conversation(
             conversation_id=conversation_id,
             prompt=prompt,
             model=effective_model,
+            project=project,
         )
         result = add_model_metadata(result, await validate_model(effective_model))
         return json.dumps(result, indent=2)

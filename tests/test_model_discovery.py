@@ -60,13 +60,22 @@ class TestParseModelsOutput:
             {"slug": "gemini-x", "display_name": "Gemini X"}
         ]
 
-    def test_mixed_columns_tolerated(self):
-        # A line without a tab (e.g. a future preamble) must not corrupt the rest.
-        records = _parse_models_output("Some Preamble\ngemini-x\tGemini X")
-        assert records == [
-            {"slug": None, "display_name": "Some Preamble"},
-            {"slug": "gemini-x", "display_name": "Gemini X"},
+    def test_tabless_prose_dropped_when_two_column_output_seen(self):
+        # Once we know the output is the modern two-column form, a tab-less line
+        # is prose (a preamble or status message), not a model. Admitting it
+        # would put an unusable value into gemini_models()' copyable `model`
+        # field and make validate_model() accept it.
+        records = _parse_models_output("Fetching available models...\ngemini-x\tGemini X")
+        assert records == [{"slug": "gemini-x", "display_name": "Gemini X"}]
+
+    def test_tabless_lines_kept_when_no_two_column_line_exists(self):
+        # agy < 1.1.5 emitted display names only; those must still be usable.
+        records = _parse_models_output("Gemini 3.1 Pro (High)\nGemini 3.5 Flash (Low)")
+        assert [r["display_name"] for r in records] == [
+            "Gemini 3.1 Pro (High)",
+            "Gemini 3.5 Flash (Low)",
         ]
+        assert all(r["slug"] is None for r in records)
 
     def test_display_name_containing_no_tab_but_parens(self):
         records = _parse_models_output("Gemini 3.5 Flash (Medium)")
@@ -147,10 +156,29 @@ class TestValidateModelBothColumns:
         assert await validate_model("  gemini-3.1-pro-high  ") == {}
 
     @pytest.mark.asyncio
-    async def test_task_defaults_all_validate(self, modern_agy):
-        # Guards the specific regression: the server's own defaults must not
-        # trip the "not recognized" warning.
-        assert await validate_model("gemini-3.1-pro-high") == {}
+    async def test_task_defaults_all_validate(self, monkeypatch):
+        # Guards the specific regression: the server's own configured defaults
+        # must not trip the "not recognized" warning. Deliberately reads
+        # TASK_MODEL_DEFAULTS rather than restating a literal, so changing a
+        # default to something agy rejects fails here.
+        import modules.utils.cli_utils as cu
+        from modules.config.cli_config import TASK_MODEL_DEFAULTS
+
+        monkeypatch.setattr(cu, "_get_cached_or_sync_version", lambda: "1.1.11")
+
+        async def _models():
+            return [
+                {"slug": "gemini-3.1-pro-high", "display_name": "Gemini 3.1 Pro (High)"},
+                {"slug": "gemini-3.6-flash-medium", "display_name": "Gemini 3.6 Flash (Medium)"},
+                {"slug": "claude-sonnet-4-6", "display_name": "Claude Sonnet 4.6 (Thinking)"},
+            ]
+
+        monkeypatch.setattr(cu, "get_available_models", _models)
+
+        configured = [v for v in TASK_MODEL_DEFAULTS.values() if v]
+        assert configured, "expected at least one pinned task default"
+        for name in configured:
+            assert await validate_model(name) == {}, f"task default {name!r} does not validate"
 
     @pytest.mark.asyncio
     async def test_unknown_model_warns(self, modern_agy):
@@ -213,13 +241,33 @@ class TestRateLimitSignal:
         assert _is_rate_limit_signal(text) is True
 
     @pytest.mark.parametrize("text", [
-        # agy 1.1.11 added /usage and /quota reporting. These are successful
-        # status reads and must not be misclassified as retryable failures.
-        "Gemini Models\tWeekly Limit Remaining\t100%\t2026-08-15T13:19:11Z",
-        "Quota is consumed proportionally to the cost of the tokens.",
-        "Remaining credits\t0",
-        "--quota  Show quota information",
-        "",
+        # agy phrases exhaustion many ways; a false negative turns a transient
+        # failure into a hard one with no retry, so all of these must match.
+        "quotaExceeded",
+        "QUOTA_EXCEEDED",
+        "Error: quota_exceeded",
+        "insufficient quota",
+        "Quota limit reached for model gemini-3.1-pro-high",
+        "You have no quota remaining for this window",
+        "You have run out of your weekly quota",
+        "Daily quota reached",
+        "rate-limited, retry after 30s",
+        "RATE_LIMIT_EXCEEDED",
+        "You've reached your weekly limit for Gemini models",
+        "weekly limit reached",
     ])
-    def test_ignores_quota_reporting(self, text):
+    def test_detects_agy_phrasing_variants(self, text):
+        assert _is_rate_limit_signal(text) is True
+
+    @pytest.mark.parametrize("text", [
+        "",
+        "   ",
+        "Reply with exactly: PING_OK",
+        "Wrote 3 files.",
+    ])
+    def test_ignores_unrelated_stderr(self, text):
+        # Only stderr reaches this function, and agy writes quota *reporting*
+        # (/usage, /quota) exclusively to stdout — verified as zero bytes on
+        # stderr in both text and JSON modes — so there is no quota-reporting
+        # false positive to guard against here.
         assert _is_rate_limit_signal(text) is False

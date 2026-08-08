@@ -1,12 +1,12 @@
 # Antigravity CLI MCP Server
 
-A Model Context Protocol (MCP) server that bridges Google's **Antigravity CLI** (`agy`) with MCP-compatible clients like Claude Code and Claude Desktop. It provides 26 specialized tools for AI-assisted workflows.
+A Model Context Protocol (MCP) server that bridges Google's **Antigravity CLI** (`agy`) with MCP-compatible clients like Claude Code and Claude Desktop. It provides 27 specialized tools for AI-assisted workflows.
 
 > Forked from [centminmod/gemini-cli-mcp-server](https://github.com/centminmod/gemini-cli-mcp-server). Refactored from the deprecated Google Gemini CLI to use **Antigravity CLI** (`agy`). Tool names retain the `gemini_` prefix for backward compatibility.
 
 ## 🚀 Key Features
 
-- **26 Specialized MCP Tools** - Complete toolset for AI-assisted workflows across 5 tool categories
+- **27 Specialized MCP Tools** - Complete toolset for AI-assisted workflows across 5 tool categories
 - **Free Quota & Credit Visibility** - `gemini_usage` / `gemini_credits` read account limits without spending quota
 - **4 MCP Resources** - Read-only repository access (tree, file, search, grep) without AI invocation
 - **Antigravity CLI Integration** - Direct bridge to Google's `agy` CLI with native conversation support
@@ -97,7 +97,7 @@ The Gemini CLI MCP Server features a modular, enterprise-grade architecture desi
 
 ## 🛠️ Tool Suite
 
-The server provides 26 specialized MCP tools and 4 read-only MCP resources:
+The server provides 27 specialized MCP tools and 4 read-only MCP resources:
 
 ### MCP Resources (Read-Only Repository Access)
 
@@ -120,7 +120,7 @@ The server exposes 4 MCP resource templates that allow clients to browse the rep
 
 **Workspace resolution:** The workspace root is resolved via `git rev-parse --show-toplevel`, so the server works correctly even when started from a subdirectory.
 
-### Core Gemini Tools (6)
+### Core Gemini Tools (7)
 
 #### `gemini_cli`
 Execute any Antigravity CLI command directly with comprehensive error handling.
@@ -152,10 +152,18 @@ gemini_prompt(
 ```
 
 #### `gemini_models`
-List all available Gemini AI models.
+List all available AI models with the exact value to pass as `model`. Each entry carries the stable slug, the display name, and both `accepted_values`.
 ```python
 gemini_models()
 ```
+
+#### `gemini_agents`
+List available custom agents (agy >= 1.1.1). Agents are specialized personas selectable via the `agent` parameter on `gemini_prompt` and `gemini_sandbox`. Cached for 30 minutes.
+```python
+gemini_agents()
+```
+
+> **Caveat:** agy silently ignores an unknown `--agent` name, so a typo passes unnoticed. `validate_agent()` pre-checks the name and attaches a warning to the response.
 
 #### `gemini_metrics`
 Get comprehensive server performance metrics and statistics.
@@ -931,10 +939,13 @@ The specialized analysis tools build their own prompts and do not expose this fl
 
 ### Conversation History Management
 
-Stateful multi-turn conversations via agy native `.pb` files:
+Stateful multi-turn conversations via agy's native conversation stores:
+
+> **Important:** `gemini_start_conversation` only records metadata locally — it does **not** create a conversation inside agy, and agy never learns the id it returns. Since agy silently ignores an unknown `--conversation` id (starting a fresh context under a different id while reporting success), that id is rejected by `gemini_continue_conversation` with `CONVERSATION_NOT_BOUND` rather than silently discarding your history. To hold a real multi-turn conversation: call `gemini_prompt` for the first turn, then take a `conversation_id` from `gemini_list_conversations` whose `has_native_file` is true, and pass that to `gemini_continue_conversation`.
+
 
 **Key Features:**
-- **Agy-Native Storage**: Conversations stored as protobuf files in `~/.gemini/antigravity-cli/conversations/`
+- **Agy-Native Storage**: Conversations stored by agy in `~/.gemini/antigravity-cli/conversations/` — SQLite `<uuid>.db` for recent conversations, legacy protobuf `<uuid>.pb` for older ones. Both formats are recognised.
 - **JSON Metadata Sidecar**: Title, tags, expiration tracked in `mcp_metadata.json`
 - **Automatic Context Building**: Intelligent context assembly respecting token limits
 - **Conversation Pruning**: Automatic message and token limit management
@@ -955,7 +966,7 @@ Stateful multi-turn conversations via agy native `.pb` files:
 
 ### @filename Syntax Support
 
-23 of the 26 tools support `@filename` syntax for optimal token efficiency:
+13 of the 27 tools support `@filename` syntax for optimal token efficiency:
 
 ```python
 # Single file
@@ -1185,7 +1196,7 @@ Response from Gemini AI
 **Concurrency**:
 - Async architecture supports 1,000-10,000+ concurrent requests
 - Memory-efficient single-threaded design
-- Non-blocking I/O operations across all 26 tools
+- Non-blocking I/O operations across all 27 tools
 
 **Memory Usage**:
 - Base server: 15-30MB (optimized for enterprise features)
@@ -1229,7 +1240,7 @@ Use the `gemini_metrics` tool to monitor server performance:
 ```
 
 **Key Metrics**:
-- Commands executed and success rate across all 26 tools
+- Commands executed and success rate across all 27 tools
 - Average latency and throughput per tool category
 - Cache hit rates and effectiveness (3 cache types)
 - Error rates and types with detailed classification

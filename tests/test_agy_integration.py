@@ -504,8 +504,10 @@ class TestModelIntegration:
 
     @pytest.mark.asyncio
     async def test_model_flag_works_with_pro_slug(self):
+        # Pro (Low) rather than (High): this asserts the slug *form* is accepted,
+        # which needs no reasoning depth, and High is the priciest tier.
         args = _build_cli_args(
-            prompt="Reply with only the word OK", model="gemini-3.1-pro-high"
+            prompt="Reply with only the word OK", model="gemini-3.1-pro-low"
         )
         result = await execute_cli_with_retry(args)
         assert result["status"] == "success"
@@ -649,7 +651,7 @@ class TestMCPToolRoundTrip:
         result = json.loads(raw)
         assert result["status"] == "success"
         assert "metrics" in result
-        assert result["server_info"]["tools_available"] == 26
+        assert result["server_info"]["tools_available"] == 27
 
     @pytest.mark.asyncio
     async def test_gemini_cache_stats_tool(self):
