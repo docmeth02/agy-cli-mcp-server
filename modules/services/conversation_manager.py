@@ -179,6 +179,27 @@ class ConversationManager:
         if not meta and not _conversation_exists(conversation_id):
             return {"status": "error", "error": f"Conversation {conversation_id} not found"}
 
+        # agy silently ignores an unknown --conversation id: it starts a brand-new
+        # conversation under a different id, exits 0, and emits no warning
+        # (verified on 1.1.11, in both text and JSON output modes). Since
+        # create_conversation() mints its own uuid4 that agy never sees, passing
+        # it through would produce a fresh, historyless context on every call
+        # while still reporting success. Refuse instead of silently losing
+        # history. The real fix — binding the sidecar entry to the id agy
+        # reports back in its JSON envelope — needs the JSON transport.
+        if not _conversation_exists(conversation_id):
+            return {
+                "status": "error",
+                "error": (
+                    f"Conversation {conversation_id} has no agy-side history yet, "
+                    f"so continuing it would silently start a new context instead "
+                    f"of resuming. Use gemini_prompt for a one-shot request, or "
+                    f"pass the conversation_id of an existing agy conversation "
+                    f"from gemini_list_conversations."
+                ),
+                "error_code": "CONVERSATION_NOT_BOUND",
+            }
+
         from modules.utils.cli_utils import _build_cli_args
         args = _build_cli_args(
             prompt=prompt,

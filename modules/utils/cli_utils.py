@@ -7,6 +7,7 @@ reference expansion (@filename → --add-dir).
 """
 import asyncio
 import glob
+import json
 import os
 import random
 import re
@@ -45,15 +46,27 @@ HELP_CACHE: TTLCache = TTLCache(maxsize=1, ttl=1800)  # 30 min
 VERSION_CACHE: TTLCache = TTLCache(maxsize=1, ttl=1800)  # 30 min
 MODELS_CACHE: TTLCache = TTLCache(maxsize=1, ttl=1800)  # 30 min
 AGENTS_CACHE: TTLCache = TTLCache(maxsize=1, ttl=1800)  # 30 min
+# Quota/credit state moves on its own schedule, and these reads are free of
+# quota cost but not of subprocess/language-server startup cost, so they get
+# short TTLs rather than the 30-min discovery TTL above.
+USAGE_CACHE: TTLCache = TTLCache(maxsize=1, ttl=60)     # 1 min
+CREDITS_CACHE: TTLCache = TTLCache(maxsize=1, ttl=300)  # 5 min
 
 # Minimum agy versions for feature-gated CLI flags
 _MIN_MODEL_VERSION = (1, 0, 5)     # --model
 _MIN_PROJECT_VERSION = (1, 0, 12)  # --project / --new-project
 _MIN_MODE_VERSION = (1, 1, 0)      # --mode
 _MIN_AGENT_VERSION = (1, 1, 1)     # --agent
+_MIN_NO_SLASH_VERSION = (1, 1, 9)  # --disable-slash-commands
+_MIN_COMMAND_JSON_VERSION = (1, 1, 8)  # --output-format json (slash-command payloads)
 
-# Short names agy accepted prior to 1.1.4. Kept for backward-compat validation
-# on older agy installs; on >= 1.1.4 these are rejected (full names required).
+# agy 1.1.4 dropped the short model names; from that version on only the full
+# display name ("Gemini 3.1 Pro (High)") or the stable slug added in 1.1.5
+# ("gemini-3.1-pro-high") is accepted.
+_MIN_FULL_MODEL_NAME_VERSION = (1, 1, 4)
+
+# Short names agy accepted prior to 1.1.4. Only valid below
+# _MIN_FULL_MODEL_NAME_VERSION; validate_model() rejects them at or above it.
 MODEL_SHORT_NAMES = frozenset({"pro", "flash", "claude"})
 
 # Metrics tracking
@@ -211,8 +224,15 @@ def _build_cli_args(
     agent: Optional[str] = None,
     project: Optional[str] = None,
     new_project: bool = False,
+    interpret_slash_commands: bool = False,
 ) -> list[str]:
-    """Build argument list for Antigravity CLI execution."""
+    """
+    Build argument list for Antigravity CLI execution.
+
+    interpret_slash_commands: when False (the default), pass
+    --disable-slash-commands so a caller-supplied prompt is sent to the model
+    verbatim. See the injection block below for why that is the safe default.
+    """
     args: list[str] = []
     cached_version = _get_cached_or_sync_version()
     version = _parse_version(cached_version) if cached_version else (0, 0, 0)
@@ -224,6 +244,16 @@ def _build_cli_args(
     # interactive diff review before writes. Force accept-edits for headless use.
     if cached_version and version >= _MIN_MODE_VERSION:
         args.extend(["--mode", "accept-edits"])
+
+    # agy 1.1.9 started expanding slash commands and skills in print mode, and
+    # 1.1.11 made the interactive-only ones hard-fail there (`-p "/clear"` now
+    # errors instead of reaching the model). This server relays arbitrary
+    # caller-supplied prompt text, so a prompt that merely begins with "/" must
+    # not be silently reinterpreted as a command. Default to literal text and
+    # let the few tools that genuinely want command/skill expansion opt in.
+    if not interpret_slash_commands:
+        if cached_version and version >= _MIN_NO_SLASH_VERSION:
+            args.append("--disable-slash-commands")
 
     # Attach files via --add-dir (replaces @filename)
     for f in (files or []):
@@ -275,6 +305,32 @@ def _build_cli_args(
 
     args.extend(["--print", prompt])
     return args
+
+
+_RATE_LIMIT_PATTERNS = (
+    r'rate\s*limit',
+    r'quota\s+(?:exceeded|exhausted)',
+    r'(?:exceeded|exhausted|out\s+of|no\s+remaining)\s+(?:your\s+)?quota',
+    r'resource[_\s]exhausted',
+    r'too\s+many\s+requests',
+    r'\b429\b',
+)
+
+
+def _is_rate_limit_signal(text: str) -> bool:
+    """
+    Whether CLI stderr indicates a transient rate-limit/quota-exhaustion state.
+
+    Matches exhaustion phrasing only. A bare "quota" substring would also fire
+    on agy's quota *reporting* output (`/usage`, `/quota`, added in 1.1.11) and
+    on ordinary help text, which would misclassify a successful read as a
+    retryable rate-limit failure.
+    """
+    if not text:
+        return False
+    return any(
+        re.search(p, text, re.IGNORECASE) for p in _RATE_LIMIT_PATTERNS
+    )
 
 
 def _apply_print_runtime_flags(args: list[str], timeout: int) -> list[str]:
@@ -415,8 +471,11 @@ async def execute_cli(
             for p in error_patterns
         )
 
-        # Check stderr for rate limiting signals (takes priority)
-        if "rate limit" in stderr_str.lower() or "quota" in stderr_str.lower():
+        # Check stderr for rate limiting signals (takes priority).
+        # Deliberately specific: a bare "quota" substring also matches ordinary
+        # quota *reporting* (agy 1.1.11 added `/usage` and `/quota`), which would
+        # turn a successful status read into a spurious CLIRateLimitError.
+        if _is_rate_limit_signal(stderr_str):
             METRICS["rate_limit_hits"] += 1
             _record_security_event("rate_limit", "medium", "execute_cli",
                                    {"detail": stderr_str[:500]})
@@ -549,8 +608,59 @@ async def get_cli_version() -> str:
     return output
 
 
-async def get_available_models() -> list[str]:
-    """Get available models from agy with caching."""
+def _parse_models_output(stdout: str) -> list[dict]:
+    """
+    Parse `agy models` output into {slug, display_name} records.
+
+    agy >= 1.1.5 emits two TAB-separated columns (the stable slug added in that
+    release, then the display name):
+
+        gemini-3.1-pro-high\tGemini 3.1 Pro (High)
+
+    Older agy emitted the display name only. Both columns are accepted by
+    --model, so the parser keeps each and lets callers pick. Single-column lines
+    are treated as legacy display names with no slug, which also makes this
+    tolerant of any future preamble line that carries no tab.
+    """
+    models: list[dict] = []
+    for line in stdout.strip().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        slug, tab, display = line.partition("\t")
+        if tab and display.strip():
+            models.append({
+                "slug": slug.strip(),
+                "display_name": display.strip(),
+            })
+        else:
+            # agy < 1.1.5: display name only, no stable slug to offer.
+            models.append({"slug": None, "display_name": line})
+    return models
+
+
+def model_selection_value(record: dict) -> str:
+    """
+    The value to pass to `--model` for a discovered model.
+
+    Prefers the stable slug (agy >= 1.1.5) over the display name, which can
+    change between releases.
+    """
+    return record.get("slug") or record.get("display_name") or ""
+
+
+def model_accepted_values(record: dict) -> list[str]:
+    """Every string agy will accept as `--model` for this record."""
+    return [v for v in (record.get("slug"), record.get("display_name")) if v]
+
+
+async def get_available_models() -> list[dict]:
+    """
+    Get available models from agy with caching.
+
+    Returns a list of {"slug": str | None, "display_name": str} records. Use
+    model_selection_value() to get the value to pass to --model.
+    """
     cache_key = "models"
 
     if cache_key in MODELS_CACHE:
@@ -561,12 +671,9 @@ async def get_available_models() -> list[str]:
     try:
         result = await execute_cli(["models"], timeout=30)
         if result["status"] == "success" and result["stdout"]:
-            models = [
-                line.strip()
-                for line in result["stdout"].strip().splitlines()
-                if line.strip()
-            ]
-            MODELS_CACHE[cache_key] = models
+            models = _parse_models_output(result["stdout"])
+            if models:
+                MODELS_CACHE[cache_key] = models
             return models
     except Exception as e:
         logger.warning(f"Failed to fetch models list: {e}")
@@ -583,6 +690,10 @@ async def validate_model(model: Optional[str]) -> dict:
     that via the returncode check, so this pre-validation now serves as an
     additional safety net and metadata enrichment rather than the primary
     detection mechanism.
+
+    Either column of `agy models` is a valid --model value: the stable slug
+    ("gemini-3.1-pro-high", agy >= 1.1.5) or the display name
+    ("Gemini 3.1 Pro (High)"). Both are accepted here, case-insensitively.
 
     Returns a dict that is empty when there is nothing to report, otherwise
     carries a "warning" and/or "model_validation" key to merge into the
@@ -606,25 +717,43 @@ async def validate_model(model: Optional[str]) -> dict:
             )
         }
 
-    # Short names are accepted by agy directly; no discovery call needed.
-    if model.strip().lower() in MODEL_SHORT_NAMES:
-        return {}
+    requested = model.strip().lower()
+
+    # Short names were only ever valid below 1.1.4. At or above that version
+    # they are rejected by agy, so they must fall through to the failure path
+    # below rather than being waved through.
+    if _parse_version(cached_version) < _MIN_FULL_MODEL_NAME_VERSION:
+        if requested in MODEL_SHORT_NAMES:
+            return {}
 
     available = await get_available_models()
     if not available:
         # Discovery failed/empty — don't false-warn on a possibly-valid model.
         return {"model_validation": "unverified"}
 
-    # Case-insensitive: `agy models` emits title-case display names.
-    if model.strip().lower() in {m.strip().lower() for m in available}:
+    # Accept either the slug or the display name, case-insensitively.
+    accepted = {
+        value.strip().lower()
+        for record in available
+        for value in model_accepted_values(record)
+    }
+    if requested in accepted:
         return {}
+
+    hint = ""
+    if requested in MODEL_SHORT_NAMES:
+        hint = (
+            f" Short names like '{model}' were dropped in agy "
+            f"{'.'.join(str(v) for v in _MIN_FULL_MODEL_NAME_VERSION)}; "
+            f"pass a slug or display name from `agy models` instead."
+        )
 
     return {
         "warning": (
-            f"Model '{model}' was not recognized (not a short name "
-            f"{sorted(MODEL_SHORT_NAMES)} and not in `agy models`). "
-            f"agy >= 1.1.2 will hard-fail in print mode; older versions "
-            f"silently fall back to the default model."
+            f"Model '{model}' was not recognized (not in `agy models`, as "
+            f"either a slug or a display name).{hint} agy >= 1.1.2 will "
+            f"hard-fail in print mode; older versions silently fall back to "
+            f"the default model."
         )
     }
 
@@ -645,6 +774,73 @@ def add_model_metadata(result: dict, model_meta: dict) -> dict:
         else:
             result[key] = value
     return result
+
+
+async def run_readonly_slash_command(command: str, timeout: int = 60) -> dict:
+    """
+    Run one of agy's read-only print-mode slash commands and return its payload.
+
+    agy 1.1.11 answers `/usage`, `/quota`, `/credits`, `/model`, `/effort` and
+    `/skills` in print mode *without* starting an agent turn, spending quota, or
+    leaving a conversation behind (verified: empty conversation_id and all-zero
+    usage counters). That makes these safe and cheap to expose.
+
+    On agy >= 1.1.8 the JSON envelope carries a fully structured
+    ``command.data`` payload, which is preferred: it has full-precision values
+    (e.g. remaining_fraction) where the text form rounds to whole percent.
+    Below that, the tab-separated text records are returned instead.
+
+    Args are built directly rather than via _build_cli_args() because these
+    invocations must NOT get --disable-slash-commands (they *are* slash
+    commands), and have no use for --model, --mode or --add-dir.
+
+    Returns:
+        {"status": "success", "data": {...} | None, "records": [[col, ...]], "raw": str}
+        or {"status": "error", "error": str}
+    """
+    cached_version = _get_cached_or_sync_version()
+    version = _parse_version(cached_version) if cached_version else (0, 0, 0)
+    structured = bool(cached_version) and version >= _MIN_COMMAND_JSON_VERSION
+
+    args = ["-p", command]
+    if structured:
+        args.extend(["--output-format", "json"])
+
+    result = await execute_cli(args, timeout=timeout)
+    if result["status"] != "success":
+        return {
+            "status": "error",
+            "error": (result.get("stderr") or result.get("stdout") or "").strip()
+                     or f"'{command}' failed with exit {result.get('return_code')}",
+        }
+
+    raw = result.get("stdout", "") or ""
+    data = None
+    text = raw
+
+    if structured:
+        try:
+            envelope = json.loads(raw)
+        except (ValueError, TypeError):
+            # Don't silently re-run in text mode: fall through to parsing what
+            # we got, and let the caller see the raw payload.
+            logger.warning(f"'{command}' returned unparseable JSON envelope")
+        else:
+            if envelope.get("status") == "ERROR":
+                return {
+                    "status": "error",
+                    "error": envelope.get("error") or f"'{command}' returned ERROR",
+                }
+            data = (envelope.get("command") or {}).get("data")
+            text = envelope.get("response", "") or ""
+
+    records = [
+        line.split("\t")
+        for line in text.strip().splitlines()
+        if line.strip()
+    ]
+
+    return {"status": "success", "data": data, "records": records, "raw": text}
 
 
 async def get_available_agents() -> list[str]:

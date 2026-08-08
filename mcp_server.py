@@ -4,7 +4,7 @@ Antigravity CLI MCP Server
 A production-ready Model Context Protocol (MCP) server that bridges Google's
 Antigravity CLI (agy) with MCP-compatible clients like Claude Code and Claude Desktop.
 
-This server provides 24 specialized tools for seamless AI workflows.
+This server provides 26 specialized tools for seamless AI workflows.
 """
 import sys
 from pathlib import Path
@@ -41,6 +41,9 @@ from modules.utils.cli_utils import (
     get_cli_version,
     get_available_models,
     get_available_agents,
+    model_selection_value,
+    model_accepted_values,
+    run_readonly_slash_command,
     validate_model,
     validate_agent,
     add_model_metadata,
@@ -219,6 +222,7 @@ async def gemini_prompt(
     debug: bool = False,
     readonly: bool = False,
     project: Optional[str] = None,
+    interpret_slash_commands: bool = False,
 ) -> str:
     """
     Send prompts to Antigravity CLI for execution (100,000 char limit).
@@ -230,8 +234,9 @@ async def gemini_prompt(
 
     Args:
         prompt: The prompt to send to Antigravity CLI
-        model: Model to use (full display name required, e.g. "Gemini 3.1 Pro (High)").
-               Defaults to agy's default. See gemini_models() for the full list.
+        model: Model to use (slug or display name, e.g. "gemini-3.1-pro-high"
+               or "Gemini 3.1 Pro (High)"). Defaults to agy's default.
+               See gemini_models() for the full list.
         agent: Custom agent to use (agy >= 1.1.1). See gemini_agents() for
                available agents. Omit to use the default agent.
         sandbox: Whether to run in sandbox mode
@@ -240,6 +245,12 @@ async def gemini_prompt(
                   create, modify, or delete any files. Use for brainstorming,
                   analysis, opinions, and planning tasks.
         project: Project ID for session isolation (agy >= 1.0.12).
+        interpret_slash_commands: When False (default) the prompt is sent to the
+                  model verbatim, even if it begins with "/". Set True to let
+                  agy expand its own slash commands and skills (agy >= 1.1.9),
+                  e.g. prompt="/antigravity-guide explain customizations". Note
+                  that with this enabled, an interactive-only command such as
+                  "/clear" will fail instead of reaching the model.
 
     Returns:
         JSON string with the response
@@ -247,7 +258,7 @@ async def gemini_prompt(
     Examples:
         gemini_prompt(prompt="Explain quantum computing")
         gemini_prompt(prompt="Analyze @src/auth.py", readonly=True)
-        gemini_prompt(prompt="Complex analysis", model="Gemini 3.1 Pro (High)")
+        gemini_prompt(prompt="Complex analysis", model="gemini-3.1-pro-high")
     """
     if readonly:
         prompt = (
@@ -275,6 +286,7 @@ async def gemini_prompt(
         model=effective_model,
         agent=agent,
         project=project,
+        interpret_slash_commands=interpret_slash_commands,
     )
 
     try:
@@ -319,28 +331,36 @@ async def gemini_models() -> str:
         return json.dumps({
             "status": "success",
             "models": [],
-            "note": "Could not fetch models list. Try full display names "
-                    "like 'Gemini 3.5 Flash (Medium)' or 'Gemini 3.1 Pro (High)'."
+            "note": "Could not fetch models list. Try a slug like "
+                    "'gemini-3.1-pro-high' or a display name like "
+                    "'Gemini 3.1 Pro (High)'. Run `agy models` for the live list."
         }, indent=2)
 
     categorized = []
-    for m in models:
-        lower = m.lower()
-        if "gemini" in lower:
-            category = "primary"
-        else:
-            category = "alternative"
-        categorized.append({"name": m, "category": category})
+    for record in models:
+        display = record.get("display_name") or ""
+        categorized.append({
+            # The exact string to pass as the `model` parameter. Named "model"
+            # rather than "name" so a caller copying a field verbatim copies a
+            # value agy actually accepts, and copies the stable slug over the
+            # release-dependent display name.
+            "model": model_selection_value(record),
+            "display_name": display,
+            "accepted_values": model_accepted_values(record),
+            "category": "primary" if "gemini" in display.lower() else "alternative",
+        })
 
     from modules.config.cli_config import TASK_MODEL_DEFAULTS
     return json.dumps({
         "status": "success",
         "models": categorized,
         "guidance": (
-            "Use full display names from the models list above (e.g. "
-            "'Gemini 3.1 Pro (High)' for complex reasoning, "
-            "'Gemini 3.5 Flash (Medium)' for fast responses). "
-            "Short names (pro/flash/claude) are no longer accepted as of agy 1.1.4."
+            "Pass the exact `model` value from the list above. Both the slug "
+            "(e.g. 'gemini-3.1-pro-high') and the display name (e.g. "
+            "'Gemini 3.1 Pro (High)') are accepted, but slugs are stable across "
+            "agy releases and are preferred. Short names (pro/flash/claude) were "
+            "dropped in agy 1.1.4 and will hard-fail. Pro tiers are High and Low "
+            "only; Flash offers High, Medium and Low."
         ),
         "task_defaults": {
             k: v or "(agy default)"
@@ -421,7 +441,7 @@ async def gemini_metrics() -> str:
             "security_stats": security_stats,
             "server_info": {
                 "name": "gemini-cli-mcp-server",
-                "tools_available": 24,
+                "tools_available": 26,
                 "python_version": os.sys.version
             }
         }, indent=2)
@@ -444,15 +464,23 @@ async def gemini_sandbox(
     model: Optional[str] = None,
     agent: Optional[str] = None,
     project: Optional[str] = None,
+    interpret_slash_commands: bool = False,
 ) -> str:
     """
     Execute prompts in sandbox mode for code execution (200,000 char limit).
 
+    Note: --sandbox restricts terminal commands, NOT the filesystem. This tool
+    can still create or modify files anywhere. Do not treat it as a jail.
+
     Args:
         prompt: The prompt to execute in sandbox mode
-        model: Model to use (full display name required). Defaults to agy's default.
+        model: Model to use (slug or display name, e.g. "gemini-3.1-pro-high").
+               Defaults to agy's default. See gemini_models().
         agent: Custom agent to use (agy >= 1.1.1). See gemini_agents().
         project: Project ID for session isolation (agy >= 1.0.12).
+        interpret_slash_commands: When False (default) the prompt is sent
+                  verbatim, even if it begins with "/". Set True to let agy
+                  expand its own slash commands and skills (agy >= 1.1.9).
 
     Returns:
         JSON string with execution results
@@ -478,6 +506,7 @@ async def gemini_sandbox(
         model=effective_model,
         agent=agent,
         project=project,
+        interpret_slash_commands=interpret_slash_commands,
     )
 
     try:
@@ -553,6 +582,131 @@ async def gemini_rate_limiting_stats() -> str:
     }, indent=2)
 
 
+@mcp.tool()
+async def gemini_usage() -> str:
+    """
+    Show remaining Gemini/Claude/GPT model quota for the signed-in account.
+
+    Reports the weekly and 5-hour limit remaining for each model group. Free to
+    call: agy answers this without starting an agent turn, so it consumes no
+    quota and creates no conversation. Requires agy >= 1.1.11.
+
+    Returns:
+        JSON with per-group quota buckets (window, remaining percent, reset time).
+
+    Examples:
+        gemini_usage()
+    """
+    from modules.utils.cli_utils import USAGE_CACHE
+
+    if "usage" in USAGE_CACHE:
+        return USAGE_CACHE["usage"]
+
+    try:
+        result = await run_readonly_slash_command("/usage")
+    except CLIExecutionError as e:
+        return json.dumps({
+            "status": "error", "error": str(e), "error_code": "USAGE_FAILED",
+        })
+
+    if result["status"] != "success":
+        return json.dumps({
+            "status": "error",
+            "error": result.get("error", "Failed to read usage"),
+            "error_code": "USAGE_FAILED",
+            "note": "Requires agy >= 1.1.11 for print-mode /usage support.",
+        })
+
+    groups = []
+    data = result.get("data") or {}
+    for group in data.get("groups", []):
+        groups.append({
+            "group": group.get("name"),
+            "models": group.get("description"),
+            "buckets": [
+                {
+                    "window": b.get("window"),
+                    "remaining_percent": (
+                        round(b["remaining_fraction"] * 100, 2)
+                        if isinstance(b.get("remaining_fraction"), (int, float))
+                        else None
+                    ),
+                    "resets_at": b.get("reset_time"),
+                    "detail": b.get("description"),
+                }
+                for b in group.get("buckets", [])
+            ],
+        })
+
+    payload = {"status": "success", "groups": groups}
+    if not groups:
+        # agy < 1.1.8 has no structured payload; hand back the text records.
+        payload["records"] = result.get("records", [])
+    payload["notes"] = (
+        "Quota is consumed proportionally to token cost. This read is free and "
+        "does not itself consume quota."
+    )
+
+    encoded = json.dumps(payload, indent=2)
+    USAGE_CACHE["usage"] = encoded
+    return encoded
+
+
+@mcp.tool()
+async def gemini_credits() -> str:
+    """
+    Show the remaining paid G1 credit balance for the signed-in account.
+
+    Free to call: agy answers this without starting an agent turn. Requires
+    agy >= 1.1.11.
+
+    Note: agy inherits the `use_ai_credits` setting from ~/.gemini/settings.json,
+    so once the standard quota is exhausted a headless run can spend paid credits
+    with no CLI flag to prevent it. Check gemini_usage() alongside this to see
+    whether quota is close to exhaustion. This tool only reports; it does not
+    gate any other tool.
+
+    Returns:
+        JSON with remaining_credits and an upgrade URI when applicable.
+
+    Examples:
+        gemini_credits()
+    """
+    from modules.utils.cli_utils import CREDITS_CACHE
+
+    if "credits" in CREDITS_CACHE:
+        return CREDITS_CACHE["credits"]
+
+    try:
+        result = await run_readonly_slash_command("/credits")
+    except CLIExecutionError as e:
+        return json.dumps({
+            "status": "error", "error": str(e), "error_code": "CREDITS_FAILED",
+        })
+
+    if result["status"] != "success":
+        return json.dumps({
+            "status": "error",
+            "error": result.get("error", "Failed to read credits"),
+            "error_code": "CREDITS_FAILED",
+            "note": "Requires agy >= 1.1.11 for print-mode /credits support.",
+        })
+
+    data = result.get("data") or {}
+    payload = {"status": "success"}
+    if "remaining_credits" in data:
+        payload["remaining_credits"] = data["remaining_credits"]
+        if data.get("upgrade_uri"):
+            payload["upgrade_uri"] = data["upgrade_uri"]
+    else:
+        # agy < 1.1.8: no structured payload, return the text records.
+        payload["records"] = result.get("records", [])
+
+    encoded = json.dumps(payload, indent=2)
+    CREDITS_CACHE["credits"] = encoded
+    return encoded
+
+
 # ============================================================================
 # PHASE 4: Analysis Tools
 # ============================================================================
@@ -569,7 +723,7 @@ async def gemini_summarize(
     Args:
         content: Content to summarize (supports @filename syntax)
         focus: Optional focus area (e.g., "architecture and design patterns")
-        model: Model to use (full display name, e.g. "Gemini 3.1 Pro (High)").
+        model: Model to use (slug or display name, e.g. "gemini-3.1-pro-high").
                Defaults to agy's default.
 
     Returns:
@@ -622,7 +776,7 @@ async def gemini_summarize_files(
     Args:
         files: Files to summarize using @filename syntax (e.g., "@src/ @docs/")
         focus: Optional focus area for analysis
-        model: Model to use (full display name, e.g. "Gemini 3.1 Pro (High)").
+        model: Model to use (slug or display name, e.g. "gemini-3.1-pro-high").
                Defaults to agy's default.
 
     Returns:
@@ -676,8 +830,8 @@ async def gemini_eval_plan(
         plan: The plan, idea, or proposal to evaluate
         context: Optional context (e.g., "Node.js REST API with MongoDB")
         requirements: Optional requirements or constraints
-        model: Model to use (full display name, e.g. "Gemini 3.5 Flash (Medium)").
-               Defaults to "Gemini 3.1 Pro (High)".
+        model: Model to use (slug or display name, e.g. "gemini-3.6-flash-medium").
+               Defaults to "gemini-3.1-pro-high".
 
     Returns:
         JSON string with evaluation results
@@ -747,8 +901,8 @@ async def gemini_review_code(
         purpose: Purpose of the review (e.g., "Security review")
         context: Additional context
         language: Programming language
-        model: Model to use (full display name, e.g. "Gemini 3.1 Pro (High)").
-               Defaults to "Gemini 3.1 Pro (High)".
+        model: Model to use (slug or display name, e.g. "gemini-3.1-pro-high").
+               Defaults to "gemini-3.1-pro-high".
 
     Returns:
         JSON string with review results
@@ -818,8 +972,8 @@ async def gemini_verify_solution(
         requirements: Original requirements
         test_criteria: Testing and performance criteria
         context: Deployment context
-        model: Model to use (full display name, e.g. "Gemini 3.1 Pro (High)").
-               Defaults to "Gemini 3.1 Pro (High)".
+        model: Model to use (slug or display name, e.g. "gemini-3.1-pro-high").
+               Defaults to "gemini-3.1-pro-high".
 
     Returns:
         JSON string with verification results
@@ -1103,8 +1257,8 @@ async def gemini_code_review(
         focus_areas: Comma-separated focus areas (security,performance,quality,best_practices)
         severity_threshold: Minimum severity to report (info, warning, error, critical)
         output_format: Output format (structured, markdown, json)
-        model: Model to use (full display name, e.g. "Gemini 3.1 Pro (High)").
-               Defaults to "Gemini 3.1 Pro (High)".
+        model: Model to use (slug or display name, e.g. "gemini-3.1-pro-high").
+               Defaults to "gemini-3.1-pro-high".
 
     Returns:
         JSON with structured code review
@@ -1156,8 +1310,8 @@ async def gemini_extract_structured(
         schema: JSON schema defining the output structure
         examples: Optional examples of expected output
         strict_mode: Whether to enforce strict schema compliance
-        model: Model to use (full display name, e.g. "Gemini 3.1 Pro (High)").
-               Defaults to "Gemini 3.1 Pro (High)".
+        model: Model to use (slug or display name, e.g. "gemini-3.1-pro-high").
+               Defaults to "gemini-3.1-pro-high".
 
     Returns:
         JSON with extracted structured data
@@ -1213,8 +1367,8 @@ async def gemini_git_diff_review(
         review_type: Review type (comprehensive, security_only, performance_only, quick)
         base_branch: Base branch for context
         commit_message: Associated commit message
-        model: Model to use (full display name, e.g. "Gemini 3.1 Pro (High)").
-               Defaults to "Gemini 3.1 Pro (High)".
+        model: Model to use (slug or display name, e.g. "gemini-3.1-pro-high").
+               Defaults to "gemini-3.1-pro-high".
 
     Returns:
         JSON with diff analysis
@@ -1276,8 +1430,8 @@ async def gemini_content_comparison(
         output_format: Output format (structured, matrix, summary, detailed, json)
         include_metrics: Include similarity scores and metrics
         focus_areas: Comma-separated focus areas
-        model: Model to use (full display name, e.g. "Gemini 3.1 Pro (High)").
-               Defaults to "Gemini 3.1 Pro (High)".
+        model: Model to use (slug or display name, e.g. "gemini-3.1-pro-high").
+               Defaults to "gemini-3.1-pro-high".
 
     Returns:
         JSON with comparison results
@@ -1345,8 +1499,8 @@ async def gemini_ai_collaboration(
     Args:
         collaboration_mode: Mode (sequential, debate, validation)
         content: Content to analyze
-        models: Comma-separated model list using full display names
-               (e.g., "Gemini 3.1 Pro (High),Gemini 3.5 Flash (Medium)")
+        models: Comma-separated model list using slugs or display names
+               (e.g., "gemini-3.1-pro-high,gemini-3.6-flash-medium")
         context: Additional context
         conversation_id: For stateful conversations
         budget_limit: Deprecated (agy does not support cost budgeting)
@@ -1390,7 +1544,7 @@ async def gemini_ai_collaboration(
             focus=focus
         )
     except ImportError:
-        model_list = (models or "Gemini 3.5 Flash (Medium)").split(",")
+        model_list = (models or "gemini-3.6-flash-medium").split(",")
         results = []
 
         for m in model_list:

@@ -1,12 +1,13 @@
 # Antigravity CLI MCP Server
 
-A Model Context Protocol (MCP) server that bridges Google's **Antigravity CLI** (`agy`) with MCP-compatible clients like Claude Code and Claude Desktop. It provides 24 specialized tools for AI-assisted workflows.
+A Model Context Protocol (MCP) server that bridges Google's **Antigravity CLI** (`agy`) with MCP-compatible clients like Claude Code and Claude Desktop. It provides 26 specialized tools for AI-assisted workflows.
 
 > Forked from [centminmod/gemini-cli-mcp-server](https://github.com/centminmod/gemini-cli-mcp-server). Refactored from the deprecated Google Gemini CLI to use **Antigravity CLI** (`agy`). Tool names retain the `gemini_` prefix for backward compatibility.
 
 ## 🚀 Key Features
 
-- **24 Specialized MCP Tools** - Complete toolset for AI-assisted workflows across 5 tool categories
+- **26 Specialized MCP Tools** - Complete toolset for AI-assisted workflows across 5 tool categories
+- **Free Quota & Credit Visibility** - `gemini_usage` / `gemini_credits` read account limits without spending quota
 - **4 MCP Resources** - Read-only repository access (tree, file, search, grep) without AI invocation
 - **Antigravity CLI Integration** - Direct bridge to Google's `agy` CLI with native conversation support
 - **Enterprise Architecture** - Refactored modular design with specialized modules
@@ -96,7 +97,7 @@ The Gemini CLI MCP Server features a modular, enterprise-grade architecture desi
 
 ## 🛠️ Tool Suite
 
-The server provides 24 specialized MCP tools and 4 read-only MCP resources:
+The server provides 26 specialized MCP tools and 4 read-only MCP resources:
 
 ### MCP Resources (Read-Only Repository Access)
 
@@ -162,7 +163,7 @@ Get comprehensive server performance metrics and statistics.
 gemini_metrics()
 ```
 
-### System Tools (3)
+### System Tools (5)
 
 #### `gemini_sandbox`
 Execute prompts in sandbox mode for code execution (200,000 char limit).
@@ -172,6 +173,8 @@ gemini_sandbox(
 )
 ```
 
+> **Note:** `--sandbox` restricts terminal commands, **not** the filesystem. Because the server always passes `--dangerously-skip-permissions`, a sandbox run can still create or modify files anywhere. Do not treat it as a filesystem jail.
+
 #### `gemini_cache_stats`
 Get cache statistics for all cache backends.
 ```python
@@ -179,10 +182,37 @@ gemini_cache_stats()
 ```
 
 #### `gemini_rate_limiting_stats`
-Get comprehensive rate limiting and quota statistics.
+Get server-side rate limiting counters (retries, fallbacks, success rate).
 ```python
 gemini_rate_limiting_stats()
 ```
+
+#### `gemini_usage`
+Show the account's remaining model quota — weekly and 5-hour windows per model group (requires agy >= 1.1.11). **Free to call:** agy answers this without starting an agent turn, so it consumes no quota and leaves no conversation behind. Cached for 60s.
+```python
+gemini_usage()
+```
+```json
+{
+  "status": "success",
+  "groups": [{
+    "group": "Gemini Models",
+    "models": "Models within this group: Gemini Flash, Gemini Pro",
+    "buckets": [
+      {"window": "weekly", "remaining_percent": 99.19, "resets_at": "2026-08-15T13:19:11Z"},
+      {"window": "5h", "remaining_percent": 95.16, "resets_at": "2026-08-08T18:19:11Z"}
+    ]
+  }]
+}
+```
+
+#### `gemini_credits`
+Show the remaining paid **G1 credit** balance (requires agy >= 1.1.11). Also free to call; cached for 5 minutes.
+```python
+gemini_credits()
+```
+
+> **Why this matters:** agy inherits the `use_ai_credits` setting from `~/.gemini/settings.json`, so once the standard quota is exhausted a headless MCP server can silently spend paid credits — there is no CLI flag or env var to pin this. These two tools make that state visible. They **report only** and never gate another tool: quota state is race-prone and window-specific, and a remaining-credit figure does not tell you whether credit fallback is even enabled, so a heuristic block would give a false sense of billing safety.
 
 ### Analysis Tools (5)
 
@@ -394,7 +424,7 @@ gemini_ai_collaboration(
 **Universal Parameters:**
 - **`collaboration_mode`** (required): `sequential` | `debate` | `validation`
 - **`content`** (required): Content to be analyzed/processed
-- **`models`** (optional): Comma-separated list of AI models (e.g., "Gemini 3.1 Pro (High),Gemini 3.5 Flash (Medium)" for diverse debate; auto-selected if not provided)
+- **`models`** (optional): Comma-separated list of AI models (e.g., "gemini-3.1-pro-high,gemini-3.6-flash-medium" for diverse debate; auto-selected if not provided)
 - **`context`** (optional): Additional context for collaboration
 - **`conversation_id`** (optional): For stateful conversation history
 
@@ -858,9 +888,46 @@ Each tool has optimized character limits based on typical use cases:
 
 ### Model Selection
 
-The `model` parameter on all tools is passed through to `agy --model` (requires agy >= 1.0.5). **As of agy 1.1.4, only full display names are accepted** (e.g. `"Gemini 3.1 Pro (High)"`, `"Gemini 3.5 Flash (Medium)"`). Short names (`pro`/`flash`/`claude`) were dropped. Complex tools (eval_plan, review_code, verify_solution, code_review, extract_structured, git_diff_review, content_comparison) default to `"Gemini 3.1 Pro (High)"` for deeper reasoning; lightweight tools let agy decide (Flash). Use `gemini_models()` to list all available models. Per-task defaults can be overridden via `CLI_MODEL_{TASK}` / `GEMINI_MODEL_{TASK}` environment variables.
+The `model` parameter on all tools is passed through to `agy --model` (requires agy >= 1.0.5).
+
+Since agy 1.1.5, `agy models` reports **two accepted forms per model** and either may be passed:
+
+| Form | Example | Notes |
+|------|---------|-------|
+| Stable slug | `gemini-3.1-pro-high` | **Preferred** — documented as stable across releases |
+| Display name | `Gemini 3.1 Pro (High)` | Tracks marketing labels, can change |
+
+Short names (`pro`/`flash`/`claude`) were dropped in agy 1.1.4 and now hard-fail with an error listing the valid names.
+
+Current roster (run `gemini_models()` or `agy models` for the live list): Gemini 3.6 Flash (High/Medium/Low), Gemini 3.5 Flash (High/Medium/Low), Gemini 3.1 Pro (**High/Low only — no Medium tier**), Claude Sonnet 4.6 (Thinking), Claude Opus 4.6 (Thinking), GPT-OSS 120B (Medium).
+
+Complex tools (eval_plan, review_code, verify_solution, code_review, extract_structured, git_diff_review, content_comparison) default to `gemini-3.1-pro-high` for deeper reasoning; lightweight tools let agy decide. Per-task defaults can be overridden via `CLI_MODEL_{TASK}` / `GEMINI_MODEL_{TASK}` environment variables.
+
+> **Version caveat:** agy 1.1.10 fixed `--model` (and `--effort`) being *silently ignored* in headless `-p` runs. On agy 1.1.4–1.1.9 a passed model may never have been applied.
 
 The server ensures agy always runs with its own isolated backend by unsetting `ANTIGRAVITY_LS_ADDRESS`, preventing interference from any IDE language server running in the same environment.
+
+### Slash Command Handling
+
+agy 1.1.9 began expanding slash commands and skills in print mode, and 1.1.11 made the interactive-only ones hard-fail there:
+
+```
+$ agy -p "/clear"
+Error: /clear is not available in print mode (...); pass --disable-slash-commands to send /clear to the model as literal text
+```
+
+Because this server relays arbitrary caller-supplied prompt text, **prompts are sent verbatim by default**: `--disable-slash-commands` is passed on agy >= 1.1.9 so a prompt that merely begins with `/` is never silently reinterpreted as a command.
+
+To deliberately invoke one of agy's own skills or commands, opt in on `gemini_prompt` or `gemini_sandbox`:
+
+```python
+gemini_prompt(
+    prompt="/antigravity-guide explain the customization system",
+    interpret_slash_commands=True,
+)
+```
+
+The specialized analysis tools build their own prompts and do not expose this flag. `gemini_cli` remains the raw escape hatch and is unaffected.
 
 ### Conversation History Management
 
@@ -888,7 +955,7 @@ Stateful multi-turn conversations via agy native `.pb` files:
 
 ### @filename Syntax Support
 
-23 of the 24 tools support `@filename` syntax for optimal token efficiency:
+23 of the 26 tools support `@filename` syntax for optimal token efficiency:
 
 ```python
 # Single file
@@ -1118,7 +1185,7 @@ Response from Gemini AI
 **Concurrency**:
 - Async architecture supports 1,000-10,000+ concurrent requests
 - Memory-efficient single-threaded design
-- Non-blocking I/O operations across all 24 tools
+- Non-blocking I/O operations across all 26 tools
 
 **Memory Usage**:
 - Base server: 15-30MB (optimized for enterprise features)
@@ -1162,7 +1229,7 @@ Use the `gemini_metrics` tool to monitor server performance:
 ```
 
 **Key Metrics**:
-- Commands executed and success rate across all 24 tools
+- Commands executed and success rate across all 26 tools
 - Average latency and throughput per tool category
 - Cache hit rates and effectiveness (3 cache types)
 - Error rates and types with detailed classification
@@ -1243,7 +1310,7 @@ python -m pytest tests/ -v -k "not prompt and not sandbox and not lifecycle and 
 **Solutions**:
 1. Wait for rate limit window to reset
 2. Increase limits: `export GEMINI_RATE_LIMIT_REQUESTS=500`
-3. Use faster model: Set `model="Gemini 3.5 Flash (Medium)"` on the tool call
+3. Use faster model: Set `model="gemini-3.6-flash-medium"` on the tool call
 
 #### Large Content Failures
 
