@@ -35,8 +35,15 @@ CREDENTIAL_PATTERNS = [
     (r'token\s*[:=]\s*(?:"[^"]*"|\'[^\']*\'|[^\s"\'\\]+)', 'token=[REDACTED]'),
     (r'api[_-]?key\s*[:=]\s*(?:"[^"]*"|\'[^\']*\'|[^\s"\'\\]+)', 'api_key=[REDACTED]'),
 
-    # Private keys
-    (r'-----BEGIN (RSA |EC |DSA )?PRIVATE KEY-----[\s\S]*?-----END (RSA |EC |DSA )?PRIVATE KEY-----',
+    # Private keys.
+    # The body is length-bounded rather than an open `[\s\S]*?`: with no END
+    # marker present, an unbounded lazy gap rescans to end-of-string from every
+    # BEGIN position, which is quadratic (measured 85ms at 21KB, 1.3s at 84KB,
+    # 5.4s at 168KB). Sanitization is synchronous and runs outside the asyncio
+    # timeout, so a single hostile payload containing repeated BEGIN markers —
+    # no actual key required — would stall the whole server. 16KB comfortably
+    # covers a real PEM key (a 4096-bit RSA key is ~3.2KB).
+    (r'-----BEGIN (RSA |EC |DSA )?PRIVATE KEY-----[\s\S]{0,16384}?-----END (RSA |EC |DSA )?PRIVATE KEY-----',
      '[REDACTED_PRIVATE_KEY]'),
 
     # JWT tokens
@@ -48,6 +55,18 @@ COMPILED_PATTERNS = [
     (re.compile(pattern, re.IGNORECASE), replacement)
     for pattern, replacement in CREDENTIAL_PATTERNS
 ]
+
+# Cheap literal prefilters for patterns whose worst case is expensive. A plain
+# substring scan is O(n) in C; if the anchor is absent the pattern cannot match,
+# so skipping it avoids the regex engine entirely.
+#
+# The private-key pattern needs this even with its bounded body: each BEGIN
+# marker still scans up to the bound looking for an END, so a payload of
+# repeated BEGIN markers (no real key needed) costs marker_count × bound.
+# Requiring "-----END" up front collapses that to a single linear pass.
+PATTERN_PREFILTERS: dict[str, str] = {
+    '[REDACTED_PRIVATE_KEY]': '-----END',
+}
 
 
 class CredentialSanitizer:
@@ -83,6 +102,9 @@ class CredentialSanitizer:
 
         result = content
         for pattern, replacement in self.patterns:
+            prefilter = PATTERN_PREFILTERS.get(replacement)
+            if prefilter and prefilter.lower() not in result.lower():
+                continue
             result = pattern.sub(replacement, result)
 
         return result
@@ -100,7 +122,10 @@ class CredentialSanitizer:
         if not content:
             return False
 
-        for pattern, _ in self.patterns:
+        for pattern, replacement in self.patterns:
+            prefilter = PATTERN_PREFILTERS.get(replacement)
+            if prefilter and prefilter.lower() not in content.lower():
+                continue
             if pattern.search(content):
                 return True
 
@@ -121,6 +146,9 @@ class CredentialSanitizer:
 
         locations = []
         for pattern, replacement in self.patterns:
+            prefilter = PATTERN_PREFILTERS.get(replacement)
+            if prefilter and prefilter.lower() not in content.lower():
+                continue
             for match in pattern.finditer(content):
                 locations.append({
                     "start": match.start(),

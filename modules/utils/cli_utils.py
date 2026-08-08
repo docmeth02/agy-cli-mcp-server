@@ -59,7 +59,6 @@ _MIN_PROJECT_VERSION = (1, 0, 12)  # --project / --new-project
 _MIN_MODE_VERSION = (1, 1, 0)      # --mode
 _MIN_AGENT_VERSION = (1, 1, 1)     # --agent
 _MIN_NO_SLASH_VERSION = (1, 1, 9)  # --disable-slash-commands
-_MIN_COMMAND_JSON_VERSION = (1, 1, 8)  # --output-format json (slash-command payloads)
 # Read-only slash commands (/usage, /quota, /credits, /model, /effort, /skills)
 # are only *answered* in print mode from 1.1.11. Below that agy treats the text
 # as an ordinary prompt: it starts an agent turn, spends quota and creates a
@@ -68,7 +67,10 @@ _MIN_COMMAND_JSON_VERSION = (1, 1, 8)  # --output-format json (slash-command pay
 _MIN_READONLY_SLASH_VERSION = (1, 1, 11)
 _MIN_OUTPUT_FORMAT_VERSION = (1, 1, 8)   # --output-format json|stream-json
 _MIN_JSON_SCHEMA_VERSION = (1, 1, 8)     # --json-schema
-_MIN_EFFORT_VERSION = (1, 1, 5)          # --effort low|medium|high
+# --effort exists from 1.1.5, but agy 1.1.10 fixed it (and --model) being
+# SILENTLY IGNORED in headless -p runs. Gate on 1.1.10 so the flag is only
+# passed where it actually takes effect, rather than appearing to work.
+_MIN_EFFORT_VERSION = (1, 1, 10)
 
 # Reasoning-effort levels accepted by --effort (agy >= 1.1.5).
 EFFORT_LEVELS = ("low", "medium", "high")
@@ -107,8 +109,20 @@ class CLITimeoutError(CLIExecutionError):
 
 
 class CLIRateLimitError(CLIExecutionError):
-    """Raised when rate limits are exceeded."""
-    pass
+    """
+    Raised when rate limits are exceeded.
+
+    ``work_done`` records whether the run had already started doing things before
+    the limit hit, which is what decides whether a retry is safe. It is derived
+    from the JSON envelope's turn/token counters: all-zero means agy refused the
+    request before running anything, so repeating it cannot duplicate work.
+    Defaults to True (assume work happened) whenever that cannot be established —
+    notably on the text transport, which reports no counters.
+    """
+
+    def __init__(self, message: str, work_done: bool = True):
+        super().__init__(message)
+        self.work_done = work_done
 
 
 class CLIProtocolError(CLIExecutionError):
@@ -168,10 +182,55 @@ def _sanitize_tree(value):
     if isinstance(value, str):
         return sanitize_output(value)
     if isinstance(value, dict):
-        return {k: _sanitize_tree(v) for k, v in value.items()}
+        # Keys are sanitized too. The text transport redacted the whole payload
+        # as one string, so a credential appearing as a *key* — e.g. a schema
+        # with additionalProperties producing {"AIza...": "found"} — was covered.
+        # Sanitizing only values would silently reopen that position.
+        # Two distinct keys can collapse to the same redaction placeholder and
+        # lose an entry; that is acceptable on a redaction path.
+        return {
+            (sanitize_output(k) if isinstance(k, str) else k): _sanitize_tree(v)
+            for k, v in value.items()
+        }
     if isinstance(value, list):
         return [_sanitize_tree(v) for v in value]
     return value
+
+
+def _extract_json_envelope(raw: str):
+    """
+    Parse agy's JSON envelope, tolerating surrounding diagnostic noise.
+
+    A strict json.loads() of the whole stream makes one stray stdout byte a fatal
+    failure for every call. That is a realistic risk rather than a theoretical
+    one: CLI_LOG_FILE is unset by default, and the config that introduces it
+    documents that agy writes language-server startup messages, warnings and
+    update checks — which land on stdout when no log file is configured.
+
+    Strategy: try the whole string first (the normal case, and the only one that
+    can validate a trailing-garbage-free stream). If that fails, decode one
+    complete JSON value starting at the first '{'. Deliberately anchored to the
+    first brace and requiring one *complete* value, rather than hunting for the
+    last line that looks like JSON — that would hide genuine corruption.
+
+    Raises:
+        ValueError / TypeError / RecursionError: nothing parseable was found.
+    """
+    try:
+        return json.loads(raw)
+    except (ValueError, TypeError):
+        pass
+
+    start = raw.find("{")
+    if start == -1:
+        raise ValueError("no JSON object found in agy stdout")
+
+    envelope, _end = json.JSONDecoder().raw_decode(raw, start)
+    logger.warning(
+        "agy stdout carried non-JSON noise around the envelope; recovered the "
+        "envelope. Set CLI_LOG_FILE to route agy diagnostics off stdout."
+    )
+    return envelope
 
 
 def _adapt_json_envelope(
@@ -224,6 +283,8 @@ def _adapt_json_envelope(
         ("num_turns", "num_turns"),
         ("duration_seconds", "agy_duration_seconds"),
         ("structured_output", "structured_output"),
+        # Read-only slash commands (/usage, /credits, ...) answer here.
+        ("command", "command"),
     ):
         if envelope.get(src) not in (None, "", {}):
             result[dest] = envelope[src]
@@ -621,7 +682,15 @@ def _apply_print_runtime_flags(
     # how gemini_cli keeps control of its own output shape), and report back
     # which transport is in force so execute_cli parses the right way.
     if _has("--output-format"):
-        transport = "explicit"
+        chosen = None
+        for i, a in enumerate(flag_tokens):
+            if a == "--output-format" and i + 1 < len(flag_tokens):
+                chosen = flag_tokens[i + 1]
+            elif a.startswith("--output-format="):
+                chosen = a.split("=", 1)[1]
+        # A caller-requested json envelope still gets parsed properly. Anything
+        # else (text, stream-json) keeps the raw text path.
+        transport = "json" if (chosen or "").strip().lower() == "json" else "explicit"
     else:
         cached_version = _get_cached_or_sync_version()
         transport = resolve_output_format(
@@ -706,28 +775,36 @@ async def execute_cli(
             stderr.decode("utf-8", errors="replace") if stderr else ""
         )
 
-        # Rate limiting is checked before transport parsing: on the JSON path a
-        # rate-limit failure still surfaces on stderr, and raising here keeps the
-        # retry semantics identical across both transports.
-        if _is_print_invocation(args) and _is_rate_limit_signal(stderr_str):
-            METRICS["rate_limit_hits"] += 1
-            _record_security_event("rate_limit", "medium", "execute_cli",
-                                   {"detail": stderr_str[:500]})
-            raise CLIRateLimitError(f"Rate limit exceeded: {stderr_str}")
+        # Whether the run had begun doing work before failing. Unknowable on the
+        # text transport, so assumed True there; the JSON envelope's turn/token
+        # counters settle it. This is what makes a retry decision safe rather
+        # than a guess (see CLIRateLimitError).
+        work_done = True
+        envelope = None
+
+        rate_limit_text = stderr_str
 
         if transport == "json":
             # Parse BEFORE sanitizing: the credential regexes can consume a JSON
             # escape and leave the envelope unparseable, so the sanitizer runs
             # over the decoded leaves instead (see _adapt_json_envelope).
             try:
-                envelope = json.loads(raw_stdout)
-            except (ValueError, TypeError) as e:
+                envelope = _extract_json_envelope(raw_stdout)
+            except (ValueError, TypeError, RecursionError) as e:
+                # RecursionError included: a deeply nested payload fails inside
+                # json.loads with a RuntimeError subclass, which would otherwise
+                # escape as a generic execution failure and break the documented
+                # "unparseable envelope => CLIProtocolError" contract.
                 METRICS["commands_failed"] += 1
                 # No text-mode fallback: having asked for JSON, exit 0 proves
                 # nothing, and re-running could spend quota or repeat file edits.
+                # Include a bounded excerpt of what actually arrived — without it
+                # an outage caused by stray stdout noise is undiagnosable from
+                # the tool response alone.
                 raise CLIProtocolError(
                     f"agy returned an unparseable JSON envelope "
                     f"(exit {process.returncode}): {e}. "
+                    f"stdout excerpt: {sanitize_output(raw_stdout)[:500]!r}. "
                     f"stderr: {stderr_str[:500]}"
                 )
             if not isinstance(envelope, dict):
@@ -737,9 +814,42 @@ async def execute_cli(
                     f"({type(envelope).__name__}) in place of an envelope."
                 )
 
-            result = _adapt_json_envelope(
-                envelope, process.returncode, execution_time, stderr_str
+            usage = envelope.get("usage")
+            spent = (usage or {}).get("total_tokens") if isinstance(usage, dict) else None
+            turns = envelope.get("num_turns")
+            work_done = bool(turns) or bool(spent)
+
+            # In JSON mode agy leaves stderr EMPTY and puts the reason in the
+            # envelope (verified: an invalid --model gives exit 1, a 676-byte
+            # envelope and 0 bytes of stderr). Scanning stderr alone would make
+            # rate-limit detection — and therefore the whole retry policy —
+            # unreachable on the default transport.
+            envelope_error = envelope.get("error")
+            if isinstance(envelope_error, str):
+                rate_limit_text = f"{stderr_str}\n{envelope_error}"
+
+        if _is_print_invocation(args) and _is_rate_limit_signal(rate_limit_text):
+            METRICS["rate_limit_hits"] += 1
+            _record_security_event("rate_limit", "medium", "execute_cli",
+                                   {"detail": rate_limit_text[:500],
+                                    "work_done": work_done})
+            raise CLIRateLimitError(
+                f"Rate limit exceeded: {rate_limit_text.strip()}",
+                work_done=work_done,
             )
+
+        if envelope is not None:
+            try:
+                result = _adapt_json_envelope(
+                    envelope, process.returncode, execution_time, stderr_str
+                )
+            except RecursionError as e:
+                # _sanitize_tree recurses, and fails at roughly half the depth
+                # json.loads tolerates (comprehensions add frames).
+                METRICS["commands_failed"] += 1
+                raise CLIProtocolError(
+                    f"agy's JSON envelope is nested too deeply to process: {e}"
+                )
             if result["status"] == "success":
                 METRICS["commands_succeeded"] += 1
             else:
@@ -820,16 +930,25 @@ async def execute_cli_with_retry(
     (a blind re-run rarely succeeds and would multiply the per-task budget), and
     non-transient execution errors are not retried.
 
-    Retry policy is invocation-aware, because a whole-process retry re-runs the
-    *entire* agent turn. agy allows hundreds of tool calls per run, so a rate
-    limit hit partway through may leave commands already executed and files
-    already edited; repeating that is worse than surfacing the failure.
+    A whole-process retry re-runs the *entire* agent turn, and agy allows
+    hundreds of tool calls per run — so a rate limit hit partway through may
+    leave commands already executed and files already edited. Repeating that is
+    worse than surfacing the failure.
 
-      mutating=True  (default): no automatic retry. Safe for anything that can
-                     write files or run commands.
-      mutating=False: up to `max_attempts` retries. Only for invocations that
-                     cannot change state — discovery reads and analysis whose
-                     prompt forbids modification.
+    Two conditions must therefore both hold to retry:
+
+      1. ``mutating=False`` — the caller's declared intent. Note this is intent
+         only: nothing at the agy level enforces read-only. `--mode plan` was
+         tested and does NOT prevent writes when combined with
+         `--dangerously-skip-permissions` (it created a file), exactly like
+         `--sandbox` not being a filesystem jail. So intent alone is not enough.
+      2. The failed run provably did no work — `CLIRateLimitError.work_done` is
+         False, meaning the envelope reported zero turns and zero tokens, i.e.
+         agy refused the request before running anything. Unknowable on the text
+         transport, which therefore never retries.
+
+    Condition 2 is what makes this safe: a rate limit that arrives before any
+    work can be retried freely, and one that arrives mid-run never is.
 
     CLIProtocolError is never retried: once JSON was requested, a failed parse
     means the run's outcome is unknown, and re-running could double-apply it.
@@ -837,8 +956,8 @@ async def execute_cli_with_retry(
     Args:
         args: Command line arguments for agy
         timeout: Optional timeout in seconds
-        max_attempts: Maximum attempts for retryable invocations
-        mutating: Whether this invocation can change state (see above)
+        max_attempts: Maximum attempts when retrying is permitted
+        mutating: Whether this invocation is intended to change state
 
     Returns:
         Dictionary with execution results
@@ -852,6 +971,12 @@ async def execute_cli_with_retry(
 
         except CLIRateLimitError as e:
             last_error = e
+            if getattr(e, "work_done", True):
+                logger.warning(
+                    "Rate limit hit after the run had already started work; "
+                    "not retrying, because re-running would repeat it."
+                )
+                break
             if attempt < max_attempts:
                 delay = min(
                     RETRY_BASE_DELAY * (2 ** (attempt - 1)),
@@ -1111,7 +1236,11 @@ async def validate_effort(effort: Optional[str], model: Optional[str] = None) ->
     if model:
         slug = model.strip().lower()
         for other in EFFORT_LEVELS:
-            if other != level and slug.endswith(f"-{other}"):
+            # Matches both forms agy accepts: the slug suffix
+            # ("gemini-3.1-pro-low") and the display-name tier ("... (Low)").
+            if other != level and (
+                slug.endswith(f"-{other}") or slug.endswith(f"({other})")
+            ):
                 return {
                     "warning": (
                         f"model '{model}' already pins effort '{other}' but "
@@ -1189,57 +1318,31 @@ async def run_readonly_slash_command(command: str, timeout: int = 60) -> dict:
         }
 
     # Unconditional: _MIN_READONLY_SLASH_VERSION (1.1.11) already exceeds
-    # _MIN_COMMAND_JSON_VERSION (1.1.8), so anything past the gate above
+    # _MIN_OUTPUT_FORMAT_VERSION (1.1.8), so anything past the gate above
     # supports the JSON envelope.
     args = ["-p", command, "--output-format", "json"]
 
-    result = await execute_cli(args, timeout=timeout)
-    if result["status"] != "success":
-        return {
-            "status": "error",
-            "error": (result.get("stderr") or result.get("stdout") or "").strip()
-                     or f"'{command}' failed with exit {result.get('return_code')}",
-            "error_code": "COMMAND_FAILED",
-        }
-
-    raw = result.get("stdout", "") or ""
-
+    # execute_cli recognises the explicitly requested json format and returns an
+    # adapted, already-sanitized result. Consuming that rather than re-parsing
+    # result["stdout"] matters: on the text path stdout would have been regexed
+    # as raw JSON before parsing — precisely the ordering the JSON transport
+    # exists to avoid, since a substitution can eat an escape character.
     try:
-        envelope = json.loads(raw)
-    except (ValueError, TypeError):
-        # Never fall through to "success" on an unparseable envelope: we asked
-        # for JSON, so exit 0 no longer proves anything, and handing back
-        # line-split raw text would look like a real reading.
-        logger.warning(f"'{command}' returned an unparseable JSON envelope")
+        result = await execute_cli(args, timeout=timeout)
+    except CLIProtocolError as e:
+        logger.warning(f"'{command}' returned an unusable JSON envelope: {e}")
         return {
             "status": "error",
             "error": f"'{command}' returned an unparseable JSON envelope",
             "error_code": "MALFORMED_ENVELOPE",
         }
 
-    # `null`, `[]`, `123` and `"str"` are all valid JSON but not an envelope.
-    # Without this the .get() calls below raise AttributeError, which escapes
-    # the tool and bypasses the whole error-code contract.
-    if not isinstance(envelope, dict):
-        logger.warning(f"'{command}' returned a non-object JSON root")
+    if result["status"] != "success":
         return {
             "status": "error",
-            "error": (
-                f"'{command}' returned a non-object JSON root "
-                f"({type(envelope).__name__})"
-            ),
-            "error_code": "MALFORMED_ENVELOPE",
-        }
-
-    # Anything that is not an explicit SUCCESS is a failure. Checking only for
-    # == "ERROR" would let an unknown future status through as success.
-    if envelope.get("status") != "SUCCESS":
-        return {
-            "status": "error",
-            "error": (
-                envelope.get("error")
-                or f"'{command}' returned status {envelope.get('status')!r}"
-            ),
+            "error": (result.get("error") or result.get("stderr")
+                      or result.get("stdout") or "").strip()
+                     or f"'{command}' failed with exit {result.get('return_code')}",
             "error_code": "COMMAND_FAILED",
         }
 
@@ -1248,10 +1351,10 @@ async def run_readonly_slash_command(command: str, timeout: int = 60) -> dict:
     # turn/token counters are non-zero. Treat that as a failure: it means this
     # agy does not answer the command, and reporting success would present model
     # prose as a quota reading.
-    usage = envelope.get("usage") or {}
-    spent = usage.get("total_tokens") or 0
-    turns = envelope.get("num_turns") or 0
-    if "command" not in envelope or turns or spent:
+    usage = result.get("usage")
+    spent = (usage.get("total_tokens") or 0) if isinstance(usage, dict) else 0
+    turns = result.get("num_turns") or 0
+    if "command" not in result or turns or spent:
         return {
             "status": "error",
             "error": (
@@ -1262,8 +1365,9 @@ async def run_readonly_slash_command(command: str, timeout: int = 60) -> dict:
             "error_code": "NOT_A_COMMAND",
         }
 
-    data = (envelope.get("command") or {}).get("data")
-    text = envelope.get("response", "") or ""
+    payload = result.get("command")
+    data = payload.get("data") if isinstance(payload, dict) else None
+    text = result.get("stdout", "") or ""
 
     records = [
         line.split("\t")

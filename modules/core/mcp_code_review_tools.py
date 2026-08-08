@@ -163,7 +163,9 @@ async def execute_extract_structured(
     except ImportError:
         strict_text = " Strictly follow the schema." if strict_mode else ""
         example_text = f"\n\nExamples:\n{examples}" if examples else ""
-        prompt = f"""Extract structured data from the following content according to this schema.{strict_text}
+        prompt = f"""IMPORTANT: This is an analysis-only task. Do NOT create, modify, or delete any files. Do NOT execute any code. Only return the extracted data.
+
+Extract structured data from the following content according to this schema.{strict_text}
 
 Schema:
 {schema}{example_text}
@@ -180,18 +182,22 @@ Return valid JSON matching the schema."""
     # instead of us asking nicely in the prompt and hoping.
     from modules.utils.cli_utils import (
         resolve_output_format, _get_cached_or_sync_version, _parse_version,
-        _MIN_JSON_SCHEMA_VERSION,
     )
     cached_version = _get_cached_or_sync_version()
     version = _parse_version(cached_version) if cached_version else (0, 0, 0)
-    transport = resolve_output_format(version, bool(cached_version))
-    # Needs both the flag and the JSON transport — the validated object only
-    # comes back inside the envelope.
-    enforce = (
-        strict_mode
-        and transport == "json"
-        and (not cached_version or version >= _MIN_JSON_SCHEMA_VERSION)
-    )
+    try:
+        transport = resolve_output_format(version, bool(cached_version))
+    except CLIExecutionError as e:
+        # CLI_OUTPUT_FORMAT=json on an agy that cannot produce it. Return the
+        # documented error shape rather than raising out of the tool.
+        return json.dumps({
+            "status": "error",
+            "error": str(e),
+            "error_code": "CONFIG_ERROR",
+        })
+    # transport == "json" already implies version >= 1.1.8, which is also the
+    # --json-schema floor, so no separate version check is needed here.
+    enforce = strict_mode and transport == "json"
 
     cleaned_prompt, files = extract_file_refs(prompt)
     args = _build_cli_args(
@@ -215,7 +221,9 @@ Return valid JSON matching the schema."""
     except (CLITimeoutError, CLIRateLimitError, CLIExecutionError) as e:
         return json.dumps({
             "status": "error",
-            "error": str(e)
+            "error": str(e),
+            "error_code": type(e).__name__.replace("CLI", "").replace("Error", "").upper(),
+            "schema_validation": "enforced" if enforce else "prompt_only",
         })
 
 

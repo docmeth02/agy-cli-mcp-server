@@ -324,8 +324,12 @@ class TestInvocationAwareRetry:
             asyncio.run(cu.execute_cli_with_retry(["--print", "x"], mutating=True))
         assert calls["n"] == 1
 
-    def test_readonly_invocation_is_retried(self, monkeypatch):
-        calls = self._count_attempts(monkeypatch, CLIRateLimitError("limit"))
+    def test_readonly_invocation_is_retried_when_no_work_was_done(self, monkeypatch):
+        # work_done=False means agy refused before running anything, so a retry
+        # cannot duplicate work.
+        calls = self._count_attempts(
+            monkeypatch, CLIRateLimitError("limit", work_done=False)
+        )
         with pytest.raises(CLIRateLimitError):
             asyncio.run(
                 cu.execute_cli_with_retry(
@@ -333,6 +337,24 @@ class TestInvocationAwareRetry:
                 )
             )
         assert calls["n"] == 3
+
+    def test_readonly_invocation_is_not_retried_when_work_was_done(self, monkeypatch):
+        # A limit that arrives mid-run may leave commands executed and files
+        # edited; repeating the turn would repeat them.
+        calls = self._count_attempts(
+            monkeypatch, CLIRateLimitError("limit", work_done=True)
+        )
+        with pytest.raises(CLIRateLimitError):
+            asyncio.run(
+                cu.execute_cli_with_retry(
+                    ["--print", "x"], mutating=False, max_attempts=3
+                )
+            )
+        assert calls["n"] == 1
+
+    def test_work_done_defaults_to_true(self):
+        # Unknowable on the text transport, so assume work happened.
+        assert CLIRateLimitError("x").work_done is True
 
     def test_default_is_conservative(self, monkeypatch):
         calls = self._count_attempts(monkeypatch, CLIRateLimitError("limit"))
@@ -359,3 +381,98 @@ class TestInvocationAwareRetry:
                 )
             )
         assert calls["n"] == 1
+
+
+class TestRateLimitFromEnvelope:
+    """
+    In JSON mode agy leaves stderr EMPTY and puts the failure reason in the
+    envelope (verified against 1.1.11: an invalid --model gives exit 1, a
+    676-byte envelope and 0 bytes of stderr). Scanning stderr alone made
+    rate-limit detection — and the whole retry policy — unreachable on the
+    default transport.
+    """
+
+    def _run(self, monkeypatch, envelope, stderr=b""):
+        stub_subprocess(monkeypatch, json.dumps(envelope).encode(), stderr=stderr, rc=1)
+        return asyncio.run(execute_cli(["--print", "hi"], timeout=10))
+
+    def test_quota_in_envelope_error_raises(self, modern_agy, monkeypatch):
+        env = dict(ERROR_ENVELOPE, error="Error: quota exceeded for this window")
+        with pytest.raises(CLIRateLimitError):
+            self._run(monkeypatch, env)
+
+    def test_work_done_false_when_counters_are_zero(self, modern_agy, monkeypatch):
+        env = dict(ERROR_ENVELOPE, error="quota exceeded",
+                   num_turns=0, usage={"total_tokens": 0})
+        with pytest.raises(CLIRateLimitError) as exc:
+            self._run(monkeypatch, env)
+        assert exc.value.work_done is False
+
+    def test_work_done_true_when_tokens_were_spent(self, modern_agy, monkeypatch):
+        env = dict(ERROR_ENVELOPE, error="quota exceeded",
+                   num_turns=3, usage={"total_tokens": 5000})
+        with pytest.raises(CLIRateLimitError) as exc:
+            self._run(monkeypatch, env)
+        assert exc.value.work_done is True
+
+    def test_non_quota_error_is_not_a_rate_limit(self, modern_agy, monkeypatch):
+        env = dict(ERROR_ENVELOPE, error='invalid model selection (--model "x")')
+        r = self._run(monkeypatch, env)
+        assert r["status"] == "error"
+
+    def test_stderr_quota_still_detected(self, modern_agy, monkeypatch):
+        with pytest.raises(CLIRateLimitError):
+            self._run(monkeypatch, dict(ERROR_ENVELOPE),
+                      stderr=b"Error: quota exceeded\n")
+
+
+class TestEnvelopeNoiseTolerance:
+    """agy writes update notices and language-server messages to stdout when
+    CLI_LOG_FILE is unset (the default), so a strict whole-string parse would
+    make one stray byte a fatal failure for every call."""
+
+    @pytest.mark.parametrize("raw", [
+        b'A new version of agy is available!\n{"status":"SUCCESS","response":"hi"}',
+        b'{"status":"SUCCESS","response":"hi"}\nUpdate available\n',
+        b'  \n{"status":"SUCCESS","response":"hi"}\n\n',
+    ])
+    def test_envelope_recovered_from_surrounding_noise(
+        self, modern_agy, monkeypatch, raw
+    ):
+        stub_subprocess(monkeypatch, raw)
+        r = asyncio.run(execute_cli(["--print", "hi"], timeout=10))
+        assert r["status"] == "success"
+        assert r["stdout"] == "hi"
+
+    def test_no_json_at_all_still_fails(self, modern_agy, monkeypatch):
+        stub_subprocess(monkeypatch, b"total garbage, no braces here")
+        with pytest.raises(CLIProtocolError, match="no JSON object found"):
+            asyncio.run(execute_cli(["--print", "hi"], timeout=10))
+
+    def test_protocol_error_includes_a_stdout_excerpt(self, modern_agy, monkeypatch):
+        # Without it, an outage caused by stdout noise is undiagnosable from the
+        # tool response alone.
+        stub_subprocess(monkeypatch, b"{ this is not valid json at all")
+        with pytest.raises(CLIProtocolError, match="stdout excerpt"):
+            asyncio.run(execute_cli(["--print", "hi"], timeout=10))
+
+
+class TestSanitizeDictKeys:
+    """The text transport redacted the whole payload as one string, so a
+    credential appearing as a dict KEY was covered. Sanitizing only values would
+    silently reopen that position — reachable via a schema with
+    additionalProperties producing {"AIza...": "..."}."""
+
+    def test_keys_are_sanitized(self):
+        out = _sanitize_tree({"AIzaSyA1234567890abcdefghijklmnopqrstuv": "found"})
+        assert "AIzaSyA1234567890abcdefghijklmnopqrstuv" not in str(out)
+
+    def test_nested_keys_are_sanitized(self):
+        out = _sanitize_tree(
+            {"structured_output": [{"AKIAIOSFODNN7EXAMPLE": {"x": "y"}}]}
+        )
+        assert "AKIAIOSFODNN7EXAMPLE" not in str(out)
+
+    def test_ordinary_keys_are_untouched(self):
+        out = _sanitize_tree({"language": "python", "functions": 2})
+        assert out == {"language": "python", "functions": 2}

@@ -923,7 +923,7 @@ carries an authoritative status, the real conversation id, and token accounting:
 ```json
 {"conversation_id":"3a4105bf-…","status":"SUCCESS","response":"…",
  "duration_seconds":1.05,"num_turns":1,
- "usage":{"input_tokens":16262,"output_tokens":7,"cache_read_tokens":0,"total_tokens":16269}}
+ "usage":{"input_tokens":16262,"output_tokens":7,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":16269}}
 ```
 
 This replaces the previous approach of guessing from the exit code and scanning
@@ -959,12 +959,14 @@ executed and files already edited.
 | Invocation | Retries |
 |---|---|
 | Mutating (`gemini_prompt`, `gemini_sandbox`, `gemini_cli`, `gemini_ai_collaboration`, `gemini_continue_conversation`) | **None** — surfaced to the caller instead of repeated |
-| Analysis (`gemini_summarize`, `gemini_eval_plan`, `gemini_review_code`, `gemini_code_review`, `gemini_verify_solution`, `gemini_extract_structured`, `gemini_git_diff_review`, `gemini_content_comparison`) | Up to `RETRY_MAX_ATTEMPTS` |
-| `gemini_prompt(readonly=True)` | Retried — the preamble forbids modification |
+| Analysis (`gemini_summarize`, `gemini_summarize_files`, `gemini_eval_plan`, `gemini_review_code`, `gemini_code_review`, `gemini_verify_solution`, `gemini_extract_structured`, `gemini_git_diff_review`, `gemini_content_comparison`) | Up to `RETRY_MAX_ATTEMPTS`, **and only if agy did no work** |
+| `gemini_prompt(readonly=True)` | **Not** retried. `readonly` only prepends a preamble asking the model not to write; nothing enforces it — `--dangerously-skip-permissions` is still passed, and `--mode plan` was tested and does **not** block writes either. Treating a prompt instruction as a safety boundary is the mistake the `--sandbox` note warns about. |
+
+Even where retrying is permitted, it happens **only when agy provably did no work** — the envelope reporting zero turns and zero tokens, meaning the request was refused before anything ran. A limit that arrives mid-run is never retried, because agy allows hundreds of tool calls and the run may already have edited files. This is unknowable on the text transport, which therefore never retries.
 
 Timeouts and `CLIProtocolError` are never retried.
 
-### Reasoning Effort (agy >= 1.1.5)
+### Reasoning Effort (agy >= 1.1.10)
 
 `gemini_prompt` and `gemini_sandbox` accept `effort` (`low`/`medium`/`high`).
 Most model slugs already pin a tier (`gemini-3.1-pro-high`), so `effort` is only
@@ -975,8 +977,13 @@ gemini_prompt(prompt="…", model="gemini-3.5-flash", effort="low")
 ```
 
 Passing both a tier-suffixed slug and a different `effort` returns a warning —
-agy's precedence between the two is unspecified. Per-task defaults via
+agy's precedence between the two is unspecified. This detects both accepted
+forms (`gemini-3.1-pro-low` and `Gemini 3.1 Pro (Low)`). Per-task defaults via
 `CLI_EFFORT_{TASK}`, global default via `CLI_DEFAULT_EFFORT`.
+
+Gated on **1.1.10**, not 1.1.5: the flag exists from 1.1.5 but agy 1.1.10 fixed
+it being *silently ignored* in headless `-p` runs, so passing it earlier would
+only appear to work.
 
 ### Structured Extraction (agy >= 1.1.8)
 
@@ -995,7 +1002,7 @@ falls back to prompt-only and reports `schema_validation: "prompt_only"`.
 
 ### Error Codes
 
-Failure responses carry a machine-readable `error_code`:
+Failure responses **may** carry a machine-readable `error_code`. Input validation, conversation errors and the quota tools always set one; agy-side failures on the JSON transport are *returned* rather than raised, so they surface as `status: "error"` with an `error` message and no code. Check `status` first, then `error_code` when present.
 
 | Code | Meaning |
 |---|---|
@@ -1006,6 +1013,7 @@ Failure responses carry a machine-readable `error_code`:
 | `INVALID_CONVERSATION_ID` | `conversation_id` is not a valid agy id (see below) |
 | `CONVERSATION_NOT_BOUND` | An unbound conversation handle on the text transport, where agy's id cannot be captured. Use agy >= 1.1.8 with `CLI_OUTPUT_FORMAT=auto` |
 | `INVALID_SCHEMA` | `gemini_extract_structured` was given a schema that is not a JSON object |
+| `CONFIG_ERROR` | `CLI_OUTPUT_FORMAT=json` on an agy older than 1.1.8 |
 | `USAGE_FAILED` / `CREDITS_FAILED` | `gemini_usage` / `gemini_credits` could not read state. The specific cause is in `underlying_error_code`: `UNSUPPORTED_AGY_VERSION` (needs agy >= 1.1.11), `NOT_A_COMMAND` (this agy ran the command as a prompt), `MALFORMED_ENVELOPE`, or `COMMAND_FAILED` |
 
 ### Slash Command Handling
@@ -1039,10 +1047,15 @@ Stateful multi-turn conversations via agy's native conversation stores:
 This indirection is necessary because **agy silently ignores an unknown `--conversation` id** — it starts a fresh conversation under a different id, exits 0, and emits no warning. Passing a locally-invented id straight through would therefore produce a historyless context on every turn while reporting success.
 
 ```python
-c = gemini_start_conversation(title="Refactor plan")   # bound: false
-gemini_continue_conversation(conversation_id=c, prompt="...")  # bound_on_this_turn: true
-gemini_continue_conversation(conversation_id=c, prompt="...")  # resumes with history
+# gemini_start_conversation returns a JSON string; the id is nested under "conversation".
+started = json.loads(gemini_start_conversation(title="Refactor plan"))
+cid = started["conversation"]["conversation_id"]        # bound: false
+
+gemini_continue_conversation(conversation_id=cid, prompt="...")  # bound_on_this_turn: true
+gemini_continue_conversation(conversation_id=cid, prompt="...")  # resumes with history
 ```
+
+`gemini_list_conversations` reports `has_native_file: true` once a handle is bound (it resolves through the binding), alongside `bound` and `agy_conversation_id`. `gemini_clear_conversation` deletes the bound store, not just the handle.
 
 Binding requires agy >= 1.1.8 (it needs the JSON envelope to learn the id). On older agy, use `gemini_prompt` for the first turn and continue an id from `gemini_list_conversations` whose `has_native_file` is true.
 
@@ -1193,6 +1206,15 @@ export GEMINI_EXTRACT_STRUCTURED_LIMIT=200000  # gemini_extract_structured chara
 export GEMINI_GIT_DIFF_LIMIT=150000  # gemini_git_diff_review character limit
 ```
 
+#### Transport & Effort
+```bash
+export CLI_OUTPUT_FORMAT=auto          # auto | json | text (see Output Transport)
+export CLI_DEFAULT_EFFORT=             # low | medium | high (empty = model's own tier)
+export CLI_EFFORT_PROMPT=              # per-task override, e.g. CLI_EFFORT_SANDBOX
+```
+Each also accepts a `GEMINI_`-prefixed fallback name (`GEMINI_OUTPUT_FORMAT`,
+`GEMINI_DEFAULT_EFFORT`, `GEMINI_EFFORT_{TASK}`) for backward compatibility.
+
 #### Model Defaults
 ```bash
 export CLI_DEFAULT_MODEL=              # Global default model (empty = let agy decide)
@@ -1256,7 +1278,7 @@ export GEMINI_RATE_LIMIT_REQUESTS=500
 **Debug Configuration**:
 ```bash
 export CLI_LOG_LEVEL=DEBUG
-export GEMINI_OUTPUT_FORMAT=json
+export CLI_OUTPUT_FORMAT=auto
 export CLI_TIMEOUT=120
 export ENABLE_STDIN_DEBUG="1"
 ```
@@ -1264,6 +1286,30 @@ export ENABLE_STDIN_DEBUG="1"
 ### Response Formats
 
 #### JSON Format (Default)
+
+On the JSON transport (agy >= 1.1.8) a successful response looks like:
+
+```json
+{
+  "status": "success",
+  "stdout": "the model's answer",
+  "stderr": "",
+  "return_code": 0,
+  "execution_time": 1.62,
+  "agy_status": "SUCCESS",
+  "conversation_id": "3a4105bf-…",
+  "num_turns": 1,
+  "agy_duration_seconds": 1.05,
+  "usage": {"input_tokens": 16262, "output_tokens": 7, "thinking_tokens": 0,
+            "cache_read_tokens": 0, "total_tokens": 16269}
+}
+```
+
+The text transport returns the same shape minus `agy_status`, `conversation_id`,
+`num_turns`, `agy_duration_seconds` and `usage` — a strict subset, so a caller
+written against JSON still works if the transport changes.
+
+Legacy shape:
 ```json
 {
   "status": "success",
@@ -1451,7 +1497,7 @@ Enable comprehensive debugging:
 
 ```bash
 export CLI_LOG_LEVEL=DEBUG
-export GEMINI_OUTPUT_FORMAT=json
+export CLI_OUTPUT_FORMAT=auto
 python mcp_server.py
 ```
 

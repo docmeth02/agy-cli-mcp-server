@@ -317,9 +317,14 @@ async def gemini_prompt(
     )
 
     try:
-        # readonly=True instructs agy not to touch files, which makes a
-        # rate-limit retry safe; otherwise this can write, so it must not repeat.
-        result = await execute_cli_with_retry(args, mutating=not readonly)
+        # Deliberately mutating=True even when readonly=True: `readonly` only
+        # prepends a preamble asking the model not to write. Nothing enforces it —
+        # --dangerously-skip-permissions and --mode accept-edits are still passed,
+        # and `--mode plan` was tested and does not block writes either. Treating
+        # a prompt instruction as a safety boundary is what the --sandbox lesson
+        # warns against. The work_done check in execute_cli_with_retry still
+        # allows a retry when agy provably did nothing.
+        result = await execute_cli_with_retry(args, mutating=True)
         result = add_model_metadata(result, await validate_model(effective_model))
         result = add_model_metadata(result, await validate_agent(agent))
         result = add_model_metadata(
@@ -1423,16 +1428,25 @@ async def gemini_extract_structured(
     """
     Extract structured data using JSON schemas (200,000 char limit).
 
+    On agy >= 1.1.8 the schema is enforced by agy itself (via --json-schema), and
+    the validated result comes back as a parsed object in `structured_output` —
+    not as text you have to re-parse and hope matches.
+
     Args:
         content: Content to analyze
-        schema: JSON schema defining the output structure
+        schema: JSON schema defining the output structure. Must be a JSON
+               **object**; anything else is rejected as INVALID_SCHEMA.
         examples: Optional examples of expected output
-        strict_mode: Whether to enforce strict schema compliance
+        strict_mode: True (default) enforces the schema upstream and returns
+               `structured_output`. False uses prompt-only extraction, where the
+               model is merely asked to follow the schema.
         model: Model to use (slug or display name, e.g. "gemini-3.1-pro-high").
                Defaults to "gemini-3.1-pro-high".
 
     Returns:
-        JSON with extracted structured data
+        JSON with `schema_validation` set to "enforced" or "prompt_only". When
+        enforced, `structured_output` holds the validated object. Below agy
+        1.1.8, or with CLI_OUTPUT_FORMAT=text, it falls back to "prompt_only".
 
     Examples:
         gemini_extract_structured(content="@src/", schema='{"type":"object",...}')
@@ -1464,6 +1478,9 @@ Return valid JSON matching the schema."""
         args = _build_cli_args(prompt=cleaned_prompt, files=files, model=effective_model)
         result = await execute_cli_with_retry(args, mutating=False, timeout=get_task_timeout("extract_structured"))
         result = add_model_metadata(result, await validate_model(effective_model))
+        # This fallback never passes --json-schema, so the schema is only ever
+        # requested in the prompt.
+        result["schema_validation"] = "prompt_only"
         return json.dumps(result, indent=2)
 
 
