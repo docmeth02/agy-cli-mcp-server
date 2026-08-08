@@ -137,6 +137,28 @@ class CLIProtocolError(CLIExecutionError):
     pass
 
 
+# Exception type -> documented error_code. Derived codes (via class-name string
+# munging) produced RATELIMIT / EXECUTION / PROTOCOL, which appear nowhere in the
+# documented contract — a caller branching on RATE_LIMIT missed those tools.
+CLI_ERROR_CODES = {
+    CLITimeoutError: "TIMEOUT",
+    CLIRateLimitError: "RATE_LIMIT",
+    CLIProtocolError: "PROTOCOL_ERROR",
+    CLIExecutionError: "EXECUTION_ERROR",
+}
+
+
+def cli_error_code(exc: Exception) -> str:
+    """Map a CLI exception to its documented error_code (most specific first)."""
+    for exc_type, code in CLI_ERROR_CODES.items():
+        if type(exc) is exc_type:
+            return code
+    for exc_type, code in CLI_ERROR_CODES.items():
+        if isinstance(exc, exc_type):
+            return code
+    return "EXECUTION_ERROR"
+
+
 def resolve_output_format(version: tuple[int, ...], version_known: bool) -> str:
     """
     Decide the transport for a --print run: "json" or "text".
@@ -207,30 +229,60 @@ def _extract_json_envelope(raw: str):
     documents that agy writes language-server startup messages, warnings and
     update checks — which land on stdout when no log file is configured.
 
-    Strategy: try the whole string first (the normal case, and the only one that
-    can validate a trailing-garbage-free stream). If that fails, decode one
-    complete JSON value starting at the first '{'. Deliberately anchored to the
-    first brace and requiring one *complete* value, rather than hunting for the
-    last line that looks like JSON — that would hide genuine corruption.
+    Strategy: try the whole string first (the normal case). If that fails, scan
+    for a complete JSON object that actually looks like an envelope, i.e. carries
+    a "status" key.
+
+    That last requirement is essential, not cosmetic: the noise this tolerates is
+    partly language-server chatter, and LSP messages are themselves JSON objects.
+    Accepting the first complete value would hand back the diagnostic instead of
+    the envelope — reporting a successful run that had already edited files as a
+    failure, with the response, usage and conversation id silently dropped.
+
+    Candidates are still required to be *complete* values decoded from a brace
+    position, rather than "the last line that looks like JSON" — that would hide
+    genuine corruption.
 
     Raises:
-        ValueError / TypeError / RecursionError: nothing parseable was found.
+        ValueError / TypeError / RecursionError: nothing envelope-shaped found.
     """
     try:
-        return json.loads(raw)
+        parsed = json.loads(raw)
     except (ValueError, TypeError):
         pass
+    else:
+        return parsed
 
-    start = raw.find("{")
-    if start == -1:
-        raise ValueError("no JSON object found in agy stdout")
+    decoder = json.JSONDecoder()
+    search = 0
+    skipped = 0
+    while True:
+        start = raw.find("{", search)
+        if start == -1:
+            break
+        try:
+            candidate, end = decoder.raw_decode(raw, start)
+        except ValueError:
+            # Not a complete value here; advance past this brace and keep looking.
+            search = start + 1
+            continue
 
-    envelope, _end = json.JSONDecoder().raw_decode(raw, start)
-    logger.warning(
-        "agy stdout carried non-JSON noise around the envelope; recovered the "
-        "envelope. Set CLI_LOG_FILE to route agy diagnostics off stdout."
+        if isinstance(candidate, dict) and "status" in candidate:
+            logger.warning(
+                "agy stdout carried non-JSON noise around the envelope; "
+                "recovered the envelope%s. Set CLI_LOG_FILE to route agy "
+                "diagnostics off stdout.",
+                f" (skipped {skipped} non-envelope object(s))" if skipped else "",
+            )
+            return candidate
+
+        skipped += 1
+        search = max(end, start + 1)
+
+    raise ValueError(
+        "no envelope-shaped JSON object (one carrying a \"status\" key) found "
+        "in agy stdout"
     )
-    return envelope
 
 
 def _adapt_json_envelope(
@@ -815,9 +867,15 @@ async def execute_cli(
                 )
 
             usage = envelope.get("usage")
-            spent = (usage or {}).get("total_tokens") if isinstance(usage, dict) else None
+            spent = usage.get("total_tokens") if isinstance(usage, dict) else None
             turns = envelope.get("num_turns")
-            work_done = bool(turns) or bool(spent)
+            if turns is None and not isinstance(usage, dict):
+                # Neither counter reported: absence is not proof that nothing ran,
+                # so fall back to the conservative assumption rather than
+                # unlocking retries on a future agy that stops emitting them.
+                work_done = True
+            else:
+                work_done = bool(turns) or bool(spent)
 
             # In JSON mode agy leaves stderr EMPTY and puts the reason in the
             # envelope (verified: an invalid --model gives exit 1, a 676-byte
@@ -826,7 +884,12 @@ async def execute_cli(
             # unreachable on the default transport.
             envelope_error = envelope.get("error")
             if isinstance(envelope_error, str):
-                rate_limit_text = f"{stderr_str}\n{envelope_error}"
+                # Sanitize here: this raise happens BEFORE _adapt_json_envelope,
+                # so the envelope has not been through _sanitize_tree yet, and the
+                # text below reaches the client as the exception message. agy error
+                # text can embed failed tool commands and their output, which is a
+                # realistic place for a credential to appear.
+                rate_limit_text = f"{stderr_str}\n{sanitize_output(envelope_error)}"
 
         if _is_print_invocation(args) and _is_rate_limit_signal(rate_limit_text):
             METRICS["rate_limit_hits"] += 1

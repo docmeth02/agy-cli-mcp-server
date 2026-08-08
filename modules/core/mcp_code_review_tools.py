@@ -9,6 +9,7 @@ import logging
 from typing import Optional
 
 from modules.utils.cli_utils import (
+    cli_error_code,
     execute_cli_with_retry,
     extract_file_refs,
     _build_cli_args,
@@ -126,7 +127,8 @@ async def execute_extract_structured(
         return json.dumps({
             "status": "error",
             "error": f"Input exceeds limit of {GEMINI_EXTRACT_STRUCTURED_LIMIT:,} characters",
-            "error_code": "INPUT_TOO_LARGE"
+            "error_code": "INPUT_TOO_LARGE",
+            "schema_validation": "not_attempted",
         })
 
     # Validate schema is valid JSON
@@ -136,7 +138,8 @@ async def execute_extract_structured(
         return json.dumps({
             "status": "error",
             "error": f"Invalid JSON schema: {str(e)}",
-            "error_code": "INVALID_SCHEMA"
+            "error_code": "INVALID_SCHEMA",
+            "schema_validation": "not_attempted",
         })
 
     # agy's --json-schema expects a schema object. A bare scalar or array parses
@@ -149,7 +152,8 @@ async def execute_extract_structured(
                 f"Schema must be a JSON object, got "
                 f"{type(parsed_schema).__name__}."
             ),
-            "error_code": "INVALID_SCHEMA"
+            "error_code": "INVALID_SCHEMA",
+            "schema_validation": "not_attempted",
         })
 
     try:
@@ -194,6 +198,7 @@ Return valid JSON matching the schema."""
             "status": "error",
             "error": str(e),
             "error_code": "CONFIG_ERROR",
+            "schema_validation": "not_attempted",
         })
     # transport == "json" already implies version >= 1.1.8, which is also the
     # --json-schema floor, so no separate version check is needed here.
@@ -222,7 +227,7 @@ Return valid JSON matching the schema."""
         return json.dumps({
             "status": "error",
             "error": str(e),
-            "error_code": type(e).__name__.replace("CLI", "").replace("Error", "").upper(),
+            "error_code": cli_error_code(e),
             "schema_validation": "enforced" if enforce else "prompt_only",
         })
 

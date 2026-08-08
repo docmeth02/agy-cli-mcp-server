@@ -36,14 +36,19 @@ CREDENTIAL_PATTERNS = [
     (r'api[_-]?key\s*[:=]\s*(?:"[^"]*"|\'[^\']*\'|[^\s"\'\\]+)', 'api_key=[REDACTED]'),
 
     # Private keys.
-    # The body is length-bounded rather than an open `[\s\S]*?`: with no END
-    # marker present, an unbounded lazy gap rescans to end-of-string from every
-    # BEGIN position, which is quadratic (measured 85ms at 21KB, 1.3s at 84KB,
-    # 5.4s at 168KB). Sanitization is synchronous and runs outside the asyncio
-    # timeout, so a single hostile payload containing repeated BEGIN markers —
-    # no actual key required — would stall the whole server. 16KB comfortably
-    # covers a real PEM key (a 4096-bit RSA key is ~3.2KB).
-    (r'-----BEGIN (RSA |EC |DSA )?PRIVATE KEY-----[\s\S]{0,16384}?-----END (RSA |EC |DSA )?PRIVATE KEY-----',
+    # The body is `(?:[^-]|-(?!----))` — any character except the start of a
+    # "-----" run — rather than a lazy `[\s\S]*?`. That matters for cost, not
+    # just tidiness: with a permissive body, every BEGIN marker rescans forward
+    # looking for an END, which is quadratic in the number of markers. A payload
+    # of repeated BEGIN markers (no real key needed) then stalls the server,
+    # because sanitization is synchronous and runs outside the asyncio timeout.
+    # Measured on 1MB of repeated markers plus one trailing END: 6.7s with a lazy
+    # body, 0.007s with this one. A length-bound alone is NOT sufficient — one
+    # trailing END marker restores the full cost, since the bound is still scanned
+    # per marker.
+    # The 16KB cap comfortably covers real keys (a 4096-bit RSA key is ~3.2KB);
+    # a longer BEGIN/END block is left unredacted rather than scanned unboundedly.
+    (r'-----BEGIN (RSA |EC |DSA )?PRIVATE KEY-----(?:[^-]|-(?!----)){0,16384}-----END (RSA |EC |DSA )?PRIVATE KEY-----',
      '[REDACTED_PRIVATE_KEY]'),
 
     # JWT tokens
@@ -56,14 +61,15 @@ COMPILED_PATTERNS = [
     for pattern, replacement in CREDENTIAL_PATTERNS
 ]
 
-# Cheap literal prefilters for patterns whose worst case is expensive. A plain
-# substring scan is O(n) in C; if the anchor is absent the pattern cannot match,
-# so skipping it avoids the regex engine entirely.
+# Cheap literal prefilters: a plain substring scan is O(n) in C, so when a
+# pattern's mandatory anchor is absent, skipping it avoids the regex engine
+# entirely.
 #
-# The private-key pattern needs this even with its bounded body: each BEGIN
-# marker still scans up to the bound looking for an END, so a payload of
-# repeated BEGIN markers (no real key needed) costs marker_count × bound.
-# Requiring "-----END" up front collapses that to a single linear pass.
+# This is an optimisation only — NOT the ReDoS defence. Requiring "-----END"
+# does not bound the work, because a single trailing marker anywhere satisfies
+# the check while every BEGIN marker still gets scanned; that was measured at
+# 6.7s for 1MB. The cost fix is the private-key pattern's body, which cannot
+# consume a "-----" run (see above).
 PATTERN_PREFILTERS: dict[str, str] = {
     '[REDACTED_PRIVATE_KEY]': '-----END',
 }

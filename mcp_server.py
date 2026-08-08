@@ -53,6 +53,7 @@ from modules.utils.cli_utils import (
     validate_model,
     validate_agent,
     validate_effort,
+    cli_error_code,
     add_model_metadata,
     get_metrics,
     validate_cli_setup,
@@ -264,7 +265,9 @@ async def gemini_prompt(
                   create, modify, or delete any files. Use for brainstorming,
                   analysis, opinions, and planning tasks.
         project: Project ID for session isolation (agy >= 1.0.12).
-        effort: Reasoning effort — "low", "medium" or "high" (agy >= 1.1.5).
+        effort: Reasoning effort — "low", "medium" or "high" (agy >= 1.1.10;
+               the flag exists from 1.1.5 but was silently ignored in headless
+               runs before 1.1.10).
                Only needed with a base model slug such as "gemini-3.5-flash";
                most slugs already pin a tier (e.g. "gemini-3.1-pro-high"), and
                passing both is flagged as a conflict.
@@ -519,7 +522,9 @@ async def gemini_sandbox(
         interpret_slash_commands: When False (default) the prompt is sent
                   verbatim, even if it begins with "/". Set True to let agy
                   expand its own slash commands and skills (agy >= 1.1.9).
-        effort: Reasoning effort — "low", "medium" or "high" (agy >= 1.1.5).
+        effort: Reasoning effort — "low", "medium" or "high" (agy >= 1.1.10;
+               the flag exists from 1.1.5 but was silently ignored in headless
+               runs before 1.1.10).
                Only needed with a base model slug such as "gemini-3.5-flash";
                most slugs already pin a tier (e.g. "gemini-3.1-pro-high"), and
                passing both is flagged as a conflict.
@@ -565,7 +570,7 @@ async def gemini_sandbox(
         return json.dumps({
             "status": "error",
             "error": str(e),
-            "error_code": type(e).__name__.replace("CLI", "").replace("Error", "").upper()
+            "error_code": cli_error_code(e)
         })
 
 
@@ -1265,7 +1270,14 @@ async def gemini_list_conversations(
     status_filter: Optional[str] = None
 ) -> str:
     """
-    List active conversations with metadata.
+    List conversations with metadata, most recent first.
+
+    Each entry carries:
+      has_native_file  — true when this id can be continued. Resolves through the
+                         binding, so a bound handle reports true even though the
+                         handle itself has no store of its own.
+      bound            — true when the id is bound to an agy conversation
+      agy_conversation_id — agy's own id for it, or null when unbound
 
     Args:
         limit: Maximum number of conversations to return
@@ -1464,7 +1476,9 @@ async def gemini_extract_structured(
         effective_model = get_task_model("extract_structured", model)
         strict_text = " Strictly follow the schema." if strict_mode else ""
         example_text = f"\n\nExamples:\n{examples}" if examples else ""
-        prompt = f"""Extract structured data from the following content according to this schema.{strict_text}
+        prompt = f"""IMPORTANT: This is an analysis-only task. Do NOT create, modify, or delete any files. Do NOT execute any code. Only return the extracted data.
+
+Extract structured data from the following content according to this schema.{strict_text}
 
 Schema:
 {schema}{example_text}
@@ -1476,7 +1490,19 @@ Return valid JSON matching the schema."""
 
         cleaned_prompt, files = extract_file_refs(prompt)
         args = _build_cli_args(prompt=cleaned_prompt, files=files, model=effective_model)
-        result = await execute_cli_with_retry(args, mutating=False, timeout=get_task_timeout("extract_structured"))
+        try:
+            result = await execute_cli_with_retry(
+                args, mutating=False, timeout=get_task_timeout("extract_structured")
+            )
+        except CLIExecutionError as e:
+            # Without this the exception escapes the tool, bypassing the
+            # error-code contract this docstring advertises.
+            return json.dumps({
+                "status": "error",
+                "error": str(e),
+                "error_code": cli_error_code(e),
+                "schema_validation": "prompt_only",
+            })
         result = add_model_metadata(result, await validate_model(effective_model))
         # This fallback never passes --json-schema, so the schema is only ever
         # requested in the prompt.

@@ -4,6 +4,7 @@ Unit tests for the security framework modules.
 These tests verify the credential sanitizer and security monitor
 without requiring a real agy installation.
 """
+import pytest
 from security.credential_sanitizer import (
     sanitize_credentials,
     check_for_credentials,
@@ -124,3 +125,48 @@ class TestSecurityMonitor:
         m1 = get_security_monitor()
         m2 = get_security_monitor()
         assert m1 is m2
+
+
+class TestPrivateKeyPatternCost:
+    """
+    A permissive body makes every BEGIN marker rescan forward for an END, which is
+    quadratic in the marker count. Sanitization is synchronous and runs outside
+    the asyncio timeout, so one hostile payload would stall the whole server.
+    A length bound alone is NOT sufficient — a single trailing END marker
+    satisfies the literal prefilter and restores the full cost.
+    """
+
+    def test_repeated_begin_markers_with_trailing_end_stay_linear(self):
+        import time
+        from security.credential_sanitizer import sanitize_credentials
+
+        payload = "-----BEGIN PRIVATE KEY-----" * 38_000 + "-----END PRIVATE KEY-----"
+        start = time.perf_counter()
+        sanitize_credentials(payload)
+        elapsed = time.perf_counter() - start
+        assert elapsed < 1.0, f"~1MB took {elapsed:.2f}s — superlinear"
+
+    def test_repeated_begin_markers_without_end_stay_linear(self):
+        import time
+        from security.credential_sanitizer import sanitize_credentials
+
+        payload = "-----BEGIN PRIVATE KEY-----" * 38_000
+        start = time.perf_counter()
+        sanitize_credentials(payload)
+        assert time.perf_counter() - start < 1.0
+
+    @pytest.mark.parametrize("kind", ["", "RSA ", "EC ", "DSA "])
+    def test_real_keys_still_redacted(self, kind):
+        from security.credential_sanitizer import sanitize_credentials
+
+        key = (
+            f"-----BEGIN {kind}PRIVATE KEY-----\n"
+            + "MIIEowIBAAKCAQEA" * 200
+            + f"\n-----END {kind}PRIVATE KEY-----"
+        )
+        assert "[REDACTED_PRIVATE_KEY]" in sanitize_credentials(key)
+
+    def test_lowercase_markers_redacted(self):
+        from security.credential_sanitizer import sanitize_credentials
+        key = "-----begin private key-----\nabc\n-----end private key-----"
+        assert "[REDACTED_PRIVATE_KEY]" in sanitize_credentials(key)

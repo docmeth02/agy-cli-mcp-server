@@ -446,7 +446,29 @@ class TestEnvelopeNoiseTolerance:
 
     def test_no_json_at_all_still_fails(self, modern_agy, monkeypatch):
         stub_subprocess(monkeypatch, b"total garbage, no braces here")
-        with pytest.raises(CLIProtocolError, match="no JSON object found"):
+        with pytest.raises(CLIProtocolError, match="no envelope-shaped JSON"):
+            asyncio.run(execute_cli(["--print", "hi"], timeout=10))
+
+    def test_leading_json_object_is_not_mistaken_for_the_envelope(
+        self, modern_agy, monkeypatch
+    ):
+        # The noise this tolerates is partly language-server chatter, and LSP
+        # messages are themselves JSON objects. Accepting the first complete
+        # value would hand back the diagnostic — reporting a successful run that
+        # had already edited files as a failure, with the response discarded.
+        raw = (
+            b'{"jsonrpc":"2.0","method":"window/logMessage","params":{"type":3}}\n'
+            b'{"status":"SUCCESS","response":"I edited 4 files","num_turns":6}'
+        )
+        stub_subprocess(monkeypatch, raw)
+        r = asyncio.run(execute_cli(["--print", "hi"], timeout=10))
+        assert r["status"] == "success"
+        assert r["stdout"] == "I edited 4 files"
+        assert r["num_turns"] == 6
+
+    def test_non_envelope_objects_only_still_fails(self, modern_agy, monkeypatch):
+        stub_subprocess(monkeypatch, b'{"jsonrpc":"2.0"}\n{"unrelated":1}')
+        with pytest.raises(CLIProtocolError, match="no envelope-shaped JSON"):
             asyncio.run(execute_cli(["--print", "hi"], timeout=10))
 
     def test_protocol_error_includes_a_stdout_excerpt(self, modern_agy, monkeypatch):

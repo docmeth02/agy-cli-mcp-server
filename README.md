@@ -50,7 +50,7 @@ The Gemini CLI MCP Server features a modular, enterprise-grade architecture desi
 └─────────────────┘    └──────────────────┘    └─────────────────┘
          ↑                       ↑                       ↑
     ┌─────────┐            ┌─────────────┐         ┌─────────────┐
-    │ 24 MCP  │            │ FastMCP     │         │ Google      │
+    │ 27 MCP  │            │ FastMCP     │         │ Google      │
     │ Tools   │            │ Server      │         │ Gemini AI   │
     └─────────┘            └─────────────┘         └─────────────┘
 ```
@@ -88,10 +88,10 @@ The Gemini CLI MCP Server features a modular, enterprise-grade architecture desi
 - **Direct Subprocess Execution**: Avoids shell injection vulnerabilities by using `subprocess` directly (not shell)
 - **@filename Server-Side Expansion**: `extract_file_refs()` parses prompts for `@path` tokens, expands globs, and converts them to `--add-dir` flags for agy
 - **Agy-Native Conversations**: Conversation state managed by agy's own stores — SQLite `<uuid>.db` for recent conversations, legacy protobuf `<uuid>.pb` for older ones; metadata tracked in a JSON sidecar
-- **Structured Error Classification**: Hybrid error detection — on agy >= 1.1.1, non-zero exit + stderr; on older versions, stdout pattern scanning for `^Error:`, `^CLI error:`, `^Warning: conversation "..." not found`
+- **Structured Error Classification**: On agy >= 1.1.8 the JSON envelope's `status` field is authoritative (agy's exit code is not — see Output Transport). The legacy hybrid detection (non-zero exit + stderr, plus stdout `^Error:` scanning) remains only on the text transport
 - **Multi-Tier TTL Caching**: Different cache durations optimized for each use case
 - **Full Async/Await**: High-concurrency architecture supporting 1,000-10,000+ requests
-- **Exponential Backoff Retry**: Intelligent retry logic with jitter for transient errors
+- **Exponential Backoff Retry**: Rate limits only, and only when agy provably did no work (see Retry Policy). Timeouts are never retried
 - **Input Validation**: Multi-layer validation with length limits and sanitization
 - **Information Disclosure Prevention**: Sanitized client responses with detailed server logging
 
@@ -999,10 +999,18 @@ that hopefully matches:
 `strict_mode=True` (default) uses upstream enforcement; `strict_mode=False` uses
 prompt-only extraction. Below agy 1.1.8, or with `CLI_OUTPUT_FORMAT=text`, it
 falls back to prompt-only and reports `schema_validation: "prompt_only"`.
+Input-validation failures (oversized input, a malformed or non-object schema,
+`CONFIG_ERROR`) report `schema_validation: "not_attempted"` — no extraction ran.
 
 ### Error Codes
 
-Failure responses **may** carry a machine-readable `error_code`. Input validation, conversation errors and the quota tools always set one; agy-side failures on the JSON transport are *returned* rather than raised, so they surface as `status: "error"` with an `error` message and no code. Check `status` first, then `error_code` when present.
+Failure responses **may** carry a machine-readable `error_code`. Always check
+`status` first, then `error_code` when present. Two gaps to be aware of:
+
+- Eight of the analysis tools set no code on a raised failure (timeout, rate
+  limit, execution error) — they return `status` and `error` only.
+- agy-side failures on the JSON transport are *returned* rather than raised, so
+  they surface as `status: "error"` with an `error` message and no code.
 
 | Code | Meaning |
 |---|---|
@@ -1013,6 +1021,7 @@ Failure responses **may** carry a machine-readable `error_code`. Input validatio
 | `INVALID_CONVERSATION_ID` | `conversation_id` is not a valid agy id (see below) |
 | `CONVERSATION_NOT_BOUND` | An unbound conversation handle on the text transport, where agy's id cannot be captured. Use agy >= 1.1.8 with `CLI_OUTPUT_FORMAT=auto` |
 | `INVALID_SCHEMA` | `gemini_extract_structured` was given a schema that is not a JSON object |
+| `PROTOCOL_ERROR` | agy's JSON envelope could not be parsed (never retried) |
 | `CONFIG_ERROR` | `CLI_OUTPUT_FORMAT=json` on an agy older than 1.1.8 |
 | `USAGE_FAILED` / `CREDITS_FAILED` | `gemini_usage` / `gemini_credits` could not read state. The specific cause is in `underlying_error_code`: `UNSUPPORTED_AGY_VERSION` (needs agy >= 1.1.11), `NOT_A_COMMAND` (this agy ran the command as a prompt), `MALFORMED_ENVELOPE`, or `COMMAND_FAILED` |
 
@@ -1369,7 +1378,6 @@ export GEMINI_VERIFY_LIMIT=2000000   # Maximum verification capacity
 
 **For Development Speed**:
 ```bash
-export GEMINI_OUTPUT_FORMAT=text     # Faster response parsing
 export RETRY_MAX_ATTEMPTS=1          # Fail fast for debugging
 ```
 

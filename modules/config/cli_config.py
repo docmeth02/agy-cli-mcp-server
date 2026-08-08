@@ -163,7 +163,8 @@ TASK_MODEL_DEFAULTS: dict[str, Optional[str]] = {
 }
 
 
-# Per-task default reasoning effort (agy >= 1.1.5). Empty by default: most model
+# Per-task default reasoning effort (agy >= 1.1.10; the flag exists from 1.1.5
+# but was silently ignored in headless runs before 1.1.10). Empty by default: most model
 # slugs already pin an effort tier (gemini-3.1-pro-high), so adding a second
 # source of truth would just create conflicts. Set CLI_EFFORT_{TASK} to override
 # per tool, or CLI_DEFAULT_EFFORT globally, when using a base slug.
