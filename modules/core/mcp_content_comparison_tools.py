@@ -97,7 +97,7 @@ Provide a {output_format} comparison{"with similarity metrics" if include_metric
     args = _build_cli_args(prompt=cleaned_prompt, files=files, model=effective_model)
 
     try:
-        result = await execute_cli_with_retry(args, timeout=get_task_timeout("content_comparison"))
+        result = await execute_cli_with_retry(args, mutating=False, timeout=get_task_timeout("content_comparison"))
         result = add_model_metadata(result, await validate_model(effective_model))
         return json.dumps(result, indent=2)
     except (CLITimeoutError, CLIRateLimitError, CLIExecutionError) as e:

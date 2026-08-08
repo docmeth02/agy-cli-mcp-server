@@ -749,45 +749,45 @@ class TestConversationToolRoundTrip:
 class TestPrintRuntimeFlags:
 
     def test_injects_print_timeout_for_print_args(self):
-        out = _apply_print_runtime_flags(["--print", "hi"], timeout=300)
+        out, _ = _apply_print_runtime_flags(["--print", "hi"], timeout=300)
         assert "--print-timeout" in out
         idx = out.index("--print-timeout")
         # agy budget sits just above the Python supervisor timeout.
         assert out[idx + 1] == f"{300 + CLI_PRINT_TIMEOUT_GRACE}s"
 
     def test_print_timeout_tracks_caller_timeout(self):
-        out = _apply_print_runtime_flags(["--print", "hi"], timeout=1800)
+        out, _ = _apply_print_runtime_flags(["--print", "hi"], timeout=1800)
         idx = out.index("--print-timeout")
         assert out[idx + 1] == f"{1800 + CLI_PRINT_TIMEOUT_GRACE}s"
 
     def test_preserves_print_payload_as_last_arg(self):
-        out = _apply_print_runtime_flags(["--print", "the prompt"], timeout=300)
+        out, _ = _apply_print_runtime_flags(["--print", "the prompt"], timeout=300)
         assert out[-2:] == ["--print", "the prompt"]
 
     def test_no_injection_for_non_print_args(self):
         for base in (["--version"], ["help"]):
-            assert _apply_print_runtime_flags(list(base), timeout=300) == base
+            assert _apply_print_runtime_flags(list(base), timeout=300) == (base, "none")
 
     def test_does_not_override_existing_print_timeout(self):
         base = ["--print-timeout", "5s", "--print", "hi"]
-        out = _apply_print_runtime_flags(list(base), timeout=300)
+        out, _ = _apply_print_runtime_flags(list(base), timeout=300)
         assert out.count("--print-timeout") == 1
         assert "5s" in out
 
     def test_does_not_duplicate_joined_form_flags(self):
         # `--flag=val` form must be recognised as already-present (no dup).
         base = ["--print-timeout=5s", "--print", "hi"]
-        out = _apply_print_runtime_flags(list(base), timeout=300)
+        out, _ = _apply_print_runtime_flags(list(base), timeout=300)
         assert sum(a.startswith("--print-timeout") for a in out) == 1
 
     def test_triggers_for_prompt_alias(self):
-        out = _apply_print_runtime_flags(["--prompt", "hi"], timeout=300)
+        out, _ = _apply_print_runtime_flags(["--prompt", "hi"], timeout=300)
         assert "--print-timeout" in out
 
     def test_prompt_payload_not_treated_as_flag(self):
         # A prompt whose text starts with a flag string must NOT suppress
         # injection (the payload token is excluded from flag detection).
-        out = _apply_print_runtime_flags(
+        out, _ = _apply_print_runtime_flags(
             ["--print", "--print-timeout=5s"], timeout=300
         )
         # Injected flag present AND the prompt payload preserved verbatim.
@@ -797,7 +797,7 @@ class TestPrintRuntimeFlags:
     def test_duplicate_print_flags_payloads_all_excluded(self):
         # Every print-flag payload is excluded from detection, not just the
         # first — a later payload starting with a flag string must not suppress.
-        out = _apply_print_runtime_flags(
+        out, _ = _apply_print_runtime_flags(
             ["--print", "one", "--print", "--print-timeout=5s"], timeout=300
         )
         assert out[:2] == ["--print-timeout", f"{300 + CLI_PRINT_TIMEOUT_GRACE}s"]
@@ -805,16 +805,23 @@ class TestPrintRuntimeFlags:
     def test_log_file_opt_in(self, monkeypatch):
         # Default (unset): no --log-file injected.
         monkeypatch.setattr("modules.utils.cli_utils.CLI_LOG_FILE", "")
-        out = _apply_print_runtime_flags(["--print", "hi"], timeout=300)
+        out, _ = _apply_print_runtime_flags(["--print", "hi"], timeout=300)
         assert "--log-file" not in out
         # Configured: injected with the given path.
         monkeypatch.setattr("modules.utils.cli_utils.CLI_LOG_FILE", "/tmp/agy.log")
-        out = _apply_print_runtime_flags(["--print", "hi"], timeout=300)
+        out, _ = _apply_print_runtime_flags(["--print", "hi"], timeout=300)
         assert out[out.index("--log-file") + 1] == "/tmp/agy.log"
 
 
 class TestSubprocessEnvironment:
     """Verify the env handed to the agy subprocess (mocked — no real agy)."""
+
+    @pytest.fixture(autouse=True)
+    def _force_text_transport(self, monkeypatch):
+        # This test asserts on the env, not the transport; plain-text stub output
+        # would otherwise be rejected as a malformed JSON envelope.
+        import modules.utils.cli_utils as cu
+        monkeypatch.setattr(cu, "CLI_OUTPUT_FORMAT", "text")
 
     @pytest.mark.asyncio
     async def test_env_isolation_and_preservation(self, monkeypatch):
@@ -1042,6 +1049,14 @@ class TestAgentValidation:
 # ---------------------------------------------------------------------------
 
 class TestErrorDetectionStderr:
+    """Covers the legacy TEXT transport's hybrid detection, which is what agy
+    < 1.1.8 (or CLI_OUTPUT_FORMAT=text) still uses. The JSON transport has an
+    authoritative status field and is covered separately."""
+
+    @pytest.fixture(autouse=True)
+    def _force_text_transport(self, monkeypatch):
+        import modules.utils.cli_utils as cu
+        monkeypatch.setattr(cu, "CLI_OUTPUT_FORMAT", "text")
 
     @pytest.mark.asyncio
     async def test_nonzero_exit_surfaces_stderr(self, monkeypatch):

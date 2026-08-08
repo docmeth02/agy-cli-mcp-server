@@ -132,9 +132,13 @@ class TestContinueConversationRejectsUnsafeIds:
         assert result["status"] == "error"
         assert result["error_code"] == "INVALID_CONVERSATION_ID"
 
-    def test_valid_but_unbound_id_reports_not_bound(self, isolated_store):
-        # A well-formed id with no agy .pb behind it must be refused distinctly:
-        # agy would silently ignore it and start a fresh, historyless context.
+    def test_unbound_id_is_refused_on_the_text_transport(self, isolated_store, monkeypatch):
+        # Binding needs the JSON envelope to learn the id agy actually created.
+        # Without it, continuing an unbound handle would start a context that
+        # can never be resumed, so it must be refused rather than silently lost.
+        import modules.utils.cli_utils as cu
+        monkeypatch.setattr(cu, "CLI_OUTPUT_FORMAT", "text")
+
         manager = ConversationManager()
         result = asyncio.run(
             manager.continue_conversation("ffffffff-0000-0000-0000-000000000000", "hello")
@@ -401,3 +405,141 @@ class TestListConversationsToleratesJunkMetadata:
         # Must return a list, not raise.
         result = ConversationManager().list_conversations(status_filter=status_filter)
         assert isinstance(result, list)
+
+
+class TestConversationBinding:
+    """
+    gemini_start_conversation mints an MCP-level handle that agy has never seen.
+    Because agy silently ignores an unknown --conversation id (starting a new
+    context under a different id while reporting success), the handle must be
+    bound to the id agy reports in its JSON envelope on the first turn.
+    """
+
+    @pytest.fixture
+    def store(self, tmp_path, monkeypatch):
+        import modules.services.conversation_manager as cm
+        import modules.utils.cli_utils as cu
+        s = tmp_path / "conversations"
+        s.mkdir()
+        monkeypatch.setattr(cm, "CONVERSATIONS_DIR", s)
+        monkeypatch.setattr(cm, "METADATA_FILE", tmp_path / "mcp_metadata.json")
+        monkeypatch.setattr(cm, "_ensure_dirs", lambda: None)
+        # Binding needs the JSON transport, so pin a version that provides it
+        # rather than depending on a real agy being installed.
+        monkeypatch.setattr(cu, "_get_cached_or_sync_version", lambda: "1.1.11")
+        monkeypatch.setattr(cu, "CLI_OUTPUT_FORMAT", "auto")
+        return s
+
+    def _fake_agy(self, monkeypatch, store, agy_id):
+        """Stub the subprocess layer, mimicking agy creating/echoing a conversation."""
+        import modules.services.conversation_manager as cm
+        seen = {}
+
+        async def _fake(args, *a, **kw):
+            seen["args"] = list(args)
+            # agy materialises the conversation on disk as it runs.
+            (store / f"{agy_id}.db").write_text("x")
+            return {
+                "status": "success",
+                "stdout": "answer",
+                "stderr": "",
+                "return_code": 0,
+                "conversation_id": agy_id,
+                "usage": {"total_tokens": 10, "cache_read_tokens": 5},
+                "num_turns": 1,
+            }
+
+        monkeypatch.setattr(cm, "execute_cli_with_retry", _fake)
+        return seen
+
+    def test_first_turn_binds_and_omits_conversation_flag(self, store, monkeypatch):
+        agy_id = "bbbb0001-0000-0000-0000-00000000000b"
+        seen = self._fake_agy(monkeypatch, store, agy_id)
+
+        mgr = ConversationManager()
+        created = asyncio.run(mgr.create_conversation(title="t"))
+        handle = created["conversation_id"]
+        assert created["bound"] is False
+
+        result = asyncio.run(mgr.continue_conversation(handle, "hello"))
+
+        assert result["status"] == "success"
+        assert result["bound_on_this_turn"] is True
+        assert result["agy_conversation_id"] == agy_id
+        # The caller's handle stays stable regardless of agy's internal id.
+        assert result["conversation_id"] == handle
+        # The binding turn must NOT pass an id agy has never seen.
+        assert "--conversation" not in seen["args"]
+
+    def test_second_turn_resumes_using_the_bound_id(self, store, monkeypatch):
+        agy_id = "bbbb0002-0000-0000-0000-00000000000b"
+        seen = self._fake_agy(monkeypatch, store, agy_id)
+
+        mgr = ConversationManager()
+        handle = asyncio.run(mgr.create_conversation())["conversation_id"]
+        asyncio.run(mgr.continue_conversation(handle, "first"))
+        result = asyncio.run(mgr.continue_conversation(handle, "second"))
+
+        assert result["status"] == "success"
+        assert result.get("bound_on_this_turn") is None
+        args = seen["args"]
+        assert "--conversation" in args
+        # Resumes agy's id, not the MCP handle.
+        assert args[args.index("--conversation") + 1] == agy_id
+
+    def test_binding_persists_in_the_sidecar(self, store, monkeypatch, tmp_path):
+        import json as _json
+        agy_id = "bbbb0003-0000-0000-0000-00000000000b"
+        self._fake_agy(monkeypatch, store, agy_id)
+
+        mgr = ConversationManager()
+        handle = asyncio.run(mgr.create_conversation())["conversation_id"]
+        asyncio.run(mgr.continue_conversation(handle, "hello"))
+
+        meta = _json.loads((tmp_path / "mcp_metadata.json").read_text())
+        assert meta[handle]["agy_conversation_id"] == agy_id
+
+    def test_binding_follows_agy_if_it_reports_a_different_id(self, store, monkeypatch):
+        # If agy ever resumes something other than what we asked for, following
+        # it is the only way later turns keep the same history.
+        first = "bbbb0004-0000-0000-0000-00000000000b"
+        self._fake_agy(monkeypatch, store, first)
+        mgr = ConversationManager()
+        handle = asyncio.run(mgr.create_conversation())["conversation_id"]
+        asyncio.run(mgr.continue_conversation(handle, "first"))
+
+        second = "bbbb0005-0000-0000-0000-00000000000b"
+        self._fake_agy(monkeypatch, store, second)
+        result = asyncio.run(mgr.continue_conversation(handle, "second"))
+
+        assert result["agy_conversation_id"] == second
+        assert "resumed a different conversation" in result["warning"]
+
+    def test_malformed_reported_id_is_ignored(self, store, monkeypatch):
+        import modules.services.conversation_manager as cm
+
+        async def _fake(args, *a, **kw):
+            return {
+                "status": "success", "stdout": "x", "stderr": "", "return_code": 0,
+                "conversation_id": "../../etc/passwd",
+            }
+
+        monkeypatch.setattr(cm, "execute_cli_with_retry", _fake)
+        mgr = ConversationManager()
+        handle = asyncio.run(mgr.create_conversation())["conversation_id"]
+        result = asyncio.run(mgr.continue_conversation(handle, "hello"))
+        # Never adopt an id that could escape the conversations directory.
+        assert "agy_conversation_id" not in result
+
+    def test_id_from_listing_is_used_directly(self, store, monkeypatch):
+        # An id taken straight from gemini_list_conversations already has a
+        # store, so it should be passed through without a binding turn.
+        existing = "cccc0001-0000-0000-0000-00000000000c"
+        (store / f"{existing}.db").write_text("x")
+        seen = self._fake_agy(monkeypatch, store, existing)
+
+        result = asyncio.run(ConversationManager().continue_conversation(existing, "hi"))
+
+        assert result["status"] == "success"
+        args = seen["args"]
+        assert args[args.index("--conversation") + 1] == existing

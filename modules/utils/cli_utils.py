@@ -35,6 +35,7 @@ from modules.config.cli_config import (
     CLI_TIMEOUT,
     CLI_COMMAND_PATH,
     CLI_LOG_FILE,
+    CLI_OUTPUT_FORMAT,
     CLI_PRINT_TIMEOUT_GRACE,
     RETRY_MAX_ATTEMPTS,
     RETRY_BASE_DELAY,
@@ -65,6 +66,12 @@ _MIN_COMMAND_JSON_VERSION = (1, 1, 8)  # --output-format json (slash-command pay
 # conversation, while still exiting 0 with status SUCCESS. That is the opposite
 # of what these commands are for, so the gate must be enforced, not assumed.
 _MIN_READONLY_SLASH_VERSION = (1, 1, 11)
+_MIN_OUTPUT_FORMAT_VERSION = (1, 1, 8)   # --output-format json|stream-json
+_MIN_JSON_SCHEMA_VERSION = (1, 1, 8)     # --json-schema
+_MIN_EFFORT_VERSION = (1, 1, 5)          # --effort low|medium|high
+
+# Reasoning-effort levels accepted by --effort (agy >= 1.1.5).
+EFFORT_LEVELS = ("low", "medium", "high")
 
 # agy 1.1.4 dropped the short model names; from that version on only the full
 # display name ("Gemini 3.1 Pro (High)") or the stable slug added in 1.1.5
@@ -102,6 +109,126 @@ class CLITimeoutError(CLIExecutionError):
 class CLIRateLimitError(CLIExecutionError):
     """Raised when rate limits are exceeded."""
     pass
+
+
+class CLIProtocolError(CLIExecutionError):
+    """
+    Raised when agy's JSON envelope cannot be parsed or is structurally invalid.
+
+    Deliberately NOT recoverable by re-running in text mode: once JSON was
+    requested, exit 0 no longer proves the run succeeded, and a blind retry could
+    spend quota, invoke tools, or apply file edits a second time. Subclasses
+    CLIExecutionError so existing handlers still catch it.
+    """
+    pass
+
+
+def resolve_output_format(version: tuple[int, ...], version_known: bool) -> str:
+    """
+    Decide the transport for a --print run: "json" or "text".
+
+    CLI_OUTPUT_FORMAT is auto | json | text (validated at import).
+      auto : JSON from agy 1.1.8, text below (and text when the version is
+             unresolvable, since guessing wrong means misreading every result)
+      json : forced; raises below 1.1.8 rather than silently ignoring the choice
+      text : forced legacy path
+
+    Raises:
+        CLIExecutionError: json was forced on an agy that cannot produce it.
+    """
+    if CLI_OUTPUT_FORMAT == "text":
+        return "text"
+
+    supported = version_known and version >= _MIN_OUTPUT_FORMAT_VERSION
+
+    if CLI_OUTPUT_FORMAT == "json":
+        if not supported:
+            raise CLIExecutionError(
+                f"CLI_OUTPUT_FORMAT=json requires agy >= "
+                f"{'.'.join(str(v) for v in _MIN_OUTPUT_FORMAT_VERSION)}, but "
+                f"the installed version is "
+                f"{'.'.join(str(v) for v in version) if version_known else 'unresolvable'}. "
+                f"Use CLI_OUTPUT_FORMAT=auto to fall back to the text transport."
+            )
+        return "json"
+
+    return "json" if supported else "text"
+
+
+def _sanitize_tree(value):
+    """
+    Recursively sanitize credentials in every string inside a parsed structure.
+
+    The JSON envelope must be parsed *before* sanitizing: running the credential
+    regexes over raw envelope text can consume a JSON escape character and leave
+    the payload unparseable. Sanitizing the decoded leaves instead keeps the
+    structure intact while preserving the guarantee that nothing unredacted
+    reaches a client.
+    """
+    if isinstance(value, str):
+        return sanitize_output(value)
+    if isinstance(value, dict):
+        return {k: _sanitize_tree(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_tree(v) for v in value]
+    return value
+
+
+def _adapt_json_envelope(
+    envelope: dict,
+    return_code: int,
+    execution_time: float,
+    stderr_str: str,
+) -> dict:
+    """
+    Map agy's JSON envelope onto this server's internal result contract.
+
+    Preserves the shape every tool already reads ({status, stdout, stderr,
+    return_code, execution_time}) so callers need no changes, and adds the
+    fields only the envelope can provide.
+
+    Critically, ``status`` comes from the envelope, NOT the exit code. In JSON
+    mode agy's exit code is inconsistent: an invalid ``--model`` exits 1, while
+    an unhandled slash command exits 0 with ``status: SUCCESS`` and model prose.
+    The envelope field is the only reliable signal, so ``return_code`` is
+    reported for diagnostics but never used to decide success.
+    """
+    envelope = _sanitize_tree(envelope)
+
+    raw_status = envelope.get("status")
+    ok = raw_status == "SUCCESS"
+
+    result = {
+        "status": "success" if ok else "error",
+        # Legacy alias: tools read result["stdout"] as the model's answer.
+        "stdout": envelope.get("response") or "",
+        "stderr": stderr_str,
+        "return_code": return_code,
+        "execution_time": execution_time,
+        "agy_status": raw_status,
+    }
+
+    if not ok:
+        result["error"] = (
+            envelope.get("error")
+            or f"agy reported status {raw_status!r}"
+        )
+        # On failure the response body is usually empty; surface the error
+        # through stdout too so text-oriented callers still see a reason.
+        if not result["stdout"]:
+            result["stdout"] = result["error"]
+
+    for src, dest in (
+        ("conversation_id", "conversation_id"),
+        ("usage", "usage"),
+        ("num_turns", "num_turns"),
+        ("duration_seconds", "agy_duration_seconds"),
+        ("structured_output", "structured_output"),
+    ):
+        if envelope.get(src) not in (None, "", {}):
+            result[dest] = envelope[src]
+
+    return result
 
 
 def validate_cli_setup() -> bool:
@@ -231,6 +358,8 @@ def _build_cli_args(
     project: Optional[str] = None,
     new_project: bool = False,
     interpret_slash_commands: bool = False,
+    effort: Optional[str] = None,
+    json_schema: Optional[str] = None,
 ) -> list[str]:
     """
     Build argument list for Antigravity CLI execution.
@@ -296,6 +425,32 @@ def _build_cli_args(
             )
         else:
             args.extend(["--model", model])
+
+    if effort:
+        level = effort.strip().lower()
+        if level not in EFFORT_LEVELS:
+            logger.warning(
+                f"Ignoring invalid --effort {effort!r}; expected one of "
+                f"{list(EFFORT_LEVELS)}"
+            )
+        elif version_unknown or version >= _MIN_EFFORT_VERSION:
+            args.extend(["--effort", level])
+        else:
+            logger.warning(
+                f"--effort requires agy >= "
+                f"{'.'.join(str(v) for v in _MIN_EFFORT_VERSION)}, "
+                f"found {cached_version}; skipping"
+            )
+
+    if json_schema:
+        if version_unknown or version >= _MIN_JSON_SCHEMA_VERSION:
+            args.extend(["--json-schema", json_schema])
+        else:
+            logger.warning(
+                f"--json-schema requires agy >= "
+                f"{'.'.join(str(v) for v in _MIN_JSON_SCHEMA_VERSION)}, "
+                f"found {cached_version}; falling back to prompt-only schema"
+            )
 
     if agent:
         if not cached_version:
@@ -402,7 +557,9 @@ def _is_print_invocation(args: list[str]) -> bool:
     )
 
 
-def _apply_print_runtime_flags(args: list[str], timeout: int) -> list[str]:
+def _apply_print_runtime_flags(
+    args: list[str], timeout: int
+) -> tuple[list[str], str]:
     """
     Inject non-interactive print-mode runtime flags onto every `--print` call,
     independent of which tool built the base args.
@@ -416,12 +573,21 @@ def _apply_print_runtime_flags(args: list[str], timeout: int) -> list[str]:
     - ``--log-file``: only when CLI_LOG_FILE is configured (opt-in), routes
       agy's own diagnostics (language-server startup, warnings, update checks)
       to that file so stdout stays a clean response payload for the error scan.
+    - ``--output-format``: the transport, per CLI_OUTPUT_FORMAT and the agy
+      version (see resolve_output_format).
 
-    Flags already present in ``args`` are never overridden. Non-print
-    invocations (``--version``, ``help``) are returned unchanged. The prompt
-    payload itself is excluded from flag detection, so a prompt whose text
-    happens to start with ``--print-timeout=`` / ``--log-file=`` does not
-    suppress injection.
+    Flags already present in ``args`` are never overridden. The prompt payload
+    itself is excluded from flag detection, so a prompt whose text happens to
+    start with ``--print-timeout=`` / ``--log-file=`` does not suppress
+    injection.
+
+    Returns:
+        (args, transport) where transport is one of:
+          "json"     — a JSON envelope is expected on stdout
+          "text"     — legacy plain-text stdout
+          "explicit" — the caller chose --output-format; parse as text and do
+                       not assume any particular shape
+          "none"     — not a print invocation (subcommand); args unchanged
     """
     print_flags = ("--print", "-p", "--prompt")
 
@@ -437,7 +603,7 @@ def _apply_print_runtime_flags(args: list[str], timeout: int) -> list[str]:
         elif any(a.startswith(f + "=") for f in print_flags):
             is_print = True  # joined form: prompt is part of this token
     if not is_print:
-        return args
+        return args, "none"
 
     # Scan flags only, never any prompt payload, in split and joined forms.
     flag_tokens = [a for j, a in enumerate(args) if j not in payload_idxs]
@@ -451,8 +617,22 @@ def _apply_print_runtime_flags(args: list[str], timeout: int) -> list[str]:
     if CLI_LOG_FILE and not _has("--log-file"):
         injected += ["--log-file", CLI_LOG_FILE]
 
+    # Transport. Never override a format the caller chose explicitly (that is
+    # how gemini_cli keeps control of its own output shape), and report back
+    # which transport is in force so execute_cli parses the right way.
+    if _has("--output-format"):
+        transport = "explicit"
+    else:
+        cached_version = _get_cached_or_sync_version()
+        transport = resolve_output_format(
+            _parse_version(cached_version) if cached_version else (0, 0, 0),
+            bool(cached_version),
+        )
+        if transport == "json":
+            injected += ["--output-format", "json"]
+
     # Prepend so injected flags precede the trailing `--print <prompt>` payload.
-    return injected + args
+    return injected + args, transport
 
 
 async def execute_cli(
@@ -476,7 +656,7 @@ async def execute_cli(
         CLIExecutionError: If command fails to execute
     """
     timeout = timeout or CLI_TIMEOUT
-    args = _apply_print_runtime_flags(args, timeout)
+    args, transport = _apply_print_runtime_flags(args, timeout)
     start_time = time.time()
 
     METRICS["commands_executed"] += 1
@@ -521,15 +701,59 @@ async def execute_cli(
         execution_time = time.time() - start_time
         METRICS["total_execution_time"] += execution_time
 
-        stdout_str = sanitize_output(stdout.decode("utf-8", errors="replace"))
+        raw_stdout = stdout.decode("utf-8", errors="replace")
         stderr_str = sanitize_output(
             stderr.decode("utf-8", errors="replace") if stderr else ""
         )
 
-        # Error detection: hybrid strategy for backward compatibility.
+        # Rate limiting is checked before transport parsing: on the JSON path a
+        # rate-limit failure still surfaces on stderr, and raising here keeps the
+        # retry semantics identical across both transports.
+        if _is_print_invocation(args) and _is_rate_limit_signal(stderr_str):
+            METRICS["rate_limit_hits"] += 1
+            _record_security_event("rate_limit", "medium", "execute_cli",
+                                   {"detail": stderr_str[:500]})
+            raise CLIRateLimitError(f"Rate limit exceeded: {stderr_str}")
+
+        if transport == "json":
+            # Parse BEFORE sanitizing: the credential regexes can consume a JSON
+            # escape and leave the envelope unparseable, so the sanitizer runs
+            # over the decoded leaves instead (see _adapt_json_envelope).
+            try:
+                envelope = json.loads(raw_stdout)
+            except (ValueError, TypeError) as e:
+                METRICS["commands_failed"] += 1
+                # No text-mode fallback: having asked for JSON, exit 0 proves
+                # nothing, and re-running could spend quota or repeat file edits.
+                raise CLIProtocolError(
+                    f"agy returned an unparseable JSON envelope "
+                    f"(exit {process.returncode}): {e}. "
+                    f"stderr: {stderr_str[:500]}"
+                )
+            if not isinstance(envelope, dict):
+                METRICS["commands_failed"] += 1
+                raise CLIProtocolError(
+                    f"agy returned a non-object JSON root "
+                    f"({type(envelope).__name__}) in place of an envelope."
+                )
+
+            result = _adapt_json_envelope(
+                envelope, process.returncode, execution_time, stderr_str
+            )
+            if result["status"] == "success":
+                METRICS["commands_succeeded"] += 1
+            else:
+                METRICS["commands_failed"] += 1
+            return result
+
+        stdout_str = sanitize_output(raw_stdout)
+
+        # Text-transport error detection: hybrid strategy for backward
+        # compatibility. Only reached on agy < 1.1.8, with CLI_OUTPUT_FORMAT=text,
+        # or for non-print subcommands — the JSON path above has an authoritative
+        # status field and needs none of this guesswork.
         # - agy < 1.1.1: always exit 0, errors only in stdout patterns.
         # - agy >= 1.1.1: server-side failures return non-zero exit + stderr.
-        # Both paths are kept so the bridge works across agy versions.
         error_patterns = [
             r'^Error:\s+',
             r'^CLI error:\s+',
@@ -539,21 +763,6 @@ async def execute_cli(
             re.search(p, stdout_str, re.IGNORECASE | re.MULTILINE)
             for p in error_patterns
         )
-
-        # Check stderr for rate limiting signals (takes priority). Matching is
-        # deliberately inclusive — see _is_rate_limit_signal for why that is safe
-        # here and why narrowing it to exact phrasings caused a regression.
-        #
-        # Restricted to --print runs: only those can actually be rate limited,
-        # and agy routes some subcommand output entirely to stderr (`agy help`
-        # writes ~2KB there and nothing to stdout). Scanning that would let one
-        # future help line naming a rate limit turn gemini_help into three
-        # retries followed by a bogus CLIRateLimitError.
-        if _is_print_invocation(args) and _is_rate_limit_signal(stderr_str):
-            METRICS["rate_limit_hits"] += 1
-            _record_security_event("rate_limit", "medium", "execute_cli",
-                                   {"detail": stderr_str[:500]})
-            raise CLIRateLimitError(f"Rate limit exceeded: {stderr_str}")
 
         if process.returncode != 0 or has_error_in_stdout:
             METRICS["commands_failed"] += 1
@@ -579,7 +788,10 @@ async def execute_cli(
                 "execution_time": execution_time
             }
 
-    except (CLITimeoutError, CLIRateLimitError):
+    except (CLITimeoutError, CLIRateLimitError, CLIProtocolError):
+        # Re-raise typed failures unchanged; the generic handler below would
+        # flatten them into CLIExecutionError and lose the distinction (a
+        # protocol error in particular must never look like a retryable one).
         raise
     except FileNotFoundError:
         METRICS["commands_failed"] += 1
@@ -599,6 +811,7 @@ async def execute_cli_with_retry(
     args: list[str],
     timeout: Optional[int] = None,
     max_attempts: Optional[int] = None,
+    mutating: bool = True,
 ) -> dict:
     """
     Execute Antigravity CLI with exponential backoff retry.
@@ -607,15 +820,30 @@ async def execute_cli_with_retry(
     (a blind re-run rarely succeeds and would multiply the per-task budget), and
     non-transient execution errors are not retried.
 
+    Retry policy is invocation-aware, because a whole-process retry re-runs the
+    *entire* agent turn. agy allows hundreds of tool calls per run, so a rate
+    limit hit partway through may leave commands already executed and files
+    already edited; repeating that is worse than surfacing the failure.
+
+      mutating=True  (default): no automatic retry. Safe for anything that can
+                     write files or run commands.
+      mutating=False: up to `max_attempts` retries. Only for invocations that
+                     cannot change state — discovery reads and analysis whose
+                     prompt forbids modification.
+
+    CLIProtocolError is never retried: once JSON was requested, a failed parse
+    means the run's outcome is unknown, and re-running could double-apply it.
+
     Args:
         args: Command line arguments for agy
         timeout: Optional timeout in seconds
-        max_attempts: Maximum retry attempts (defaults to RETRY_MAX_ATTEMPTS)
+        max_attempts: Maximum attempts for retryable invocations
+        mutating: Whether this invocation can change state (see above)
 
     Returns:
         Dictionary with execution results
     """
-    max_attempts = max_attempts or RETRY_MAX_ATTEMPTS
+    max_attempts = 1 if mutating else (max_attempts or RETRY_MAX_ATTEMPTS)
     last_error = None
 
     for attempt in range(1, max_attempts + 1):
@@ -639,6 +867,12 @@ async def execute_cli_with_retry(
         except CLITimeoutError as e:
             # Don't retry timeouts: a blind re-run rarely succeeds and would
             # multiply the (now per-task, possibly 900s) budget by max_attempts.
+            last_error = e
+            break
+
+        except CLIProtocolError as e:
+            # The run's outcome is unknown — it may well have succeeded and
+            # written files. Never repeat it.
             last_error = e
             break
 
@@ -838,6 +1072,56 @@ async def validate_model(model: Optional[str]) -> dict:
             f"the default model."
         )
     }
+
+
+async def validate_effort(effort: Optional[str], model: Optional[str] = None) -> dict:
+    """
+    Validate a requested reasoning-effort level.
+
+    Returns metadata to merge into the tool response (same convention as
+    validate_model), empty when there is nothing to report.
+
+    Also flags the contradictory case of an effort-suffixed model slug combined
+    with a different explicit effort (e.g. model="gemini-3.1-pro-low" with
+    effort="high"): agy's precedence there is not documented, so the caller
+    should be told rather than silently getting one of the two.
+    """
+    if not effort:
+        return {}
+
+    level = effort.strip().lower()
+    if level not in EFFORT_LEVELS:
+        return {
+            "warning": (
+                f"effort '{effort}' is not valid (expected one of "
+                f"{list(EFFORT_LEVELS)}); it was not applied."
+            )
+        }
+
+    cached_version = _get_cached_or_sync_version()
+    if cached_version and _parse_version(cached_version) < _MIN_EFFORT_VERSION:
+        return {
+            "warning": (
+                f"--effort '{level}' was not applied: agy >= "
+                f"{'.'.join(str(v) for v in _MIN_EFFORT_VERSION)} is required "
+                f"(found {cached_version})."
+            )
+        }
+
+    if model:
+        slug = model.strip().lower()
+        for other in EFFORT_LEVELS:
+            if other != level and slug.endswith(f"-{other}"):
+                return {
+                    "warning": (
+                        f"model '{model}' already pins effort '{other}' but "
+                        f"effort='{level}' was also passed; agy's precedence "
+                        f"between the two is unspecified. Pass a base slug "
+                        f"(e.g. 'gemini-3.5-flash') with effort, or drop effort."
+                    )
+                }
+
+    return {}
 
 
 def add_model_metadata(result: dict, model_meta: dict) -> dict:

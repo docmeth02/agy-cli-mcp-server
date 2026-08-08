@@ -216,7 +216,16 @@ class ConversationManager:
         tags: Optional[list[str]] = None,
         expiration_hours: int = DEFAULT_EXPIRATION_HOURS
     ) -> dict:
-        """Create a new conversation."""
+        """
+        Create a conversation handle.
+
+        The id minted here is an MCP-level handle, deliberately stable for the
+        caller's whole session. agy does not know it yet: nothing is created
+        server-side and no quota is spent. The handle is *bound* to a real agy
+        conversation on the first continue_conversation() call, which runs without
+        --conversation and records the id agy reports back in its JSON envelope
+        (see agy_conversation_id below).
+        """
         conversation_id = str(uuid.uuid4())
         now = time.time()
 
@@ -229,6 +238,10 @@ class ConversationManager:
                 "created_at": now,
                 "updated_at": now,
                 "expiration_hours": expiration_hours,
+                # None until the first turn binds this handle to an agy-side
+                # conversation. An unbound handle is not resumable, because agy
+                # silently ignores an id it has never seen.
+                "agy_conversation_id": None,
             }
             saved = _save_metadata(metadata)
 
@@ -246,6 +259,12 @@ class ConversationManager:
             "created_at": now,
             "expiration_hours": expiration_hours,
             "message_count": 0,
+            "bound": False,
+            "note": (
+                "Not yet backed by an agy conversation. The first "
+                "gemini_continue_conversation call on this id starts the "
+                "conversation and binds it; subsequent calls resume it."
+            ),
         }
 
     async def continue_conversation(
@@ -255,40 +274,79 @@ class ConversationManager:
         model: Optional[str] = None,
         project: Optional[str] = None,
     ) -> dict:
-        """Continue an existing conversation via agy."""
+        """
+        Continue a conversation via agy, binding the handle on its first turn.
+
+        agy silently ignores an unknown ``--conversation`` id: it starts a
+        brand-new conversation under a different id, exits 0, and emits no
+        warning (verified on 1.1.11 in both text and JSON output modes). So the
+        id must be one agy actually knows.
+
+        Resolution order for the agy-side id:
+          1. a recorded ``agy_conversation_id`` binding, else
+          2. the handle itself, when a store already exists under that name
+             (covers ids taken straight from gemini_list_conversations), else
+          3. unbound — run WITHOUT ``--conversation`` and adopt the id agy
+             reports in its JSON envelope, recording it as the binding.
+
+        Case 3 needs the JSON transport to learn the id. On the text transport
+        there is nothing to read it from, so an unbound handle is refused rather
+        than silently starting a context that can never be resumed.
+        """
         if not prompt or not prompt.strip():
             return {"status": "error", "error": "Prompt cannot be empty"}
 
         if not _is_valid_conversation_id(conversation_id):
             return _invalid_id_error(conversation_id)
 
-        # agy silently ignores an unknown --conversation id: it starts a brand-new
-        # conversation under a different id, exits 0, and emits no warning
-        # (verified on 1.1.11, in both text and JSON output modes). Since
-        # create_conversation() mints its own uuid4 that agy never sees, passing
-        # it through would produce a fresh, historyless context on every call
-        # while still reporting success. Require a real agy-side store instead of
-        # silently losing history — this subsumes the sidecar-metadata check,
-        # because a sidecar entry alone is not something agy can resume. The
-        # real fix, binding the sidecar entry to the id agy reports back in its
-        # JSON envelope, needs the JSON transport.
-        if not _conversation_exists(conversation_id):
-            return {
-                "status": "error",
-                "error": (
-                    f"Conversation {conversation_id} has no agy-side history yet, "
-                    f"so continuing it would silently start a new context instead "
-                    f"of resuming. Use gemini_prompt for a one-shot request, or "
-                    f"pass a conversation_id from gemini_list_conversations whose "
-                    f"has_native_file is true."
-                ),
-                "error_code": "CONVERSATION_NOT_BOUND",
-            }
+        metadata = _load_metadata()
+        meta = metadata.get(conversation_id) or {}
+        bound_id = meta.get("agy_conversation_id")
+        if bound_id and not _is_valid_conversation_id(bound_id):
+            logger.warning(
+                f"Ignoring malformed agy_conversation_id for {conversation_id}"
+            )
+            bound_id = None
 
-        from modules.utils.cli_utils import _build_cli_args
+        if bound_id and _conversation_exists(bound_id):
+            agy_id = bound_id
+        elif _conversation_exists(conversation_id):
+            agy_id = conversation_id
+        else:
+            agy_id = None  # unbound — this turn will create and adopt one
+
+        from modules.utils.cli_utils import (
+            _build_cli_args, resolve_output_format, _get_cached_or_sync_version,
+            _parse_version,
+        )
+
+        if agy_id is None:
+            cached_version = _get_cached_or_sync_version()
+            transport = resolve_output_format(
+                _parse_version(cached_version) if cached_version else (0, 0, 0),
+                bool(cached_version),
+            )
+            if transport != "json":
+                return {
+                    "status": "error",
+                    "error": (
+                        f"Conversation {conversation_id} is not yet bound to an agy "
+                        f"conversation, and binding requires agy's JSON transport "
+                        f"(agy >= 1.1.8 with CLI_OUTPUT_FORMAT=auto or json). "
+                        f"Without it the new conversation's id cannot be captured, "
+                        f"so this turn would start a context that can never be "
+                        f"resumed. Use gemini_prompt for a one-shot request, or "
+                        f"pass an id from gemini_list_conversations whose "
+                        f"has_native_file is true."
+                    ),
+                    "error_code": "CONVERSATION_NOT_BOUND",
+                }
+
         args = _build_cli_args(
             prompt=prompt,
-            conversation_id=conversation_id,
+            # Omitted on the binding turn: passing an id agy does not know would
+            # be silently discarded anyway.
+            conversation_id=agy_id,
             model=model,
             project=project,
         )
@@ -296,28 +354,57 @@ class ConversationManager:
         try:
             result = await execute_cli_with_retry(args)
 
+            # Adopt whatever id agy actually used. On the binding turn this is
+            # the new conversation; on later turns it should echo agy_id back,
+            # and if it ever differs, agy started a different conversation and
+            # the binding must follow it or every later turn loses history.
+            reported = result.get("conversation_id")
+            if reported and not _is_valid_conversation_id(reported):
+                logger.warning(f"agy reported a malformed conversation id: {reported!r}")
+                reported = None
+
             async with _get_metadata_lock():
                 metadata = _load_metadata()
                 now = time.time()
-                if conversation_id in metadata:
-                    metadata[conversation_id]["updated_at"] = now
-                    if model:
-                        metadata[conversation_id]["model"] = model
-                    saved = _save_metadata(metadata)
-                else:
-                    saved = True
+                entry = metadata.setdefault(conversation_id, {
+                    "title": f"Conversation {conversation_id[:8]}",
+                    "created_at": now,
+                    "expiration_hours": DEFAULT_EXPIRATION_HOURS,
+                })
+                entry["updated_at"] = now
+                if model:
+                    entry["model"] = model
+                if reported:
+                    entry["agy_conversation_id"] = reported
+                saved = _save_metadata(metadata)
 
             self._stats["messages_added"] += 1
 
             response = {
                 "status": result.get("status", "success"),
+                # The caller's stable handle, not agy's internal id.
                 "conversation_id": conversation_id,
                 "response": result.get("stdout", ""),
             }
+            if reported:
+                response["agy_conversation_id"] = reported
+                response["bound"] = True
+                if agy_id is None:
+                    response["bound_on_this_turn"] = True
+                elif reported != agy_id:
+                    response["warning"] = (
+                        f"agy resumed a different conversation ({reported}) than "
+                        f"requested ({agy_id}); the binding has been updated."
+                    )
+            for key in ("usage", "num_turns", "error"):
+                if result.get(key) is not None:
+                    response[key] = result[key]
             if model:
                 response["model"] = model
             if not saved:
-                response["warning"] = "metadata update failed"
+                existing = response.get("warning")
+                note = "metadata update failed"
+                response["warning"] = f"{existing} | {note}" if existing else note
             if result.get("stderr"):
                 response["stderr"] = result["stderr"]
             return response

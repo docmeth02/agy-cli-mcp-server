@@ -14,7 +14,28 @@ from typing import Optional
 CLI_TIMEOUT = int(os.getenv("CLI_TIMEOUT", os.getenv("GEMINI_TIMEOUT", "300")))
 CLI_COMMAND_PATH = os.getenv("CLI_COMMAND_PATH", os.getenv("GEMINI_COMMAND_PATH", "agy"))
 CLI_LOG_LEVEL = os.getenv("CLI_LOG_LEVEL", os.getenv("GEMINI_LOG_LEVEL", "INFO")).upper()
-CLI_OUTPUT_FORMAT = os.getenv("CLI_OUTPUT_FORMAT", os.getenv("GEMINI_OUTPUT_FORMAT", "json"))
+
+# Transport for --print runs. agy 1.1.8 added `--output-format json`, whose
+# envelope carries an authoritative status, the real conversation id, and token
+# accounting — replacing the regex/exit-code guessing the text path needs.
+#
+#   auto (default) : JSON on agy >= 1.1.8, text below
+#   json           : force JSON; a configuration error below 1.1.8
+#   text           : force the legacy text path (escape hatch)
+#
+# Note this knob previously existed and defaulted to "json" while being read by
+# nothing at all. It is now live, so the default is "auto" rather than "json" —
+# "json" would be a hard error on older agy instead of degrading.
+CLI_OUTPUT_FORMAT = os.getenv(
+    "CLI_OUTPUT_FORMAT", os.getenv("GEMINI_OUTPUT_FORMAT", "auto")
+).strip().lower()
+
+_VALID_OUTPUT_FORMATS = frozenset({"auto", "text", "json"})
+if CLI_OUTPUT_FORMAT not in _VALID_OUTPUT_FORMATS:
+    raise ValueError(
+        f"CLI_OUTPUT_FORMAT must be one of {sorted(_VALID_OUTPUT_FORMATS)}, "
+        f"got {CLI_OUTPUT_FORMAT!r}"
+    )
 
 # Optional override for agy's own diagnostic log file (language-server startup,
 # warnings, update checks). Set CLI_LOG_FILE to a real, writable path to keep
@@ -140,6 +161,35 @@ TASK_MODEL_DEFAULTS: dict[str, Optional[str]] = {
     "sandbox": None,
     "continue_conversation": None,
 }
+
+
+# Per-task default reasoning effort (agy >= 1.1.5). Empty by default: most model
+# slugs already pin an effort tier (gemini-3.1-pro-high), so adding a second
+# source of truth would just create conflicts. Set CLI_EFFORT_{TASK} to override
+# per tool, or CLI_DEFAULT_EFFORT globally, when using a base slug.
+DEFAULT_EFFORT = os.getenv("CLI_DEFAULT_EFFORT", os.getenv("GEMINI_DEFAULT_EFFORT", ""))
+
+TASK_EFFORT_DEFAULTS: dict[str, Optional[str]] = {}
+
+
+def get_task_effort(task: str, explicit: Optional[str] = None) -> Optional[str]:
+    """
+    Resolve the effective reasoning effort for a tool invocation.
+
+    Resolution: explicit > CLI_EFFORT_{TASK} env > task default > CLI_DEFAULT_EFFORT.
+    Returns None when no --effort should be passed (agy uses the model's own tier).
+    """
+    if explicit:
+        return explicit
+
+    env_key = task.upper()
+    env_effort = os.getenv(
+        f"CLI_EFFORT_{env_key}", os.getenv(f"GEMINI_EFFORT_{env_key}", "")
+    )
+    if env_effort:
+        return env_effort
+
+    return TASK_EFFORT_DEFAULTS.get(task) or DEFAULT_EFFORT or None
 
 
 def get_task_model(task: str, explicit: Optional[str] = None) -> Optional[str]:
