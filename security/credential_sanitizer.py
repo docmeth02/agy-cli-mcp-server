@@ -48,11 +48,23 @@ CREDENTIAL_PATTERNS = [
     # per marker.
     # The 16KB cap comfortably covers real keys (a 4096-bit RSA key is ~3.2KB);
     # a longer BEGIN/END block is left unredacted rather than scanned unboundedly.
-    (r'-----BEGIN (RSA |EC |DSA )?PRIVATE KEY-----(?:[^-]|-(?!----)){0,16384}-----END (RSA |EC |DSA )?PRIVATE KEY-----',
+    (r'-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED |PGP )?PRIVATE KEY(?: BLOCK)?-----'
+     r'(?:[^-]|-(?!----)){0,16384}'
+     r'-----END (?:RSA |EC |DSA |OPENSSH |ENCRYPTED |PGP )?PRIVATE KEY(?: BLOCK)?-----',
      '[REDACTED_PRIVATE_KEY]'),
 
-    # JWT tokens
-    (r'eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+', '[REDACTED_JWT]'),
+    # JWT tokens.
+    # The leading lookbehind is a cost fix, not a precision one: without it every
+    # third character of a base64 run like "eyJeyJeyJ..." starts a fresh
+    # candidate (e, y and J are all in the character class) and each scans to
+    # end-of-string looking for a '.'. That is quadratic — measured 1.1s at 64KB
+    # and 4.5s at 128KB, extrapolating to minutes at 1MB, all synchronous and
+    # outside the asyncio timeout. Anchoring to a token boundary makes those
+    # interior positions non-starts; segment bounds cap the remaining work.
+    # (Possessive quantifiers do NOT help here, and a '.' prefilter is defeated
+    # by a single dot anywhere in the payload.)
+    (r'(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{1,8192}\.[A-Za-z0-9_-]{1,8192}\.[A-Za-z0-9_-]{1,8192}',
+     '[REDACTED_JWT]'),
 ]
 
 # Compile patterns for performance
@@ -70,8 +82,15 @@ COMPILED_PATTERNS = [
 # the check while every BEGIN marker still gets scanned; that was measured at
 # 6.7s for 1MB. The cost fix is the private-key pattern's body, which cannot
 # consume a "-----" run (see above).
-PATTERN_PREFILTERS: dict[str, str] = {
-    '[REDACTED_PRIVATE_KEY]': '-----END',
+# Keyed by the compiled pattern object, not by replacement text: keying on the
+# replacement would let a caller-supplied additional_pattern reusing the same
+# placeholder silently inherit this gate and skip its own redaction.
+_PRIVATE_KEY_PATTERN_INDEX = next(
+    i for i, (_p, r) in enumerate(CREDENTIAL_PATTERNS)
+    if r == '[REDACTED_PRIVATE_KEY]'
+)
+PATTERN_PREFILTERS: dict[re.Pattern, str] = {
+    COMPILED_PATTERNS[_PRIVATE_KEY_PATTERN_INDEX][0]: '-----END',
 }
 
 
@@ -108,7 +127,7 @@ class CredentialSanitizer:
 
         result = content
         for pattern, replacement in self.patterns:
-            prefilter = PATTERN_PREFILTERS.get(replacement)
+            prefilter = PATTERN_PREFILTERS.get(pattern)
             if prefilter and prefilter.lower() not in result.lower():
                 continue
             result = pattern.sub(replacement, result)
@@ -129,7 +148,7 @@ class CredentialSanitizer:
             return False
 
         for pattern, replacement in self.patterns:
-            prefilter = PATTERN_PREFILTERS.get(replacement)
+            prefilter = PATTERN_PREFILTERS.get(pattern)
             if prefilter and prefilter.lower() not in content.lower():
                 continue
             if pattern.search(content):
@@ -152,7 +171,7 @@ class CredentialSanitizer:
 
         locations = []
         for pattern, replacement in self.patterns:
-            prefilter = PATTERN_PREFILTERS.get(replacement)
+            prefilter = PATTERN_PREFILTERS.get(pattern)
             if prefilter and prefilter.lower() not in content.lower():
                 continue
             for match in pattern.finditer(content):

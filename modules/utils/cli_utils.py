@@ -256,6 +256,7 @@ def _extract_json_envelope(raw: str):
     decoder = json.JSONDecoder()
     search = 0
     skipped = 0
+    candidates = []
     while True:
         start = raw.find("{", search)
         if start == -1:
@@ -268,21 +269,31 @@ def _extract_json_envelope(raw: str):
             continue
 
         if isinstance(candidate, dict) and "status" in candidate:
-            logger.warning(
-                "agy stdout carried non-JSON noise around the envelope; "
-                "recovered the envelope%s. Set CLI_LOG_FILE to route agy "
-                "diagnostics off stdout.",
-                f" (skipped {skipped} non-envelope object(s))" if skipped else "",
-            )
-            return candidate
-
-        skipped += 1
+            candidates.append(candidate)
+        else:
+            skipped += 1
         search = max(end, start + 1)
 
-    raise ValueError(
-        "no envelope-shaped JSON object (one carrying a \"status\" key) found "
-        "in agy stdout"
+    if not candidates:
+        raise ValueError(
+            "no envelope-shaped JSON object (one carrying a \"status\" key) "
+            "found in agy stdout"
+        )
+    if len(candidates) > 1:
+        # Do NOT pick one. Two status-bearing objects means either agy changed
+        # its output or something injected an envelope; choosing either could
+        # report a failed run as successful with content we did not generate.
+        raise ValueError(
+            f"agy stdout contained {len(candidates)} envelope-shaped JSON "
+            f"objects; refusing to guess which is the real envelope"
+        )
+
+    logger.warning(
+        "agy stdout carried non-JSON noise around the envelope; recovered the "
+        "envelope%s. Set CLI_LOG_FILE to route agy diagnostics off stdout.",
+        f" (skipped {skipped} non-envelope object(s))" if skipped else "",
     )
+    return candidates[0]
 
 
 def _adapt_json_envelope(
@@ -856,7 +867,9 @@ async def execute_cli(
                 raise CLIProtocolError(
                     f"agy returned an unparseable JSON envelope "
                     f"(exit {process.returncode}): {e}. "
-                    f"stdout excerpt: {sanitize_output(raw_stdout)[:500]!r}. "
+                    # Truncate BEFORE sanitizing: otherwise a multi-megabyte stdout is
+                    # fully scanned just to produce a 500-char excerpt.
+                    f"stdout excerpt: {sanitize_output(raw_stdout[:2000])[:500]!r}. "
                     f"stderr: {stderr_str[:500]}"
                 )
             if not isinstance(envelope, dict):
@@ -866,16 +879,16 @@ async def execute_cli(
                     f"({type(envelope).__name__}) in place of an envelope."
                 )
 
+            # Only an EXPLICIT zero counts as proof of no work. A missing counter
+            # is not evidence — e.g. {"usage": {"input_tokens": 16262}} with no
+            # total_tokens and no num_turns would otherwise unlock retries after
+            # 16k tokens were already spent. Any nonzero counter means work.
             usage = envelope.get("usage")
-            spent = usage.get("total_tokens") if isinstance(usage, dict) else None
-            turns = envelope.get("num_turns")
-            if turns is None and not isinstance(usage, dict):
-                # Neither counter reported: absence is not proof that nothing ran,
-                # so fall back to the conservative assumption rather than
-                # unlocking retries on a future agy that stops emitting them.
-                work_done = True
-            else:
-                work_done = bool(turns) or bool(spent)
+            usage = usage if isinstance(usage, dict) else {}
+            counters = [envelope.get("num_turns"), usage.get("total_tokens")]
+            reported = [c for c in counters if isinstance(c, (int, float))
+                        and not isinstance(c, bool)]
+            work_done = (not reported) or any(c != 0 for c in reported)
 
             # In JSON mode agy leaves stderr EMPTY and puts the reason in the
             # envelope (verified: an invalid --model gives exit 1, a 676-byte

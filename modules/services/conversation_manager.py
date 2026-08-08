@@ -94,6 +94,25 @@ def _get_handle_lock(conversation_id: str) -> asyncio.Lock:
     return lock
 
 
+def _release_handle_lock(conversation_id: str) -> None:
+    """
+    Drop a per-handle lock once nobody holds or awaits it.
+
+    Without this the table grows one entry per distinct id forever, and a caller
+    passing many ids (including ones rejected early) could grow it without bound.
+    Keeping the entry while it is held or contended is essential — removing it
+    then would let a second turn create a fresh lock and defeat the serialisation.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    key = (id(loop), conversation_id)
+    lock = _handle_locks.get(key)
+    if lock is not None and not lock.locked():
+        _handle_locks.pop(key, None)
+
+
 def _get_metadata_lock() -> asyncio.Lock:
     """Get an asyncio.Lock bound to the current event loop."""
     loop = asyncio.get_running_loop()
@@ -333,10 +352,14 @@ class ConversationManager:
         # Held for the whole resolve -> run -> bind sequence, so two concurrent
         # turns on this handle cannot both take the binding path (which would
         # create two agy conversations and orphan one, quota already spent).
-        async with _get_handle_lock(conversation_id):
-            return await self._continue_locked(
-                conversation_id, prompt, model, project
-            )
+        lock = _get_handle_lock(conversation_id)
+        try:
+            async with lock:
+                return await self._continue_locked(
+                    conversation_id, prompt, model, project
+                )
+        finally:
+            _release_handle_lock(conversation_id)
 
     async def _continue_locked(
         self,
