@@ -385,8 +385,8 @@ class TestInvocationAwareRetry:
 
 class TestRateLimitFromEnvelope:
     """
-    In JSON mode agy leaves stderr EMPTY and puts the failure reason in the
-    envelope (verified against 1.1.11: an invalid --model gives exit 1, a
+    In JSON mode the failure reason is in the envelope, and before agy 1.1.28
+    stderr was EMPTY (verified against 1.1.11: an invalid --model gives exit 1, a
     676-byte envelope and 0 bytes of stderr). Scanning stderr alone made
     rate-limit detection — and the whole retry policy — unreachable on the
     default transport.

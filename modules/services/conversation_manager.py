@@ -500,7 +500,7 @@ class ConversationManager:
                 )
             else:
                 response["bound"] = True
-            for key in ("usage", "num_turns", "error"):
+            for key in ("usage", "num_turns", "error", "agy_error", "denied_actions"):
                 if result.get(key) is not None:
                     response[key] = result[key]
             if model:

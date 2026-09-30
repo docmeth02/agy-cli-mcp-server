@@ -71,9 +71,18 @@ _MIN_JSON_SCHEMA_VERSION = (1, 1, 8)     # --json-schema
 # SILENTLY IGNORED in headless -p runs. Gate on 1.1.10 so the flag is only
 # passed where it actually takes effect, rather than appearing to work.
 _MIN_EFFORT_VERSION = (1, 1, 10)
+# `max` joined the --effort vocabulary in 1.2.11 ("models with different
+# support"). No model in the 1.2.14 roster actually offers it — agy rejects it
+# per model with the tiers that model does have — but the level itself is valid.
+_MIN_MAX_EFFORT_VERSION = (1, 2, 11)
 
-# Reasoning-effort levels accepted by --effort (agy >= 1.1.5).
-EFFORT_LEVELS = ("low", "medium", "high")
+# Reasoning-effort levels accepted by --effort (agy >= 1.1.5; `max` >= 1.2.11).
+EFFORT_LEVELS = ("low", "medium", "high", "max")
+
+
+def _min_effort_version(level: str) -> tuple[int, ...]:
+    """The agy floor for passing --effort at this level."""
+    return _MIN_MAX_EFFORT_VERSION if level == "max" else _MIN_EFFORT_VERSION
 
 # agy 1.1.4 dropped the short model names; from that version on only the full
 # display name ("Gemini 3.1 Pro (High)") or the stable slug added in 1.1.5
@@ -118,11 +127,18 @@ class CLIRateLimitError(CLIExecutionError):
     request before running anything, so repeating it cannot duplicate work.
     Defaults to True (assume work happened) whenever that cannot be established —
     notably on the text transport, which reports no counters.
+
+    ``retryable`` is agy's own verdict from its structured ``AGY_ERROR`` line
+    (agy >= 1.2.6), or None when agy gave none. Only an explicit False vetoes a
+    retry: since 1.2.13 agy already waits out short server-advised delays itself
+    and gives up on daily/billing caps, so re-running those only burns time.
     """
 
-    def __init__(self, message: str, work_done: bool = True):
+    def __init__(self, message: str, work_done: bool = True,
+                 retryable: Optional[bool] = None):
         super().__init__(message)
         self.work_done = work_done
+        self.retryable = retryable
 
 
 class CLIProtocolError(CLIExecutionError):
@@ -217,6 +233,51 @@ def _sanitize_tree(value):
     if isinstance(value, list):
         return [_sanitize_tree(v) for v in value]
     return value
+
+
+_AGY_ERROR_PREFIX = "AGY_ERROR:"
+_AGY_ERROR_MAX_LEN = 64 * 1024
+
+
+def _parse_agy_error(stderr: str) -> Optional[dict]:
+    """
+    Extract agy's structured headless error record from stderr, if any.
+
+    agy >= 1.2.6 ends a headless turn that failed on an agent or model API error
+    with one stderr line ``AGY_ERROR: {...}`` (canonical status, HTTP/gRPC code,
+    retryability, error id) and exit code 3. The field set is not documented;
+    the binary's JSON tags are ``short_error``, ``status``, ``code``,
+    ``retryable`` and ``error_id``, so the record is passed through as-is and
+    only ``retryable`` is interpreted (see CLIRateLimitError).
+
+    Returns the LAST usable record (the terminal one), sanitized, or None when
+    no candidate decodes to an object — this is diagnostic
+    enrichment and must never turn a result into a failure by itself.
+    """
+    if not stderr or _AGY_ERROR_PREFIX not in stderr:
+        return None
+    for line in reversed(stderr.splitlines()):
+        # Tolerate a log prefix ("2026/09/30 10:00:00 AGY_ERROR: {...}"): the
+        # line format was never observed live, only the binary's format string.
+        idx = line.find(_AGY_ERROR_PREFIX)
+        if idx < 0:
+            continue
+        line = line[idx:].strip()
+        # A genuine record is a few hundred bytes; skip pathological ones rather
+        # than sanitize megabytes twice (the full stderr is sanitized anyway).
+        if len(line) > _AGY_ERROR_MAX_LEN:
+            continue
+        try:
+            record = json.loads(line[len(_AGY_ERROR_PREFIX):].strip())
+            # Inside the try: _sanitize_tree recurses and fails at roughly half
+            # the depth json.loads accepts, and a RecursionError escaping here
+            # would turn a SUCCESSFUL run into an execution failure.
+            if isinstance(record, dict):
+                return _sanitize_tree(record)
+        except (ValueError, RecursionError):
+            pass
+        # Unusable candidate: fall back to an earlier record rather than none.
+    return None
 
 
 def _extract_json_envelope(raw: str):
@@ -348,8 +409,11 @@ def _adapt_json_envelope(
         ("structured_output", "structured_output"),
         # Read-only slash commands (/usage, /credits, ...) answer here.
         ("command", "command"),
+        # agy >= 1.1.27: tool actions the headless run was not permitted to
+        # take (previously skipped silently).
+        ("denied_actions", "denied_actions"),
     ):
-        if envelope.get(src) not in (None, "", {}):
+        if envelope.get(src) not in (None, "", {}, []):
             result[dest] = envelope[src]
 
     return result
@@ -557,12 +621,12 @@ def _build_cli_args(
                 f"Ignoring invalid --effort {effort!r}; expected one of "
                 f"{list(EFFORT_LEVELS)}"
             )
-        elif version_unknown or version >= _MIN_EFFORT_VERSION:
+        elif version_unknown or version >= _min_effort_version(level):
             args.extend(["--effort", level])
         else:
             logger.warning(
-                f"--effort requires agy >= "
-                f"{'.'.join(str(v) for v in _MIN_EFFORT_VERSION)}, "
+                f"--effort {level} requires agy >= "
+                f"{'.'.join(str(v) for v in _min_effort_version(level))}, "
                 f"found {cached_version}; skipping"
             )
 
@@ -688,9 +752,9 @@ def _apply_print_runtime_flags(
     Inject non-interactive print-mode runtime flags onto every `--print` call,
     independent of which tool built the base args.
 
-    - ``--print-timeout``: agy's internal print-mode timeout defaults to 5m. If
-      CLI_TIMEOUT is raised above that, agy would preempt long runs before the
-      Python supervisor fires. We set it to ``timeout + grace`` so agy never
+    - ``--print-timeout``: agy's internal print-mode timeout defaulted to 5m
+      before 1.2.6 (unlimited since). Without an explicit value an older agy
+      would preempt long runs before the Python supervisor fires. We set it to ``timeout + grace`` so agy never
       aborts before the configured budget, while the Python-side ``wait_for``
       (at exactly ``timeout``) remains the authoritative supervisor and still
       raises CLITimeoutError on overrun.
@@ -834,9 +898,11 @@ async def execute_cli(
         METRICS["total_execution_time"] += execution_time
 
         raw_stdout = stdout.decode("utf-8", errors="replace")
-        stderr_str = sanitize_output(
-            stderr.decode("utf-8", errors="replace") if stderr else ""
-        )
+        raw_stderr = stderr.decode("utf-8", errors="replace") if stderr else ""
+        stderr_str = sanitize_output(raw_stderr)
+        # Parsed from RAW stderr, then sanitized leaf-wise, for the same reason
+        # as the envelope: regex redaction can eat a JSON escape character.
+        agy_error = _parse_agy_error(raw_stderr)
 
         # Whether the run had begun doing work before failing. Unknowable on the
         # text transport, so assumed True there; the JSON envelope's turn/token
@@ -890,11 +956,12 @@ async def execute_cli(
                         and not isinstance(c, bool)]
             work_done = (not reported) or any(c != 0 for c in reported)
 
-            # In JSON mode agy leaves stderr EMPTY and puts the reason in the
-            # envelope (verified: an invalid --model gives exit 1, a 676-byte
-            # envelope and 0 bytes of stderr). Scanning stderr alone would make
-            # rate-limit detection — and therefore the whole retry policy —
-            # unreachable on the default transport.
+            # In JSON mode the reason is always in the envelope. Before agy
+            # 1.1.28 stderr was EMPTY (an invalid --model gave exit 1, a 676-byte
+            # envelope and 0 bytes of stderr); since then fatal errors are also
+            # echoed to stderr with an `error:` marker, but older versions still
+            # need this. Scanning stderr alone would make rate-limit detection —
+            # and therefore the whole retry policy — unreachable there.
             envelope_error = envelope.get("error")
             if isinstance(envelope_error, str):
                 # Sanitize here: this raise happens BEFORE _adapt_json_envelope,
@@ -909,9 +976,11 @@ async def execute_cli(
             _record_security_event("rate_limit", "medium", "execute_cli",
                                    {"detail": rate_limit_text[:500],
                                     "work_done": work_done})
+            retryable = agy_error.get("retryable") if agy_error else None
             raise CLIRateLimitError(
                 f"Rate limit exceeded: {rate_limit_text.strip()}",
                 work_done=work_done,
+                retryable=retryable if isinstance(retryable, bool) else None,
             )
 
         if envelope is not None:
@@ -926,6 +995,8 @@ async def execute_cli(
                 raise CLIProtocolError(
                     f"agy's JSON envelope is nested too deeply to process: {e}"
                 )
+            if agy_error:
+                result["agy_error"] = agy_error
             if result["status"] == "success":
                 METRICS["commands_succeeded"] += 1
             else:
@@ -949,6 +1020,16 @@ async def execute_cli(
             re.search(p, stdout_str, re.IGNORECASE | re.MULTILINE)
             for p in error_patterns
         )
+        # Since agy 1.1.12 the unknown-conversation notice reaches stderr
+        # (measured on 1.2.14: `warning: conversation "<id>" not found`, exit 0,
+        # and the run continues in a NEW conversation). Treat it like the old
+        # stdout form: the requested history was not used.
+        conversation_lost = _is_print_invocation(args) and any(
+            re.search(error_patterns[2], stream, re.IGNORECASE | re.MULTILINE)
+            for stream in (stderr_str, stdout_str)
+        )
+        if conversation_lost:
+            has_error_in_stdout = True
 
         if process.returncode != 0 or has_error_in_stdout:
             METRICS["commands_failed"] += 1
@@ -957,7 +1038,7 @@ async def execute_cli(
             error_output = stdout_str
             if process.returncode != 0 and stderr_str.strip() and not stdout_str.strip():
                 error_output = stderr_str
-            return {
+            result = {
                 "status": "error",
                 "return_code": process.returncode,
                 "stdout": error_output,
@@ -966,13 +1047,21 @@ async def execute_cli(
             }
         else:
             METRICS["commands_succeeded"] += 1
-            return {
+            result = {
                 "status": "success",
                 "return_code": process.returncode,
                 "stdout": stdout_str,
                 "stderr": stderr_str,
                 "execution_time": execution_time
             }
+        if conversation_lost:
+            result["error"] = (
+                "the requested conversation was not found; agy answered in a "
+                "NEW conversation without its history"
+            )
+        if agy_error:
+            result["agy_error"] = agy_error
+        return result
 
     except (CLITimeoutError, CLIRateLimitError, CLIProtocolError):
         # Re-raise typed failures unchanged; the generic handler below would
@@ -1014,10 +1103,12 @@ async def execute_cli_with_retry(
     Two conditions must therefore both hold to retry:
 
       1. ``mutating=False`` — the caller's declared intent. Note this is intent
-         only: nothing at the agy level enforces read-only. `--mode plan` was
-         tested and does NOT prevent writes when combined with
-         `--dangerously-skip-permissions` (it created a file), exactly like
-         `--sandbox` not being a filesystem jail. So intent alone is not enough.
+         only: nothing at the agy level enforces read-only. `--mode plan` does
+         NOT prevent writes (re-measured on agy 1.2.14: it is a no-op alongside
+         --disable-slash-commands, and without that flag headless runs
+         auto-approve their own plan review since 1.1.28 and then write the
+         file), exactly like `--sandbox` not being a filesystem jail. So intent
+         alone is not enough.
       2. The failed run provably did no work — `CLIRateLimitError.work_done` is
          False, meaning the envelope reported zero turns and zero tokens, i.e.
          agy refused the request before running anything. Unknowable on the text
@@ -1051,6 +1142,14 @@ async def execute_cli_with_retry(
                 logger.warning(
                     "Rate limit hit after the run had already started work; "
                     "not retrying, because re-running would repeat it."
+                )
+                break
+            if getattr(e, "retryable", None) is False:
+                # agy's own verdict (AGY_ERROR, >= 1.2.6). It has already waited
+                # out any short server-advised delay and classifies daily/billing
+                # caps as terminal (1.2.13) — our backoff cannot outlast those.
+                logger.warning(
+                    "Rate limit reported as non-retryable by agy; not retrying."
                 )
                 break
             if attempt < max_attempts:
@@ -1171,6 +1270,33 @@ def model_accepted_values(record: dict) -> list[str]:
     return [v for v in (record.get("slug"), record.get("display_name")) if v]
 
 
+def effort_families(records: list[dict]) -> dict[str, set[str]]:
+    """
+    Map each tier-free base slug implied by `agy models` to the tiers it offers.
+
+    `agy models` lists only tier-pinned slugs (gemini-3.8-flash-high, ...), but
+    agy 1.2.14 also accepts the family's base slug (gemini-3.8-flash) — and
+    REQUIRES --effort with it ("requires --effort (available: low, medium,
+    high)"), restricted to the tiers the family lists (gemini-3.1-pro has no
+    medium). A family is recognised only when at least two tiers share a base: a
+    single tier-suffixed slug such as gpt-oss-120b-medium is not an effort
+    family, and agy rejects --effort for such models. Keys are lower-cased.
+    """
+    tiers: dict[str, set[str]] = {}
+    for record in records:
+        slug = (record.get("slug") or "").strip().lower()
+        for level in EFFORT_LEVELS:
+            if slug.endswith(f"-{level}"):
+                tiers.setdefault(slug[: -len(f"-{level}")], set()).add(level)
+                break
+    return {base: levels for base, levels in tiers.items() if len(levels) >= 2}
+
+
+def base_model_slugs(records: list[dict]) -> set[str]:
+    """Tier-free base slugs agy accepts together with --effort (lower-cased)."""
+    return set(effort_families(records))
+
+
 async def get_available_models() -> list[dict]:
     """
     Get available models from agy with caching.
@@ -1198,7 +1324,7 @@ async def get_available_models() -> list[dict]:
     return []
 
 
-async def validate_model(model: Optional[str]) -> dict:
+async def validate_model(model: Optional[str], effort: Optional[str] = None) -> dict:
     """
     Validate a requested model name against what agy actually accepts.
 
@@ -1257,6 +1383,21 @@ async def validate_model(model: Optional[str]) -> dict:
     if requested in accepted:
         return {}
 
+    # Base slugs (gemini-3.8-flash) are valid, but agy rejects them without
+    # --effort — and only gemini_prompt / gemini_sandbox can pass one.
+    families = effort_families(available)
+    if requested in families:
+        if effort:
+            return {}
+        tier = next(t for t in reversed(EFFORT_LEVELS) if t in families[requested])
+        return {
+            "warning": (
+                f"'{model}' is a base slug, which agy only accepts together with "
+                f"`effort` (available on gemini_prompt / gemini_sandbox). Use a "
+                f"tiered slug such as '{requested}-{tier}' here."
+            )
+        }
+
     hint = ""
     if requested in MODEL_SHORT_NAMES:
         hint = (
@@ -1282,10 +1423,8 @@ async def validate_effort(effort: Optional[str], model: Optional[str] = None) ->
     Returns metadata to merge into the tool response (same convention as
     validate_model), empty when there is nothing to report.
 
-    Also flags the contradictory case of an effort-suffixed model slug combined
-    with a different explicit effort (e.g. model="gemini-3.1-pro-low" with
-    effort="high"): agy's precedence there is not documented, so the caller
-    should be told rather than silently getting one of the two.
+    Also flags model/effort combinations agy rejects outright (see
+    _effort_model_conflict), naming a valid alternative from the live roster.
     """
     if not effort:
         return {}
@@ -1300,32 +1439,100 @@ async def validate_effort(effort: Optional[str], model: Optional[str] = None) ->
         }
 
     cached_version = _get_cached_or_sync_version()
-    if cached_version and _parse_version(cached_version) < _MIN_EFFORT_VERSION:
+    min_version = _min_effort_version(level)
+    if cached_version and _parse_version(cached_version) < min_version:
         return {
             "warning": (
                 f"--effort '{level}' was not applied: agy >= "
-                f"{'.'.join(str(v) for v in _MIN_EFFORT_VERSION)} is required "
+                f"{'.'.join(str(v) for v in min_version)} is required "
                 f"(found {cached_version})."
             )
         }
 
     if model:
-        slug = model.strip().lower()
-        for other in EFFORT_LEVELS:
-            # Matches both forms agy accepts: the slug suffix
-            # ("gemini-3.1-pro-low") and the display-name tier ("... (Low)").
-            if other != level and (
-                slug.endswith(f"-{other}") or slug.endswith(f"({other})")
-            ):
-                return {
-                    "warning": (
-                        f"model '{model}' already pins effort '{other}' but "
-                        f"effort='{level}' was also passed; agy's precedence "
-                        f"between the two is unspecified. Pass a base slug "
-                        f"(e.g. 'gemini-3.5-flash') with effort, or drop effort."
-                    )
-                }
+        return await _effort_model_conflict(model, level)
 
+    return {}
+
+
+def _pinned_tier(value: str) -> Optional[str]:
+    """The effort tier a slug ("...-low") or display name ("... (Low)") pins."""
+    for tier in EFFORT_LEVELS:
+        if value.endswith(f"-{tier}") or value.endswith(f"({tier})"):
+            return tier
+    return None
+
+
+async def _effort_model_conflict(model: str, level: str) -> dict:
+    """
+    Warn about model/effort combinations agy rejects before running a turn.
+
+    Measured on agy 1.2.14 (each exits 1 with no turn spent):
+      - tiered slug + different effort: "--model gemini-3.8-flash-high
+        conflicts with --effort=low" (the same tier on both sides is fine);
+      - base slug + a tier the family lacks: "gemini-3.1-pro has no \"max\"
+        effort (available: low, high)";
+      - an untiered model with any effort: "--effort is not supported for
+        model \"claude-opus-4-6-thinking\"".
+    Suggestions are drawn from the live roster so they never name a model or
+    tier that does not exist. Without a roster, only the tier conflict (which
+    needs no roster) is reported.
+    """
+    requested = model.strip().lower()
+    records = await get_available_models()
+    families = effort_families(records)
+
+    # Resolve a display name ("Gemini 3.8 Flash (High)") to its slug so the
+    # base-slug suggestion works for both accepted forms.
+    slug = requested
+    for record in records:
+        if (record.get("display_name") or "").strip().lower() == requested and record.get("slug"):
+            slug = record["slug"].strip().lower()
+            break
+
+    def _tiers(base: str) -> str:
+        return ", ".join(t for t in EFFORT_LEVELS if t in families[base])
+
+    pinned = _pinned_tier(requested)
+    if pinned and pinned != level:
+        base = slug[: -len(f"-{pinned}")] if slug.endswith(f"-{pinned}") else None
+        if base in families and level in families[base]:
+            suggestion = f"Pass the base slug '{base}' with effort='{level}', or drop effort."
+        elif base in families:
+            suggestion = (
+                f"'{base}' offers no '{level}' effort (available: {_tiers(base)}); "
+                f"drop effort or pick one of those."
+            )
+        else:
+            suggestion = "Drop effort for this model."
+        return {
+            "warning": (
+                f"model '{model}' already pins effort '{pinned}' but "
+                f"effort='{level}' was also passed; agy rejects this "
+                f"combination. {suggestion}"
+            )
+        }
+    if pinned or not records:
+        return {}
+
+    if slug in families:
+        if level not in families[slug]:
+            return {
+                "warning": (
+                    f"'{model}' has no '{level}' effort (available: "
+                    f"{_tiers(slug)}); agy rejects this combination."
+                )
+            }
+        return {}
+
+    known = {v.strip().lower() for r in records for v in model_accepted_values(r)}
+    if requested in known:
+        return {
+            "warning": (
+                f"model '{model}' does not accept an effort level; agy rejects "
+                f"--effort for it. Drop effort."
+            )
+        }
     return {}
 
 
