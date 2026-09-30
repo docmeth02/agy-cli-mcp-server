@@ -226,7 +226,7 @@ except ImportError:
         return explicit or None
 
     def get_task_timeout(task: str, explicit: Optional[int] = None) -> int:
-        return explicit or 300
+        return explicit or 900
 
     def get_task_effort(task: str, explicit: Optional[str] = None) -> Optional[str]:
         return explicit or None
@@ -264,13 +264,15 @@ async def gemini_prompt(
         readonly: When True, instructs the AI to only respond with text and not
                   create, modify, or delete any files. Use for brainstorming,
                   analysis, opinions, and planning tasks.
-        project: Project ID for session isolation (agy >= 1.0.12).
-        effort: Reasoning effort — "low", "medium" or "high" (agy >= 1.1.10;
-               the flag exists from 1.1.5 but was silently ignored in headless
-               runs before 1.1.10).
-               Only needed with a base model slug such as "gemini-3.5-flash";
-               most slugs already pin a tier (e.g. "gemini-3.1-pro-high"), and
-               passing both is flagged as a conflict.
+        project: Project ID or name for session isolation (agy >= 1.0.12;
+               names accepted since agy 1.1.18).
+        effort: Reasoning effort — "low", "medium", "high" (agy >= 1.1.10)
+               or "max" (agy >= 1.2.11; no current model offers it).
+               Use it with a base model slug such as "gemini-3.8-flash" or
+               "gemini-3.1-pro" — agy REQUIRES effort with a base slug. Tiered
+               slugs (e.g. "gemini-3.8-flash-high") already pin one; a
+               different effort on top is rejected by agy. Claude and GPT-OSS
+               models do not accept effort at all.
         interpret_slash_commands: When False (default) the prompt is sent to the
                   model verbatim, even if it begins with "/". Set True to let
                   agy expand its own slash commands and skills (agy >= 1.1.9),
@@ -323,12 +325,15 @@ async def gemini_prompt(
         # Deliberately mutating=True even when readonly=True: `readonly` only
         # prepends a preamble asking the model not to write. Nothing enforces it —
         # --dangerously-skip-permissions and --mode accept-edits are still passed,
-        # and `--mode plan` was tested and does not block writes either. Treating
+        # and `--mode plan` does not block writes either (re-measured on agy
+        # 1.2.14: headless runs auto-approve their own plan). Treating
         # a prompt instruction as a safety boundary is what the --sandbox lesson
         # warns against. The work_done check in execute_cli_with_retry still
         # allows a retry when agy provably did nothing.
         result = await execute_cli_with_retry(args, mutating=True)
-        result = add_model_metadata(result, await validate_model(effective_model))
+        result = add_model_metadata(
+            result, await validate_model(effective_model, effective_effort)
+        )
         result = add_model_metadata(result, await validate_agent(agent))
         result = add_model_metadata(
             result, await validate_effort(effective_effort, effective_model)
@@ -400,7 +405,10 @@ async def gemini_models() -> str:
             "'Gemini 3.1 Pro (High)') are accepted, but slugs are stable across "
             "agy releases and are preferred. Short names (pro/flash/claude) were "
             "dropped in agy 1.1.4 and will hard-fail. Pro tiers are High and Low "
-            "only; Flash offers High, Medium and Low."
+            "only; Flash (3.6, 3.7, 3.8) offers High, Medium and Low. A base "
+            "slug without the tier (e.g. 'gemini-3.8-flash') is also accepted, "
+            "but only together with `effort`, which only gemini_prompt and "
+            "gemini_sandbox take; use a tiered slug with every other tool."
         ),
         "task_defaults": {
             k: v or "(agy default)"
@@ -518,16 +526,18 @@ async def gemini_sandbox(
         model: Model to use (slug or display name, e.g. "gemini-3.1-pro-high").
                Defaults to agy's default. See gemini_models().
         agent: Custom agent to use (agy >= 1.1.1). See gemini_agents().
-        project: Project ID for session isolation (agy >= 1.0.12).
+        project: Project ID or name for session isolation (agy >= 1.0.12;
+               names accepted since agy 1.1.18).
         interpret_slash_commands: When False (default) the prompt is sent
                   verbatim, even if it begins with "/". Set True to let agy
                   expand its own slash commands and skills (agy >= 1.1.9).
-        effort: Reasoning effort — "low", "medium" or "high" (agy >= 1.1.10;
-               the flag exists from 1.1.5 but was silently ignored in headless
-               runs before 1.1.10).
-               Only needed with a base model slug such as "gemini-3.5-flash";
-               most slugs already pin a tier (e.g. "gemini-3.1-pro-high"), and
-               passing both is flagged as a conflict.
+        effort: Reasoning effort — "low", "medium", "high" (agy >= 1.1.10)
+               or "max" (agy >= 1.2.11; no current model offers it).
+               Use it with a base model slug such as "gemini-3.8-flash" or
+               "gemini-3.1-pro" — agy REQUIRES effort with a base slug. Tiered
+               slugs (e.g. "gemini-3.8-flash-high") already pin one; a
+               different effort on top is rejected by agy. Claude and GPT-OSS
+               models do not accept effort at all.
 
     Returns:
         JSON string with execution results
@@ -560,7 +570,9 @@ async def gemini_sandbox(
 
     try:
         result = await execute_cli_with_retry(args, timeout=get_task_timeout("sandbox"))
-        result = add_model_metadata(result, await validate_model(effective_model))
+        result = add_model_metadata(
+            result, await validate_model(effective_model, effective_effort)
+        )
         result = add_model_metadata(result, await validate_agent(agent))
         result = add_model_metadata(
             result, await validate_effort(effective_effort, effective_model)
@@ -926,7 +938,7 @@ async def gemini_eval_plan(
         plan: The plan, idea, or proposal to evaluate
         context: Optional context (e.g., "Node.js REST API with MongoDB")
         requirements: Optional requirements or constraints
-        model: Model to use (slug or display name, e.g. "gemini-3.6-flash-medium").
+        model: Model to use (slug or display name, e.g. "gemini-3.8-flash-medium").
                Defaults to "gemini-3.1-pro-high".
 
     Returns:
@@ -1225,7 +1237,8 @@ async def gemini_continue_conversation(
         model: Model to use (slug or display name, e.g. "gemini-3.1-pro-high").
                Defaults to agy's default; the model is not carried over from
                earlier turns of the conversation.
-        project: Project ID for session isolation (agy >= 1.0.12).
+        project: Project ID or name for session isolation (agy >= 1.0.12;
+               names accepted since agy 1.1.18).
 
     Returns:
         JSON with response and updated conversation state
@@ -1520,7 +1533,7 @@ async def gemini_git_diff_review(
     model: Optional[str] = None,
 ) -> str:
     """
-    Analyze git diffs with contextual feedback (150,000 char limit).
+    Analyze git diffs with contextual feedback (300,000 char limit).
 
     Args:
         diff: Git diff content or patch
@@ -1661,7 +1674,7 @@ async def gemini_ai_collaboration(
         collaboration_mode: Mode (sequential, debate, validation)
         content: Content to analyze
         models: Comma-separated model list using slugs or display names
-               (e.g., "gemini-3.1-pro-high,gemini-3.6-flash-medium")
+               (e.g., "gemini-3.1-pro-high,gemini-3.8-flash-medium")
         context: Additional context
         conversation_id: Accepted for backward compatibility but NOT used;
                 the collaboration engine does not thread it through
@@ -1706,7 +1719,7 @@ async def gemini_ai_collaboration(
             focus=focus
         )
     except ImportError:
-        model_list = (models or "gemini-3.6-flash-medium").split(",")
+        model_list = (models or "gemini-3.8-flash-medium").split(",")
         results = []
 
         for m in model_list:

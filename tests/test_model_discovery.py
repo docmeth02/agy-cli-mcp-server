@@ -70,16 +70,16 @@ class TestParseModelsOutput:
 
     def test_tabless_lines_kept_when_no_two_column_line_exists(self):
         # agy < 1.1.5 emitted display names only; those must still be usable.
-        records = _parse_models_output("Gemini 3.1 Pro (High)\nGemini 3.5 Flash (Low)")
+        records = _parse_models_output("Gemini 3.1 Pro (High)\nGemini 3.8 Flash (Low)")
         assert [r["display_name"] for r in records] == [
             "Gemini 3.1 Pro (High)",
-            "Gemini 3.5 Flash (Low)",
+            "Gemini 3.8 Flash (Low)",
         ]
         assert all(r["slug"] is None for r in records)
 
     def test_display_name_containing_no_tab_but_parens(self):
-        records = _parse_models_output("Gemini 3.5 Flash (Medium)")
-        assert records[0]["display_name"] == "Gemini 3.5 Flash (Medium)"
+        records = _parse_models_output("Gemini 3.8 Flash (Medium)")
+        assert records[0]["display_name"] == "Gemini 3.8 Flash (Medium)"
 
     def test_empty_output(self):
         assert _parse_models_output("") == []

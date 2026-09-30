@@ -432,7 +432,7 @@ gemini_ai_collaboration(
 **Universal Parameters:**
 - **`collaboration_mode`** (required): `sequential` | `debate` | `validation`
 - **`content`** (required): Content to be analyzed/processed
-- **`models`** (optional): Comma-separated list of AI models (e.g., "gemini-3.1-pro-high,gemini-3.6-flash-medium" for diverse debate; auto-selected if not provided)
+- **`models`** (optional): Comma-separated list of AI models (e.g., "gemini-3.1-pro-high,gemini-3.8-flash-medium" for diverse debate; auto-selected if not provided)
 - **`context`** (optional): Additional context for collaboration
 - **`conversation_id`** (optional): For stateful conversation history
 
@@ -534,7 +534,7 @@ gemini_ai_collaboration(
 ### Prerequisites
 
 - **Python 3.10+** - Required for MCP SDK compatibility
-- **Antigravity CLI** - Google's command-line tool for Gemini AI (`agy`)
+- **Antigravity CLI** - Google's command-line tool for Gemini AI (`agy`). Verified against **agy 1.2.14**; older versions keep working through version-gated flags (see the per-feature `agy >=` notes below)
 - **uv** (recommended) or pip for package management
 
 ### Linux Setup
@@ -890,7 +890,7 @@ Each tool has optimized character limits based on typical use cases:
 | `gemini_ai_collaboration` | 500K chars | Multi-AI workflow collaboration |
 | `gemini_code_review` | 300K chars | Structured code analysis |
 | `gemini_extract_structured` | 200K chars | Schema-based data extraction |
-| `gemini_git_diff_review` | 150K chars | Git diff analysis |
+| `gemini_git_diff_review` | 300K chars | Git diff analysis |
 | `gemini_content_comparison` | 400K chars | Multi-source content comparison |
 | **Conversation Tools** | Variable | Context-aware with token management |
 
@@ -907,7 +907,7 @@ Since agy 1.1.5, `agy models` reports **two accepted forms per model** and eithe
 
 Short names (`pro`/`flash`/`claude`) were dropped in agy 1.1.4 and now hard-fail with an error listing the valid names.
 
-Current roster (run `gemini_models()` or `agy models` for the live list): Gemini 3.6 Flash (High/Medium/Low), Gemini 3.5 Flash (High/Medium/Low), Gemini 3.1 Pro (**High/Low only — no Medium tier**), Claude Sonnet 4.6 (Thinking), Claude Opus 4.6 (Thinking), GPT-OSS 120B (Medium).
+Current roster (run `gemini_models()` or `agy models` for the live list): Gemini 3.8 Flash, Gemini 3.7 Flash and Gemini 3.6 Flash (each High/Medium/Low), Gemini 3.1 Pro (**High/Low only — no Medium tier**), Claude Sonnet 4.6 (Thinking), Claude Opus 4.6 (Thinking), GPT-OSS 120B (Medium).
 
 Complex tools (eval_plan, review_code, verify_solution, code_review, extract_structured, git_diff_review, content_comparison) default to `gemini-3.1-pro-high` for deeper reasoning; lightweight tools let agy decide. Per-task defaults can be overridden via `CLI_MODEL_{TASK}` / `GEMINI_MODEL_{TASK}` environment variables.
 
@@ -932,8 +932,12 @@ success signal** — an invalid `--model` exits 1, while an unhandled slash comm
 exits 0 with `status: SUCCESS`. The envelope's `status` field is the only
 dependable indicator, so it is what the server trusts.
 
-Responses gain `usage`, `num_turns`, `conversation_id`, `agy_status` and
-`agy_duration_seconds` alongside the existing `stdout`/`stderr`/`return_code`.
+Responses gain `usage`, `num_turns`, `conversation_id`, `agy_status`,
+`agy_duration_seconds` and `denied_actions` (agy >= 1.1.27) alongside the existing
+`stdout`/`stderr`/`return_code`. When a turn fails on an agent or model API error,
+agy >= 1.2.6 exits 3 and prints a structured `AGY_ERROR: {...}` line on stderr;
+it is surfaced as `agy_error`, and its `retryable: false` verdict suppresses
+retries.
 
 | `CLI_OUTPUT_FORMAT` | Behavior |
 |---|---|
@@ -960,7 +964,7 @@ executed and files already edited.
 |---|---|
 | Mutating (`gemini_prompt`, `gemini_sandbox`, `gemini_cli`, `gemini_ai_collaboration`, `gemini_continue_conversation`) | **None** — surfaced to the caller instead of repeated |
 | Analysis (`gemini_summarize`, `gemini_summarize_files`, `gemini_eval_plan`, `gemini_review_code`, `gemini_code_review`, `gemini_verify_solution`, `gemini_extract_structured`, `gemini_git_diff_review`, `gemini_content_comparison`) | Up to `RETRY_MAX_ATTEMPTS`, **and only if agy did no work** |
-| `gemini_prompt(readonly=True)` | **Not** retried. `readonly` only prepends a preamble asking the model not to write; nothing enforces it — `--dangerously-skip-permissions` is still passed, and `--mode plan` was tested and does **not** block writes either. Treating a prompt instruction as a safety boundary is the mistake the `--sandbox` note warns about. |
+| `gemini_prompt(readonly=True)` | **Not** retried. `readonly` only prepends a preamble asking the model not to write; nothing enforces it — `--dangerously-skip-permissions` is still passed, and `--mode plan` does **not** block writes either (re-measured on agy 1.2.14: headless runs auto-approve their own plan and write). Treating a prompt instruction as a safety boundary is the mistake the `--sandbox` note warns about. |
 
 Even where retrying is permitted, it happens **only when agy provably did no work** — the envelope reporting zero turns and zero tokens, meaning the request was refused before anything ran. A limit that arrives mid-run is never retried, because agy allows hundreds of tool calls and the run may already have edited files. This is unknowable on the text transport, which therefore never retries.
 
@@ -968,18 +972,25 @@ Timeouts and `CLIProtocolError` are never retried.
 
 ### Reasoning Effort (agy >= 1.1.10)
 
-`gemini_prompt` and `gemini_sandbox` accept `effort` (`low`/`medium`/`high`).
-Most model slugs already pin a tier (`gemini-3.1-pro-high`), so `effort` is only
-needed with a base slug:
+`gemini_prompt` and `gemini_sandbox` accept `effort` (`low`/`medium`/`high`, and
+`max` on agy >= 1.2.11 — though no current model offers it). Most model slugs
+already pin a tier (`gemini-3.1-pro-high`), so `effort` is only needed with a
+tier-free base slug, which agy **requires** it for:
 
 ```python
-gemini_prompt(prompt="…", model="gemini-3.5-flash", effort="low")
+gemini_prompt(prompt="…", model="gemini-3.8-flash", effort="low")
 ```
 
-Passing both a tier-suffixed slug and a different `effort` returns a warning —
-agy's precedence between the two is unspecified. This detects both accepted
-forms (`gemini-3.1-pro-low` and `Gemini 3.1 Pro (Low)`). Per-task defaults via
-`CLI_EFFORT_{TASK}`, global default via `CLI_DEFAULT_EFFORT`.
+agy 1.2.14 **rejects** a tier-suffixed slug combined with a different `effort`
+(`--model gemini-3.8-flash-high conflicts with --effort=low`); the response then
+carries a warning naming the base slug to use. This detects both accepted forms
+(`gemini-3.1-pro-low` and `Gemini 3.1 Pro (Low)`). Claude and GPT-OSS models do
+not accept `effort` at all, and a base slug's `effort` must be a tier the family
+offers (Gemini 3.1 Pro has no `medium`). The response warns about each of these
+combinations using the live model list. Base slugs work only on `gemini_prompt`
+and `gemini_sandbox` (the only tools that take `effort`); other tools warn when
+given one. Per-task defaults via `CLI_EFFORT_{TASK}`, global default via
+`CLI_DEFAULT_EFFORT` (applies to `gemini_prompt`/`gemini_sandbox` only).
 
 Gated on **1.1.10**, not 1.1.5: the flag exists from 1.1.5 but agy 1.1.10 fixed
 it being *silently ignored* in headless `-p` runs, so passing it earlier would
@@ -1010,7 +1021,13 @@ Failure responses **may** carry a machine-readable `error_code`. Always check
 - Eight of the analysis tools set no code on a raised failure (timeout, rate
   limit, execution error) — they return `status` and `error` only.
 - agy-side failures on the JSON transport are *returned* rather than raised, so
-  they surface as `status: "error"` with an `error` message and no code.
+  they surface as `status: "error"` with an `error` message and no code. Check
+  `agy_error` (when present, agy >= 1.2.6) for agy's structured status, code and
+  `retryable` flag.
+- On the text transport, a print run whose stderr reports
+  `conversation "<id>" not found` returns `status: "error"` with `return_code: 0`,
+  no `error_code`, and an `error` explaining it: `stdout` still holds the answer,
+  but it was produced in a new conversation without the requested history.
 
 | Code | Meaning |
 |---|---|
@@ -1053,7 +1070,9 @@ Stateful multi-turn conversations via agy's native conversation stores:
 
 **How binding works.** `gemini_start_conversation` returns a stable MCP-level handle and spends no quota; agy does not know it yet. The first `gemini_continue_conversation` call runs *without* `--conversation`, then adopts the id agy reports in its JSON envelope and records it as the binding. Later calls resume that conversation with full history, while your handle stays unchanged.
 
-This indirection is necessary because **agy silently ignores an unknown `--conversation` id** — it starts a fresh conversation under a different id, exits 0, and emits no warning. Passing a locally-invented id straight through would therefore produce a historyless context on every turn while reporting success.
+This indirection is necessary because **agy silently ignores an unknown `--conversation` id** — it starts a fresh conversation under a different id and exits 0; its only signal is a
+`warning: conversation "<id>" not found` line on stderr (agy >= 1.1.12; before
+that there was none). Passing a locally-invented id straight through would therefore produce a historyless context on every turn while reporting success.
 
 ```python
 # gemini_start_conversation returns a JSON string; the id is nested under "conversation".
@@ -1151,22 +1170,24 @@ The server supports extensive configuration through environment variables:
 
 #### Core Configuration
 ```bash
-export CLI_TIMEOUT=300          # Default command timeout (10-3600 seconds)
+export CLI_TIMEOUT=900          # Default command timeout (10-3600 seconds)
 export CLI_TIMEOUT_VERIFY_SOLUTION=900  # Per-tool override: CLI_TIMEOUT_<TASK>
 export CLI_LOG_LEVEL=INFO       # Logging level (DEBUG, INFO, WARNING, ERROR)
 export CLI_COMMAND_PATH=agy     # Path to Antigravity CLI executable
-export GEMINI_TIMEOUT=300       # Fallback for CLI_TIMEOUT
+export GEMINI_TIMEOUT=900       # Fallback for CLI_TIMEOUT
 export GEMINI_LOG_LEVEL=INFO    # Fallback for CLI_LOG_LEVEL
 export GEMINI_COMMAND_PATH=agy  # Fallback for CLI_COMMAND_PATH
 export CLI_PRINT_TIMEOUT_GRACE=30  # Seconds agy's --print-timeout sits above the resolved timeout
 export CLI_LOG_FILE=            # Optional path for agy diagnostics; keeps stdout clean (do NOT use /dev/null — agy hangs)
 ```
 
-**Per-task timeouts:** heavy tools default above `CLI_TIMEOUT` because agy 1.0.7
-raised the per-run tool-call ceiling to 512. Defaults: `verify_solution`,
+**Per-task timeouts:** a tool's timeout is `max(task default, CLI_TIMEOUT)`, so a
+task default can only raise a tool above `CLI_TIMEOUT` (agy 1.0.7 raised the
+per-run tool-call ceiling to 512). Task defaults: `verify_solution`,
 `code_review`, `ai_collaboration` → 900s; `eval_plan`, `review_code`, `sandbox`,
-`summarize_files`, `content_comparison` → 600s; everything else inherits
-`CLI_TIMEOUT`. Override any
+`summarize_files`, `content_comparison` → 600s. They only matter when
+`CLI_TIMEOUT` is set below them — at the 900s default (raised from 300s, which
+caused "5 minute timeout" reports) every tool gets 900s. Override any
 tool with `CLI_TIMEOUT_<TASK>`. **Timeouts are not retried**, so the resolved
 value is the true wall-clock cap.
 
@@ -1185,10 +1206,11 @@ value is the true wall-clock cap.
 > **agy version floor:** legacy non-AES-NI CPUs require **agy ≥ 1.0.8**
 > (SIGILL crash fix).
 
-`--print-timeout`: agy's internal print-mode timeout defaults to 5 minutes. The
-server passes `--print-timeout (CLI_TIMEOUT + CLI_PRINT_TIMEOUT_GRACE)s` so that
-raising `CLI_TIMEOUT` above 300s no longer lets agy preempt a long run before the
-Python-side supervisor timeout fires. The server also sets
+`--print-timeout`: agy's internal print-mode timeout defaulted to 5 minutes before
+agy 1.2.6 (unlimited since). The server passes
+`--print-timeout (CLI_TIMEOUT + CLI_PRINT_TIMEOUT_GRACE)s` so agy never preempts a
+long run before the Python-side supervisor timeout fires. A timeout error reading
+`Command timed out after N seconds` comes from this server, not from agy. The server also sets
 `AGY_CLI_HIDE_ACCOUNT_INFO=1` on the agy subprocess so the account/credits header
 never leaks into the parsed stdout.
 
@@ -1212,13 +1234,13 @@ export GEMINI_CONTENT_COMPARISON_LIMIT=400000  # gemini_content_comparison chara
 export GEMINI_COLLABORATION_LIMIT=500000  # gemini_ai_collaboration character limit
 export GEMINI_CODE_REVIEW_LIMIT=300000  # gemini_code_review character limit
 export GEMINI_EXTRACT_STRUCTURED_LIMIT=200000  # gemini_extract_structured character limit
-export GEMINI_GIT_DIFF_LIMIT=150000  # gemini_git_diff_review character limit
+export GEMINI_GIT_DIFF_LIMIT=300000  # gemini_git_diff_review character limit
 ```
 
 #### Transport & Effort
 ```bash
 export CLI_OUTPUT_FORMAT=auto          # auto | json | text (see Output Transport)
-export CLI_DEFAULT_EFFORT=             # low | medium | high (empty = model's own tier)
+export CLI_DEFAULT_EFFORT=             # low | medium | high | max (max: agy >= 1.2.11; empty = model's own tier)
 export CLI_EFFORT_PROMPT=              # per-task override, e.g. CLI_EFFORT_SANDBOX
 ```
 Each also accepts a `GEMINI_`-prefixed fallback name (`GEMINI_OUTPUT_FORMAT`,
@@ -1314,8 +1336,12 @@ On the JSON transport (agy >= 1.1.8) a successful response looks like:
 }
 ```
 
+When present, responses also carry `denied_actions` (JSON transport, agy >= 1.1.27:
+tool actions the headless run was not permitted to take) and `agy_error` (either
+transport, agy >= 1.2.6: the structured `AGY_ERROR` record of a failed turn).
+
 The text transport returns the same shape minus `agy_status`, `conversation_id`,
-`num_turns`, `agy_duration_seconds` and `usage` — a strict subset, so a caller
+`num_turns`, `agy_duration_seconds`, `usage` and `denied_actions` — a strict subset, so a caller
 written against JSON still works if the transport changes.
 
 Legacy shape:
@@ -1471,7 +1497,7 @@ python -m pytest tests/ -v -k "not prompt and not sandbox and not lifecycle and 
 **Solutions**:
 1. Wait for rate limit window to reset
 2. Increase limits: `export GEMINI_RATE_LIMIT_REQUESTS=500`
-3. Use faster model: Set `model="gemini-3.6-flash-medium"` on the tool call
+3. Use faster model: Set `model="gemini-3.8-flash-medium"` on the tool call
 
 #### Large Content Failures
 

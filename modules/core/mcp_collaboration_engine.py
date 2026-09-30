@@ -29,14 +29,14 @@ logger = logging.getLogger(__name__)
 # ("flash", "pro", "claude") were dropped in agy 1.1.4 and now hard-fail, which
 # meant every default collaboration run errored out.
 DEFAULT_MODELS = {
-    "sequential": "gemini-3.6-flash-medium,gemini-3.1-pro-high",
-    "debate": "gemini-3.1-pro-high,gemini-3.6-flash-medium,claude-sonnet-4-6",
-    "validation": "gemini-3.1-pro-high,gemini-3.6-flash-medium",
+    "sequential": "gemini-3.8-flash-medium,gemini-3.1-pro-high",
+    "debate": "gemini-3.1-pro-high,gemini-3.8-flash-medium,claude-sonnet-4-6",
+    "validation": "gemini-3.1-pro-high,gemini-3.8-flash-medium",
 }
 
 # Model used for the cheap aggregation steps (pipeline summary, debate
 # synthesis, consensus building) rather than the per-stage reasoning.
-SYNTHESIS_MODEL = "gemini-3.6-flash-medium"
+SYNTHESIS_MODEL = "gemini-3.8-flash-medium"
 
 
 async def execute_collaboration(
@@ -68,7 +68,7 @@ async def execute_collaboration(
         collaboration_mode: Mode (sequential, debate, validation)
         content: Content to analyze
         models: Comma-separated model list of slugs or display names
-                (e.g., "gemini-3.1-pro-high,gemini-3.6-flash-medium" for debate)
+                (e.g., "gemini-3.1-pro-high,gemini-3.8-flash-medium" for debate)
         context: Additional context
         Other mode-specific parameters
 

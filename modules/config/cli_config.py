@@ -11,7 +11,7 @@ from typing import Optional
 # Core Configuration (with backward-compatible env var fallbacks)
 # ============================================================================
 
-CLI_TIMEOUT = int(os.getenv("CLI_TIMEOUT", os.getenv("GEMINI_TIMEOUT", "300")))
+CLI_TIMEOUT = int(os.getenv("CLI_TIMEOUT", os.getenv("GEMINI_TIMEOUT", "900")))
 CLI_COMMAND_PATH = os.getenv("CLI_COMMAND_PATH", os.getenv("GEMINI_COMMAND_PATH", "agy"))
 CLI_LOG_LEVEL = os.getenv("CLI_LOG_LEVEL", os.getenv("GEMINI_LOG_LEVEL", "INFO")).upper()
 
@@ -64,8 +64,10 @@ RETRY_MAX_DELAY = float(os.getenv("RETRY_MAX_DELAY", "30.0"))
 # Per-Task Timeout Configuration
 # ============================================================================
 # agy 1.0.7 raised the per-run tool-call ceiling to 512, so agentic tools can
-# legitimately run far longer than the flat CLI_TIMEOUT (300s) allows. Heavy
-# tools get a larger budget; everything else inherits CLI_TIMEOUT. Override any
+# legitimately run for many minutes. CLI_TIMEOUT defaults to 900s: the old 300s
+# default was the source of reported "5 minute timeouts" (agy itself has had no
+# headless time limit since 1.2.6). A task default only ever RAISES a tool above
+# CLI_TIMEOUT, never below it, so raising the global raises every tool. Override any
 # task via CLI_TIMEOUT_{TASK} or GEMINI_TIMEOUT_{TASK}. Note: timeouts are NOT
 # retried (see execute_cli_with_retry), so this value is the true wall-clock cap.
 
@@ -85,7 +87,7 @@ def get_task_timeout(task: str, explicit: Optional[int] = None) -> int:
     """
     Resolve the effective subprocess timeout (seconds) for a tool invocation.
 
-    Resolution: explicit > CLI_TIMEOUT_{TASK} env > task default > CLI_TIMEOUT.
+    Resolution: explicit > CLI_TIMEOUT_{TASK} env > max(task default, CLI_TIMEOUT).
     """
     if explicit:
         return explicit
@@ -100,7 +102,7 @@ def get_task_timeout(task: str, explicit: Optional[int] = None) -> int:
         except ValueError:
             pass
 
-    return TASK_TIMEOUT_DEFAULTS.get(task, CLI_TIMEOUT)
+    return max(TASK_TIMEOUT_DEFAULTS.get(task, CLI_TIMEOUT), CLI_TIMEOUT)
 
 # ============================================================================
 # Tool-Specific Character Limits
@@ -117,7 +119,7 @@ GEMINI_VERIFY_LIMIT = int(os.getenv("GEMINI_VERIFY_LIMIT", "800000"))
 GEMINI_COLLABORATION_LIMIT = int(os.getenv("GEMINI_COLLABORATION_LIMIT", "500000"))
 GEMINI_CODE_REVIEW_LIMIT = int(os.getenv("GEMINI_CODE_REVIEW_LIMIT", "300000"))
 GEMINI_EXTRACT_STRUCTURED_LIMIT = int(os.getenv("GEMINI_EXTRACT_STRUCTURED_LIMIT", "200000"))
-GEMINI_GIT_DIFF_LIMIT = int(os.getenv("GEMINI_GIT_DIFF_LIMIT", "150000"))
+GEMINI_GIT_DIFF_LIMIT = int(os.getenv("GEMINI_GIT_DIFF_LIMIT", "300000"))
 GEMINI_CONTENT_COMPARISON_LIMIT = int(os.getenv("GEMINI_CONTENT_COMPARISON_LIMIT", "400000"))
 
 # ============================================================================
@@ -165,9 +167,10 @@ TASK_MODEL_DEFAULTS: dict[str, Optional[str]] = {
 
 # Per-task default reasoning effort (agy >= 1.1.10; the flag exists from 1.1.5
 # but was silently ignored in headless runs before 1.1.10). Empty by default: most model
-# slugs already pin an effort tier (gemini-3.1-pro-high), so adding a second
-# source of truth would just create conflicts. Set CLI_EFFORT_{TASK} to override
-# per tool, or CLI_DEFAULT_EFFORT globally, when using a base slug.
+# slugs already pin an effort tier (gemini-3.1-pro-high), and agy 1.2.14 REJECTS
+# a tiered slug combined with a different effort. Set CLI_EFFORT_{TASK} to
+# override per tool, or CLI_DEFAULT_EFFORT globally, only when using a base slug
+# (gemini-3.8-flash / gemini-3.1-pro), which in turn requires an effort.
 DEFAULT_EFFORT = os.getenv("CLI_DEFAULT_EFFORT", os.getenv("GEMINI_DEFAULT_EFFORT", ""))
 
 TASK_EFFORT_DEFAULTS: dict[str, Optional[str]] = {}

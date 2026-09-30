@@ -51,6 +51,7 @@ from modules.utils.cli_utils import (
 )
 from modules.config.cli_config import (
     CLI_PRINT_TIMEOUT_GRACE,
+    CLI_TIMEOUT,
     get_task_model,
     get_task_timeout,
 )
@@ -374,8 +375,8 @@ class TestBuildCliArgs:
         assert args.index("--model") < args.index("--print")
 
     def test_model_with_spaces(self):
-        args = _build_cli_args(prompt="hello", model="Gemini 3.5 Flash (Medium)")
-        assert args[args.index("--model") + 1] == "Gemini 3.5 Flash (Medium)"
+        args = _build_cli_args(prompt="hello", model="Gemini 3.8 Flash (Medium)")
+        assert args[args.index("--model") + 1] == "Gemini 3.8 Flash (Medium)"
 
     def test_model_with_sandbox_and_files(self, sample_file):
         args = _build_cli_args(
@@ -515,7 +516,7 @@ class TestModelIntegration:
     @pytest.mark.asyncio
     async def test_model_flag_works_with_flash_slug(self):
         args = _build_cli_args(
-            prompt="Reply with only the word OK", model="gemini-3.5-flash-low"
+            prompt="Reply with only the word OK", model="gemini-3.8-flash-low"
         )
         result = await execute_cli_with_retry(args)
         assert result["status"] == "success"
@@ -524,10 +525,39 @@ class TestModelIntegration:
     async def test_model_flag_works_with_display_name(self):
         # Both columns of `agy models` are accepted by --model.
         args = _build_cli_args(
-            prompt="Reply with only the word OK", model="Gemini 3.5 Flash (Low)"
+            prompt="Reply with only the word OK", model="Gemini 3.8 Flash (Low)"
         )
         result = await execute_cli_with_retry(args)
         assert result["status"] == "success"
+
+    @pytest.mark.asyncio
+    async def test_base_slug_with_effort_works(self):
+        # agy 1.2.14: tier-free base slugs are accepted, but only with --effort.
+        args = _build_cli_args(
+            prompt="Reply with only the word OK", model="gemini-3.8-flash",
+            effort="low",
+        )
+        result = await execute_cli_with_retry(args)
+        assert result["status"] == "success"
+
+    @pytest.mark.asyncio
+    async def test_shipped_default_models_exist_in_live_roster(self):
+        # Gemini 3.5 Flash vanished between agy 1.1.11 and 1.2.14 and nothing
+        # noticed until calls failed. Pin every model slug this server ships as
+        # a default against the live `agy models` list.
+        from modules.config.cli_config import TASK_MODEL_DEFAULTS
+        from modules.core.mcp_collaboration_engine import (
+            DEFAULT_MODELS, SYNTHESIS_MODEL,
+        )
+        from modules.utils.cli_utils import get_available_models
+
+        live = {r["slug"] for r in await get_available_models() if r.get("slug")}
+        assert live, "agy models returned nothing"
+        shipped = {m for m in TASK_MODEL_DEFAULTS.values() if m}
+        shipped |= {m for v in DEFAULT_MODELS.values() for m in v.split(",")}
+        shipped.add(SYNTHESIS_MODEL)
+        missing = sorted(shipped - live)
+        assert not missing, f"default models missing from agy: {missing}"
 
     @pytest.mark.asyncio
     async def test_short_name_is_rejected_by_agy(self):
@@ -873,7 +903,7 @@ class TestTaskTimeout:
     def test_heavy_task_raised_above_default(self):
         assert get_task_timeout("verify_solution") == 900
         assert get_task_timeout("code_review") == 900
-        assert get_task_timeout("eval_plan") == 600
+        assert get_task_timeout("eval_plan") == max(600, CLI_TIMEOUT)
 
     def test_unknown_task_inherits_default(self):
         from modules.config.cli_config import CLI_TIMEOUT
@@ -888,7 +918,7 @@ class TestTaskTimeout:
 
     def test_env_override_invalid_falls_through(self, monkeypatch):
         monkeypatch.setenv("CLI_TIMEOUT_EVAL_PLAN", "not-a-number")
-        assert get_task_timeout("eval_plan") == 600
+        assert get_task_timeout("eval_plan") == max(600, CLI_TIMEOUT)
 
 
 # ---------------------------------------------------------------------------
@@ -923,7 +953,7 @@ class TestModelValidation:
         async def _models():
             return [
                 {"slug": "gemini-3.1-pro-high", "display_name": "Gemini 3.1 Pro (High)"},
-                {"slug": "gemini-3.5-flash-medium", "display_name": "Gemini 3.5 Flash (Medium)"},
+                {"slug": "gemini-3.8-flash-medium", "display_name": "Gemini 3.8 Flash (Medium)"},
             ]
 
         monkeypatch.setattr(cu, "get_available_models", _models)
