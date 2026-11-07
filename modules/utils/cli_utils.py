@@ -37,9 +37,11 @@ from modules.config.cli_config import (
     CLI_LOG_FILE,
     CLI_OUTPUT_FORMAT,
     CLI_PRINT_TIMEOUT_GRACE,
+    CLI_AI_CREDITS,
     RETRY_MAX_ATTEMPTS,
     RETRY_BASE_DELAY,
     RETRY_MAX_DELAY,
+    get_task_model_with_source,
 )
 
 # Caches with TTL
@@ -72,21 +74,58 @@ _MIN_JSON_SCHEMA_VERSION = (1, 1, 8)     # --json-schema
 # passed where it actually takes effect, rather than appearing to work.
 _MIN_EFFORT_VERSION = (1, 1, 10)
 # `max` joined the --effort vocabulary in 1.2.11 ("models with different
-# support"). No model in the 1.2.14 roster actually offers it — agy rejects it
+# support"). No model in the 1.2.14 or 1.5.3 roster offers it — agy rejects it
 # per model with the tiers that model does have — but the level itself is valid.
 _MIN_MAX_EFFORT_VERSION = (1, 2, 11)
+# `xhigh` is in the --effort vocabulary of agy 1.5.3 (`agy help`:
+# low|medium|high|xhigh|max) but no changelog entry names its release, so the
+# floor is the version it was measured on. No 1.5.3 model offers it either.
+_MIN_XHIGH_EFFORT_VERSION = (1, 5, 3)
 
-# Reasoning-effort levels accepted by --effort (agy >= 1.1.5; `max` >= 1.2.11).
-EFFORT_LEVELS = ("low", "medium", "high", "max")
+# Reasoning-effort levels accepted by --effort, in ascending order
+# (agy >= 1.1.5; `max` >= 1.2.11; `xhigh` measured on 1.5.3).
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+
+_EFFORT_LEVEL_FLOORS = {
+    "xhigh": _MIN_XHIGH_EFFORT_VERSION,
+    "max": _MIN_MAX_EFFORT_VERSION,
+}
 
 
 def _min_effort_version(level: str) -> tuple[int, ...]:
     """The agy floor for passing --effort at this level."""
-    return _MIN_MAX_EFFORT_VERSION if level == "max" else _MIN_EFFORT_VERSION
+    return _EFFORT_LEVEL_FLOORS.get(level, _MIN_EFFORT_VERSION)
+
+# agy 1.3.4: a base slug (gemini-3.8-flash) without --effort runs at the
+# model's default tier instead of failing with "requires --effort".
+_MIN_BASE_SLUG_WITHOUT_EFFORT_VERSION = (1, 3, 4)
+
+# agy 1.3.4: an unknown --agent makes a headless run fail (exit 1, `unknown
+# agent "..."`) instead of silently running the default agent.
+_MIN_AGENT_REJECTS_UNKNOWN_VERSION = (1, 3, 4)
+
+# agy 1.5.0: when --print-timeout expires, agy ends the turn itself — exit 3,
+# an AGY_ERROR line, the partial response kept and (1.4.11) finished_reason
+# "print_timeout" in the envelope. Before that a cut-short run could report
+# success. See _agy_print_timeout for how this decides which timeout fires
+# first.
+_MIN_GRACEFUL_PRINT_TIMEOUT_VERSION = (1, 5, 0)
+
+# `--mode plan` blocks writes in headless runs. Since agy 1.3.2,
+# --dangerously-skip-permissions no longer auto-approves the plan, so the turn
+# ends with a plan for review instead of carrying it out. Measured on 1.5.3:
+# file-tool and shell writes, inside and outside the workspace, were all held
+# back, while reads (--add-dir) still worked. 1.5.3 is the floor because that
+# is the only version measured; 1.5.2 also stopped headless runs from waiting
+# on any interaction, which is what keeps a held-back plan from hanging.
+# Plan mode is built on slash-command expansion — agy warns "--mode plan has
+# no effect while slash command expansion is disabled" and the write then goes
+# through — so it cannot be combined with --disable-slash-commands.
+_MIN_PLAN_MODE_READONLY_VERSION = (1, 5, 3)
 
 # agy 1.1.4 dropped the short model names; from that version on only the full
-# display name ("Gemini 3.1 Pro (High)") or the stable slug added in 1.1.5
-# ("gemini-3.1-pro-high") is accepted.
+# display name ("Gemini 3.8 Flash (High)") or the stable slug added in 1.1.5
+# ("gemini-3.8-flash-high") is accepted.
 _MIN_FULL_MODEL_NAME_VERSION = (1, 1, 4)
 
 # Short names agy accepted prior to 1.1.4. Only valid below
@@ -412,9 +451,20 @@ def _adapt_json_envelope(
         # agy >= 1.1.27: tool actions the headless run was not permitted to
         # take (previously skipped silently).
         ("denied_actions", "denied_actions"),
+        # agy >= 1.4.11: why a turn ended early — "print_timeout", "interrupted"
+        # or "error". Omitted when the turn finished normally.
+        ("finished_reason", "finished_reason"),
     ):
         if envelope.get(src) not in (None, "", {}, []):
             result[dest] = envelope[src]
+
+    # agy >= 1.5.0 ends an overrunning turn itself at --print-timeout, which
+    # this server sets just below the supervisor timeout (_agy_print_timeout).
+    # Report it with the same error_code as a supervisor timeout, but keep the
+    # partial answer that agy returned.
+    if envelope.get("finished_reason") == "print_timeout":
+        result["error_code"] = "TIMEOUT"
+        result["partial"] = bool(envelope.get("response"))
 
     return result
 
@@ -534,6 +584,39 @@ def _get_cached_or_sync_version() -> str:
         return ""
 
 
+def resolve_readonly_enforcement(prompt: str) -> str:
+    """
+    How a read-only request is enforced: "plan_mode" or "prompt_only".
+
+    "plan_mode" runs agy with `--mode plan`, which holds back writes (see
+    _MIN_PLAN_MODE_READONLY_VERSION). "prompt_only" means the read-only
+    instruction in the prompt is the only thing asking the model not to write.
+
+    Plan mode needs slash-command expansion left on, so it is only used when
+    that is harmless:
+      - The version must be KNOWN and >= the measured floor. An unknown version
+        does not get plan mode, unlike the fail-closed flags in _build_cli_args.
+        Plan mode is not a flag added on top of the defaults; it REPLACES two
+        of them (--mode accept-edits and --disable-slash-commands). On an agy
+        where plan mode does not hold writes back, that would give up the
+        slash-command protection and gain nothing.
+      - The prompt must not start with "/". agy expands a command or skill only
+        at the start of a message (measured on 1.5.3: a "/usage" after a
+        preamble reached the model as text), and callers prepend a read-only
+        preamble, so this is a backstop for a caller that does not.
+
+    The same function is called by _build_cli_args and by the tool reporting
+    the outcome, so the two cannot disagree.
+    """
+    cached_version = _get_cached_or_sync_version()
+    version = _parse_version(cached_version) if cached_version else (0, 0, 0)
+    if version == (0, 0, 0) or version < _MIN_PLAN_MODE_READONLY_VERSION:
+        return "prompt_only"
+    if prompt.lstrip().startswith("/"):
+        return "prompt_only"
+    return "plan_mode"
+
+
 def _build_cli_args(
     prompt: str,
     sandbox: bool = False,
@@ -548,6 +631,7 @@ def _build_cli_args(
     interpret_slash_commands: bool = False,
     effort: Optional[str] = None,
     json_schema: Optional[str] = None,
+    readonly: bool = False,
 ) -> list[str]:
     """
     Build argument list for Antigravity CLI execution.
@@ -555,10 +639,15 @@ def _build_cli_args(
     interpret_slash_commands: when False (the default), pass
     --disable-slash-commands so a caller-supplied prompt is sent to the model
     verbatim. See the injection block below for why that is the safe default.
+
+    readonly: when True and resolve_readonly_enforcement() allows it, run in
+    `--mode plan` (which holds back writes) instead of `--mode accept-edits`,
+    and without --disable-slash-commands, which plan mode cannot work with.
     """
     args: list[str] = []
     cached_version = _get_cached_or_sync_version()
     version = _parse_version(cached_version) if cached_version else (0, 0, 0)
+    plan_mode = readonly and resolve_readonly_enforcement(prompt) == "plan_mode"
 
     # Always skip permissions for MCP automation
     args.append("--dangerously-skip-permissions")
@@ -579,7 +668,11 @@ def _build_cli_args(
 
     # agy 1.1.0 changed the default mode to "request-review" which pauses for
     # interactive diff review before writes. Force accept-edits for headless use.
-    if version_unknown or version >= _MIN_MODE_VERSION:
+    # A read-only request runs in plan mode instead (it only gets here on a known
+    # agy >= _MIN_PLAN_MODE_READONLY_VERSION, so it needs no version check).
+    if plan_mode:
+        args.extend(["--mode", "plan"])
+    elif version_unknown or version >= _MIN_MODE_VERSION:
         args.extend(["--mode", "accept-edits"])
 
     # agy 1.1.9 started expanding slash commands and skills in print mode, and
@@ -589,7 +682,9 @@ def _build_cli_args(
     # not be silently reinterpreted as a command — agy 1.1.11 ships commands
     # like /schedule that establish recurring work. Default to literal text and
     # let the few tools that genuinely want command/skill expansion opt in.
-    if not interpret_slash_commands:
+    # Plan mode is the exception: it works by expanding /plan, so the flag would
+    # disable it (see resolve_readonly_enforcement for why that is safe there).
+    if not interpret_slash_commands and not plan_mode:
         if version_unknown or version >= _MIN_NO_SLASH_VERSION:
             args.append("--disable-slash-commands")
 
@@ -752,12 +847,15 @@ def _apply_print_runtime_flags(
     Inject non-interactive print-mode runtime flags onto every `--print` call,
     independent of which tool built the base args.
 
-    - ``--print-timeout``: agy's internal print-mode timeout defaulted to 5m
-      before 1.2.6 (unlimited since). Without an explicit value an older agy
-      would preempt long runs before the Python supervisor fires. We set it to ``timeout + grace`` so agy never
-      aborts before the configured budget, while the Python-side ``wait_for``
-      (at exactly ``timeout``) remains the authoritative supervisor and still
-      raises CLITimeoutError on overrun.
+    - ``--print-timeout``: see _agy_print_timeout. On agy >= 1.5.0 it is set
+      just BELOW the Python supervisor's ``timeout``, so agy ends an overrunning
+      turn itself and returns the partial answer. On older (or unknown) agy it
+      sits just ABOVE as a safety net, because those versions could report a
+      cut-short turn as a success. Either way the Python-side ``wait_for`` (at
+      exactly ``timeout``) still kills the process and raises CLITimeoutError
+      if agy has not exited by then.
+    - ``--settings``: pins AI-credit fallback per run when CLI_AI_CREDITS is
+      "off" or "on" (see cli_config). Never injected for "inherit".
     - ``--log-file``: only when CLI_LOG_FILE is configured (opt-in), routes
       agy's own diagnostics (language-server startup, warnings, update checks)
       to that file so stdout stays a clean response payload for the error scan.
@@ -799,9 +897,18 @@ def _apply_print_runtime_flags(
     def _has(flag: str) -> bool:
         return any(a == flag or a.startswith(flag + "=") for a in flag_tokens)
 
+    cached_version = _get_cached_or_sync_version()
+    version = _parse_version(cached_version) if cached_version else (0, 0, 0)
+
     injected: list[str] = []
     if not _has("--print-timeout"):
-        injected += ["--print-timeout", f"{timeout + CLI_PRINT_TIMEOUT_GRACE}s"]
+        injected += ["--print-timeout", f"{_agy_print_timeout(timeout, version)}s"]
+    # A caller's own --settings (only possible through gemini_cli, which relays
+    # raw arguments) wins: agy takes one --settings value, which may be a file
+    # path, so the pin cannot be merged into it reliably.
+    if CLI_AI_CREDITS != "inherit" and not _has("--settings"):
+        pinned = CLI_AI_CREDITS == "on"
+        injected += ["--settings", json.dumps({"useG1Credits": pinned})]
     if CLI_LOG_FILE and not _has("--log-file"):
         injected += ["--log-file", CLI_LOG_FILE]
 
@@ -819,16 +926,40 @@ def _apply_print_runtime_flags(
         # else (text, stream-json) keeps the raw text path.
         transport = "json" if (chosen or "").strip().lower() == "json" else "explicit"
     else:
-        cached_version = _get_cached_or_sync_version()
-        transport = resolve_output_format(
-            _parse_version(cached_version) if cached_version else (0, 0, 0),
-            bool(cached_version),
-        )
+        transport = resolve_output_format(version, bool(cached_version))
         if transport == "json":
             injected += ["--output-format", "json"]
 
     # Prepend so injected flags precede the trailing `--print <prompt>` payload.
     return injected + args, transport
+
+
+def _agy_print_timeout(timeout: int, version: tuple[int, ...]) -> int:
+    """
+    The --print-timeout (seconds) to give agy under a Python ``timeout``.
+
+    agy >= 1.5.0 stops shortly before the supervisor, so an overrunning turn
+    ends with its partial answer and finished_reason "print_timeout" instead of
+    being killed with nothing. The gap is a tenth of the budget, at least 3s and
+    at most CLI_PRINT_TIMEOUT_GRACE: agy took about 2s to stop after its
+    timeout (measured on 1.5.3), so a fixed 30s gap would only waste budget on
+    short calls. With half of a 60s budget given away, a normal 30s run was cut
+    off in the integration suite. agy is never given less than 1s.
+
+    Older or unknown versions get ``timeout + grace``, which leaves Python in
+    charge. Before 1.5.0 a print timeout could end with exit 0, so a cut-off
+    answer could not be told apart from a complete one. An unknown version
+    keeps that older behaviour: if Python stops first, only a partial answer
+    is lost, whereas guessing wrong the other way passes a truncated answer
+    off as complete.
+    """
+    if version != (0, 0, 0) and version >= _MIN_GRACEFUL_PRINT_TIMEOUT_VERSION:
+        # The gap is at least 1s even if CLI_PRINT_TIMEOUT_GRACE is set to 0 or
+        # below; otherwise agy would get the full budget or more and fire
+        # after the supervisor, which defeats the layering.
+        gap = max(min(CLI_PRINT_TIMEOUT_GRACE, max(timeout // 10, 3)), 1)
+        return max(timeout - gap, 1)
+    return timeout + CLI_PRINT_TIMEOUT_GRACE
 
 
 async def execute_cli(
@@ -1103,12 +1234,12 @@ async def execute_cli_with_retry(
     Two conditions must therefore both hold to retry:
 
       1. ``mutating=False`` — the caller's declared intent. Note this is intent
-         only: nothing at the agy level enforces read-only. `--mode plan` does
-         NOT prevent writes (re-measured on agy 1.2.14: it is a no-op alongside
-         --disable-slash-commands, and without that flag headless runs
-         auto-approve their own plan review since 1.1.28 and then write the
-         file), exactly like `--sandbox` not being a filesystem jail. So intent
-         alone is not enough.
+         only. `--mode plan` holds back writes on agy >= 1.5.3 (measured), but
+         the analysis tools that pass mutating=False do not run in plan mode,
+         and on older agy plan mode did not block writes at all (1.1.28-1.3.1:
+         headless runs auto-approved their own plan and wrote the file). That
+         is the same lesson as `--sandbox` not being a filesystem jail, so
+         intent alone is not enough.
       2. The failed run provably did no work — `CLIRateLimitError.work_done` is
          False, meaning the envelope reported zero turns and zero tokens, i.e.
          agy refused the request before running anything. Unknowable on the text
@@ -1223,7 +1354,7 @@ def _parse_models_output(stdout: str) -> list[dict]:
     agy >= 1.1.5 emits two TAB-separated columns (the stable slug added in that
     release, then the display name):
 
-        gemini-3.1-pro-high\tGemini 3.1 Pro (High)
+        gemini-3.8-flash-high\tGemini 3.8 Flash (High)
 
     Older agy emitted the display name only. Both columns are accepted by
     --model, so the parser keeps each and lets callers pick.
@@ -1275,10 +1406,11 @@ def effort_families(records: list[dict]) -> dict[str, set[str]]:
     Map each tier-free base slug implied by `agy models` to the tiers it offers.
 
     `agy models` lists only tier-pinned slugs (gemini-3.8-flash-high, ...), but
-    agy 1.2.14 also accepts the family's base slug (gemini-3.8-flash) — and
-    REQUIRES --effort with it ("requires --effort (available: low, medium,
-    high)"), restricted to the tiers the family lists (gemini-3.1-pro has no
-    medium). A family is recognised only when at least two tiers share a base: a
+    agy 1.2.14 also accepts the family's base slug (gemini-3.8-flash), with an
+    --effort restricted to the tiers the family lists (gemini-3.1-pro had no
+    medium). Up to 1.3.3 agy REQUIRED --effort with a base slug ("requires
+    --effort (available: low, medium, high)"); since 1.3.4 a base slug alone runs
+    at the model's default tier. A family is recognised only when at least two tiers share a base: a
     single tier-suffixed slug such as gpt-oss-120b-medium is not an effort
     family, and agy rejects --effort for such models. Keys are lower-cased.
     """
@@ -1293,8 +1425,68 @@ def effort_families(records: list[dict]) -> dict[str, set[str]]:
 
 
 def base_model_slugs(records: list[dict]) -> set[str]:
-    """Tier-free base slugs agy accepts together with --effort (lower-cased)."""
+    """Tier-free base slugs agy accepts as --model (lower-cased)."""
     return set(effort_families(records))
+
+
+def _listed_model_values(records: list[dict]) -> set[str]:
+    """Every slug and display name `agy models` lists, lower-cased."""
+    return {
+        value.strip().lower()
+        for record in records
+        for value in model_accepted_values(record)
+    }
+
+
+async def drop_unavailable_default(model: Optional[str]) -> tuple[Optional[str], dict]:
+    """
+    Keep a model this server SHIPS as a default only if agy still offers it.
+
+    Returns (model, {}) when the model is listed by `agy models` (as a slug,
+    display name or base slug), or when the roster cannot be read. Otherwise
+    returns (None, {"warning": ...}): the run then passes no --model, so agy
+    uses its own default model.
+
+    The point is that a release dropping a model should not break every tool
+    that defaults to it. agy 1.5.3 removed Gemini 3.1 Pro, and seven tools plus
+    the collaboration engine hard-failed on every default call until the
+    defaults were changed by hand. Only use this for shipped defaults. A model
+    the caller or operator named (argument, CLI_MODEL_* or CLI_DEFAULT_MODEL)
+    must still fail loudly when it does not exist; replacing it would quietly
+    run a different model from the one requested.
+    """
+    if not model:
+        return model, {}
+    available = await get_available_models()
+    if not available:
+        return model, {}
+    requested = model.strip().lower()
+    if requested in _listed_model_values(available) or requested in effort_families(available):
+        return model, {}
+    logger.warning(f"Shipped default model {model!r} is not offered by agy; using agy's default")
+    return None, {
+        "warning": (
+            f"The default model '{model}' is no longer offered by agy (not in "
+            f"`agy models`), so agy's own default model was used instead. "
+            f"Pass `model` or set CLI_MODEL_<TASK> to choose one."
+        )
+    }
+
+
+async def resolve_task_model(
+    task: str, explicit: Optional[str] = None
+) -> tuple[Optional[str], dict]:
+    """
+    get_task_model(), except that a shipped default agy no longer offers is
+    dropped with a warning (see drop_unavailable_default).
+
+    Returns (model, metadata); merge the metadata into the tool response with
+    add_model_metadata().
+    """
+    model, source = get_task_model_with_source(task, explicit)
+    if source != "task_default":
+        return model, {}
+    return await drop_unavailable_default(model)
 
 
 async def get_available_models() -> list[dict]:
@@ -1335,8 +1527,8 @@ async def validate_model(model: Optional[str], effort: Optional[str] = None) -> 
     detection mechanism.
 
     Either column of `agy models` is a valid --model value: the stable slug
-    ("gemini-3.1-pro-high", agy >= 1.1.5) or the display name
-    ("Gemini 3.1 Pro (High)"). Both are accepted here, case-insensitively.
+    ("gemini-3.8-flash-high", agy >= 1.1.5) or the display name
+    ("Gemini 3.8 Flash (High)"). Both are accepted here, case-insensitively.
 
     Returns a dict that is empty when there is nothing to report, otherwise
     carries a "warning" and/or "model_validation" key to merge into the
@@ -1374,20 +1566,15 @@ async def validate_model(model: Optional[str], effort: Optional[str] = None) -> 
         # Discovery failed/empty — don't false-warn on a possibly-valid model.
         return {"model_validation": "unverified"}
 
-    # Accept either the slug or the display name, case-insensitively.
-    accepted = {
-        value.strip().lower()
-        for record in available
-        for value in model_accepted_values(record)
-    }
-    if requested in accepted:
+    if requested in _listed_model_values(available):
         return {}
 
-    # Base slugs (gemini-3.8-flash) are valid, but agy rejects them without
-    # --effort — and only gemini_prompt / gemini_sandbox can pass one.
+    # Base slugs (gemini-3.8-flash) are valid. Up to agy 1.3.3 they were
+    # rejected without --effort — which only gemini_prompt / gemini_sandbox can
+    # pass; since 1.3.4 agy runs them at the model's default tier.
     families = effort_families(available)
     if requested in families:
-        if effort:
+        if effort or _parse_version(cached_version) >= _MIN_BASE_SLUG_WITHOUT_EFFORT_VERSION:
             return {}
         tier = next(t for t in reversed(EFFORT_LEVELS) if t in families[requested])
         return {
@@ -1690,8 +1877,13 @@ async def validate_agent(agent: Optional[str]) -> dict:
     """
     Validate a requested agent name against what agy knows.
 
-    agy silently ignores an unknown --agent name (exit 0, no error), so a
-    typo would pass unnoticed. Returns metadata to merge into the response.
+    Up to agy 1.3.3 an unknown --agent name was silently ignored (exit 0, no
+    error), so a typo would pass unnoticed. Since 1.3.4 agy rejects it itself:
+    the run fails before any turn with `unknown agent "<name>"`, and that error
+    reaches the caller through the normal result. The local check is skipped
+    there. It could only be less accurate than agy's, because `agy agents`
+    lists custom agents only (empty when there are none), not the built-in
+    ones. Returns metadata to merge into the response.
     """
     if not agent:
         return {}
@@ -1705,6 +1897,8 @@ async def validate_agent(agent: Optional[str]) -> dict:
                 f"(found {cached_version or 'unknown'}). agy used its default agent."
             )
         }
+    if _parse_version(cached_version) >= _MIN_AGENT_REJECTS_UNKNOWN_VERSION:
+        return {}
 
     available = await get_available_agents()
     if not available:

@@ -11,6 +11,7 @@ from modules.utils.cli_utils import (
     execute_cli_with_retry,
     extract_file_refs,
     _build_cli_args,
+    resolve_task_model,
     validate_model,
     add_model_metadata,
     CLIExecutionError,
@@ -19,7 +20,6 @@ from modules.utils.cli_utils import (
 )
 from modules.config.cli_config import (
     GEMINI_CONTENT_COMPARISON_LIMIT,
-    get_task_model,
     get_task_timeout,
 )
 
@@ -91,13 +91,14 @@ Sources:
 
 Provide a {output_format} comparison{"with similarity metrics" if include_metrics else ""}."""
 
-    effective_model = get_task_model("content_comparison", model)
+    effective_model, model_note = await resolve_task_model("content_comparison", model)
 
     cleaned_prompt, files = extract_file_refs(prompt)
     args = _build_cli_args(prompt=cleaned_prompt, files=files, model=effective_model)
 
     try:
         result = await execute_cli_with_retry(args, mutating=False, timeout=get_task_timeout("content_comparison"))
+        result = add_model_metadata(result, model_note)
         result = add_model_metadata(result, await validate_model(effective_model))
         return json.dumps(result, indent=2)
     except (CLITimeoutError, CLIRateLimitError, CLIExecutionError) as e:

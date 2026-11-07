@@ -38,7 +38,9 @@ from modules.utils.cli_utils import (
     execute_cli,
     execute_cli_with_retry,
     _build_cli_args,
+    _agy_print_timeout,
     _apply_print_runtime_flags,
+    _get_cached_or_sync_version,
     _parse_version,
     extract_file_refs,
     sanitize_output,
@@ -50,7 +52,6 @@ from modules.utils.cli_utils import (
     CLITimeoutError,
 )
 from modules.config.cli_config import (
-    CLI_PRINT_TIMEOUT_GRACE,
     CLI_TIMEOUT,
     get_task_model,
     get_task_timeout,
@@ -152,7 +153,10 @@ class TestFileContext:
         add_dir_count = args.count("--add-dir")
         assert add_dir_count == 2
 
-        result = await execute_cli_with_retry(args, timeout=60)
+        # 120s, not 60s: on agy 1.5.3 this call takes 30-55s (the agent lists the
+        # directory with its tools), and since agy 1.5.0 agy stops a few seconds
+        # before the supervisor timeout (_agy_print_timeout).
+        result = await execute_cli_with_retry(args, timeout=120)
         assert result["status"] == "success"
 
     def test_extract_file_refs_resolves_real_file(self, monkeypatch):
@@ -439,12 +443,13 @@ class TestModelConfig:
     def test_explicit_model_wins(self):
         assert get_task_model("prompt", "claude") == "claude"
 
-    def test_task_default_pro(self):
+    def test_task_default_high_tier(self):
         # agy 1.1.5 added stable slugs; TASK_MODEL_DEFAULTS uses them because
         # display names track marketing labels and change between releases.
-        assert get_task_model("eval_plan") == "gemini-3.1-pro-high"
-        assert get_task_model("code_review") == "gemini-3.1-pro-high"
-        assert get_task_model("review_code") == "gemini-3.1-pro-high"
+        # Gemini 3.1 Pro was the default until agy 1.5.3 dropped it.
+        assert get_task_model("eval_plan") == "gemini-3.8-flash-high"
+        assert get_task_model("code_review") == "gemini-3.8-flash-high"
+        assert get_task_model("review_code") == "gemini-3.8-flash-high"
 
     def test_task_default_none_for_lightweight(self):
         assert get_task_model("prompt") is None
@@ -504,14 +509,18 @@ class TestVersionGuard:
 class TestModelIntegration:
 
     @pytest.mark.asyncio
-    async def test_model_flag_works_with_pro_slug(self):
-        # Pro (Low) rather than (High): this asserts the slug *form* is accepted,
-        # which needs no reasoning depth, and High is the priciest tier.
+    async def test_removed_model_fails_before_any_turn(self):
+        # agy 1.5.3 dropped Gemini 3.1 Pro. An unknown --model must fail before
+        # a turn starts (free: num_turns 0), never silently fall back. Gated:
+        # on older agy the model still exists and this would spend a real turn.
+        _require_version((1, 5, 3))
         args = _build_cli_args(
-            prompt="Reply with only the word OK", model="gemini-3.1-pro-low"
+            prompt="Reply with only the word OK", model="gemini-3.1-pro-high"
         )
         result = await execute_cli_with_retry(args)
-        assert result["status"] == "success"
+        assert result["status"] == "error"
+        assert "not recognized" in result["stdout"]
+        assert result.get("num_turns", 0) == 0
 
     @pytest.mark.asyncio
     async def test_model_flag_works_with_flash_slug(self):
@@ -532,7 +541,7 @@ class TestModelIntegration:
 
     @pytest.mark.asyncio
     async def test_base_slug_with_effort_works(self):
-        # agy 1.2.14: tier-free base slugs are accepted, but only with --effort.
+        # agy 1.2.14: tier-free base slugs are accepted together with --effort.
         args = _build_cli_args(
             prompt="Reply with only the word OK", model="gemini-3.8-flash",
             effort="low",
@@ -776,19 +785,26 @@ class TestConversationToolRoundTrip:
 # 12. Print-mode runtime flags (--print-timeout / --log-file) — pure, no agy
 # ---------------------------------------------------------------------------
 
+def _expected_print_timeout(timeout: int) -> str:
+    """The --print-timeout value the installed agy version should get."""
+    version = _get_cached_or_sync_version()
+    return f"{_agy_print_timeout(timeout, _parse_version(version) if version else (0, 0, 0))}s"
+
+
 class TestPrintRuntimeFlags:
 
     def test_injects_print_timeout_for_print_args(self):
         out, _ = _apply_print_runtime_flags(["--print", "hi"], timeout=300)
         assert "--print-timeout" in out
         idx = out.index("--print-timeout")
-        # agy budget sits just above the Python supervisor timeout.
-        assert out[idx + 1] == f"{300 + CLI_PRINT_TIMEOUT_GRACE}s"
+        # Below or above the Python supervisor timeout, depending on the
+        # version (see _agy_print_timeout).
+        assert out[idx + 1] == _expected_print_timeout(300)
 
     def test_print_timeout_tracks_caller_timeout(self):
         out, _ = _apply_print_runtime_flags(["--print", "hi"], timeout=1800)
         idx = out.index("--print-timeout")
-        assert out[idx + 1] == f"{1800 + CLI_PRINT_TIMEOUT_GRACE}s"
+        assert out[idx + 1] == _expected_print_timeout(1800)
 
     def test_preserves_print_payload_as_last_arg(self):
         out, _ = _apply_print_runtime_flags(["--print", "the prompt"], timeout=300)
@@ -821,7 +837,7 @@ class TestPrintRuntimeFlags:
             ["--print", "--print-timeout=5s"], timeout=300
         )
         # Injected flag present AND the prompt payload preserved verbatim.
-        assert out[:2] == ["--print-timeout", f"{300 + CLI_PRINT_TIMEOUT_GRACE}s"]
+        assert out[:2] == ["--print-timeout", _expected_print_timeout(300)]
         assert out[-2:] == ["--print", "--print-timeout=5s"]
 
     def test_duplicate_print_flags_payloads_all_excluded(self):
@@ -830,7 +846,7 @@ class TestPrintRuntimeFlags:
         out, _ = _apply_print_runtime_flags(
             ["--print", "one", "--print", "--print-timeout=5s"], timeout=300
         )
-        assert out[:2] == ["--print-timeout", f"{300 + CLI_PRINT_TIMEOUT_GRACE}s"]
+        assert out[:2] == ["--print-timeout", _expected_print_timeout(300)]
 
     def test_log_file_opt_in(self, monkeypatch):
         # Default (unset): no --log-file injected.
@@ -1174,3 +1190,84 @@ class TestSandboxScope:
             "agy --sandbox unexpectedly blocked an out-of-workspace file write; "
             "if agy added a filesystem jail, update the docs/security model."
         )
+
+
+# ---------------------------------------------------------------------------
+# 18. agy 1.3.x-1.5.x behaviour (real agy). Pre-turn failures are free; the
+#     rest spend one short Flash-Low turn each.
+# ---------------------------------------------------------------------------
+
+def _require_version(minimum: tuple[int, ...]):
+    version = _get_cached_or_sync_version()
+    if not version or _parse_version(version) < minimum:
+        pytest.skip(f"needs agy >= {'.'.join(map(str, minimum))} (found {version or 'unknown'})")
+
+
+class TestAgy15Behaviour:
+
+    @pytest.mark.asyncio
+    async def test_unknown_agent_fails_before_any_turn(self):
+        # agy 1.3.4: no longer silently runs the default agent.
+        _require_version((1, 3, 4))
+        args = _build_cli_args(prompt="Reply with only OK", agent="no-such-agent-xyz")
+        result = await execute_cli_with_retry(args)
+        assert result["status"] == "error"
+        assert "unknown agent" in result["stdout"]
+        assert result.get("num_turns", 0) == 0
+
+    @pytest.mark.asyncio
+    async def test_xhigh_is_valid_vocabulary_but_not_offered_by_flash(self):
+        # Free: rejected per model before a turn, which proves agy parsed the
+        # level rather than refusing the flag value outright.
+        _require_version((1, 5, 3))
+        args = _build_cli_args(prompt="Reply with only OK", model="gemini-3.8-flash", effort="xhigh")
+        result = await execute_cli_with_retry(args)
+        assert result["status"] == "error"
+        assert 'no "xhigh" effort' in result["stdout"]
+
+    @pytest.mark.asyncio
+    async def test_credit_pin_is_accepted(self, monkeypatch):
+        # Proves agy accepts the key (a misspelt one exits 1 with `unknown
+        # setting`). It cannot prove that "off" stops credit spend.
+        import modules.utils.cli_utils as cu
+        from modules.utils.cli_utils import run_readonly_slash_command
+        _require_version((1, 5, 3))
+        monkeypatch.setattr(cu, "CLI_AI_CREDITS", "off")
+        result = await run_readonly_slash_command("/credits")
+        assert result["status"] == "success", result
+
+    @pytest.mark.asyncio
+    async def test_base_slug_without_effort_works(self):
+        # agy 1.3.4: runs at the model's default tier instead of failing.
+        _require_version((1, 3, 4))
+        args = _build_cli_args(prompt="Reply with only the word OK", model="gemini-3.8-flash")
+        result = await execute_cli_with_retry(args)
+        assert result["status"] == "success"
+
+    @pytest.mark.asyncio
+    async def test_print_timeout_returns_partial_answer(self):
+        # agy 1.5.0 ends the turn itself; 1.4.11 reports finished_reason.
+        _require_version((1, 5, 0))
+        args = ["--print-timeout", "4s"] + _build_cli_args(
+            prompt="Write a 1500-word essay about the history of bridges.",
+            model="gemini-3.8-flash-low",
+        )
+        result = await execute_cli(args, timeout=120)
+        assert result["status"] == "error"
+        assert result["finished_reason"] == "print_timeout"
+        assert result["error_code"] == "TIMEOUT"
+        assert result["agy_error"]["retryable"] is False
+
+    @pytest.mark.asyncio
+    async def test_readonly_holds_back_a_requested_write(self, tmp_path, monkeypatch):
+        # The enforcement claim behind readonly_enforcement="plan_mode".
+        import mcp_server
+        _require_version((1, 5, 3))
+        monkeypatch.setenv("CLI_MODEL_PROMPT", "gemini-3.8-flash-low")
+        target = tmp_path / "must_not_exist.txt"
+        out = json.loads(await mcp_server.gemini_prompt(
+            prompt=f"Create the file {target} containing the word hi. Do it now.",
+            readonly=True,
+        ))
+        assert out["readonly_enforcement"] == "plan_mode"
+        assert not target.exists(), "plan mode let a write through; readonly is not enforced"

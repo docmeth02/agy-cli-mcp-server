@@ -49,6 +49,8 @@ from modules.utils.cli_utils import (
     get_available_agents,
     model_selection_value,
     model_accepted_values,
+    resolve_readonly_enforcement,
+    resolve_task_model,
     run_readonly_slash_command,
     validate_model,
     validate_agent,
@@ -208,7 +210,6 @@ try:
         GEMINI_REVIEW_LIMIT,
         GEMINI_VERIFY_LIMIT,
         GEMINI_COLLABORATION_LIMIT,
-        get_task_model,
         get_task_timeout,
         get_task_effort,
     )
@@ -221,9 +222,6 @@ except ImportError:
     GEMINI_REVIEW_LIMIT = 300000
     GEMINI_VERIFY_LIMIT = 800000
     GEMINI_COLLABORATION_LIMIT = 500000
-
-    def get_task_model(task: str, explicit: Optional[str] = None) -> Optional[str]:
-        return explicit or None
 
     def get_task_timeout(task: str, explicit: Optional[int] = None) -> int:
         return explicit or 900
@@ -254,25 +252,31 @@ async def gemini_prompt(
 
     Args:
         prompt: The prompt to send to Antigravity CLI
-        model: Model to use (slug or display name, e.g. "gemini-3.1-pro-high"
-               or "Gemini 3.1 Pro (High)"). Defaults to agy's default.
+        model: Model to use (slug or display name, e.g. "gemini-3.8-flash-high"
+               or "Gemini 3.8 Flash (High)"). Defaults to agy's default.
                See gemini_models() for the full list.
         agent: Custom agent to use (agy >= 1.1.1). See gemini_agents() for
                available agents. Omit to use the default agent.
         sandbox: Whether to run in sandbox mode
         debug: Whether to enable debug output (ignored for agy)
-        readonly: When True, instructs the AI to only respond with text and not
+        readonly: When True, the AI only responds with text and does not
                   create, modify, or delete any files. Use for brainstorming,
-                  analysis, opinions, and planning tasks.
+                  analysis, opinions, and planning tasks. On agy >= 1.5.3 this
+                  is enforced by running agy in plan mode, which holds back
+                  writes; on older agy it is only an instruction in the
+                  prompt. The response's `readonly_enforcement` field says
+                  which applied ("plan_mode" or "prompt_only").
         project: Project ID or name for session isolation (agy >= 1.0.12;
                names accepted since agy 1.1.18).
-        effort: Reasoning effort — "low", "medium", "high" (agy >= 1.1.10)
-               or "max" (agy >= 1.2.11; no current model offers it).
-               Use it with a base model slug such as "gemini-3.8-flash" or
-               "gemini-3.1-pro" — agy REQUIRES effort with a base slug. Tiered
-               slugs (e.g. "gemini-3.8-flash-high") already pin one; a
-               different effort on top is rejected by agy. Claude and GPT-OSS
-               models do not accept effort at all.
+        effort: Reasoning effort — "low", "medium", "high" (agy >= 1.1.10),
+               "xhigh" (agy >= 1.5.3) or "max" (agy >= 1.2.11). No current
+               model offers xhigh or max; Gemini 3.8 Flash offers low, medium
+               and high. Use it with a base model slug such as
+               "gemini-3.8-flash" (since agy 1.3.4 a base slug without effort
+               runs at the model's default tier). Tiered slugs (e.g.
+               "gemini-3.8-flash-high") already pin one; a different effort on
+               top is rejected by agy. Claude and GPT-OSS models do not accept
+               effort at all.
         interpret_slash_commands: When False (default) the prompt is sent to the
                   model verbatim, even if it begins with "/". Set True to let
                   agy expand its own slash commands and skills (agy >= 1.1.9),
@@ -288,7 +292,7 @@ async def gemini_prompt(
     Examples:
         gemini_prompt(prompt="Explain quantum computing")
         gemini_prompt(prompt="Analyze @src/auth.py", readonly=True)
-        gemini_prompt(prompt="Complex analysis", model="gemini-3.1-pro-high")
+        gemini_prompt(prompt="Complex analysis", model="gemini-3.8-flash-high")
     """
     if readonly:
         prompt = (
@@ -305,7 +309,7 @@ async def gemini_prompt(
             "error_code": "INPUT_TOO_LARGE"
         })
 
-    effective_model = get_task_model("prompt", model)
+    effective_model, model_note = await resolve_task_model("prompt", model)
     effective_effort = get_task_effort("prompt", effort)
 
     cleaned_prompt, files = extract_file_refs(prompt)
@@ -319,18 +323,22 @@ async def gemini_prompt(
         project=project,
         interpret_slash_commands=interpret_slash_commands,
         effort=effective_effort,
+        readonly=readonly,
     )
 
     try:
-        # Deliberately mutating=True even when readonly=True: `readonly` only
-        # prepends a preamble asking the model not to write. Nothing enforces it —
-        # --dangerously-skip-permissions and --mode accept-edits are still passed,
-        # and `--mode plan` does not block writes either (re-measured on agy
-        # 1.2.14: headless runs auto-approve their own plan). Treating
-        # a prompt instruction as a safety boundary is what the --sandbox lesson
-        # warns against. The work_done check in execute_cli_with_retry still
-        # allows a retry when agy provably did nothing.
+        # Deliberately mutating=True even when readonly=True. On agy >= 1.5.3
+        # readonly runs in `--mode plan`, which held back every write in the
+        # measurements (file and shell, inside and outside the workspace). But
+        # that rests on one version's behaviour, and on older agy readonly is
+        # only the preamble above. Treating either as a guarantee strong enough
+        # to re-run a whole agent turn is what the --sandbox lesson warns
+        # against. The work_done check in execute_cli_with_retry still allows a
+        # retry when agy provably did nothing.
         result = await execute_cli_with_retry(args, mutating=True)
+        if readonly:
+            result["readonly_enforcement"] = resolve_readonly_enforcement(cleaned_prompt)
+        result = add_model_metadata(result, model_note)
         result = add_model_metadata(
             result, await validate_model(effective_model, effective_effort)
         )
@@ -377,8 +385,8 @@ async def gemini_models() -> str:
             "status": "success",
             "models": [],
             "note": "Could not fetch models list. Try a slug like "
-                    "'gemini-3.1-pro-high' or a display name like "
-                    "'Gemini 3.1 Pro (High)'. Run `agy models` for the live list."
+                    "'gemini-3.8-flash-high' or a display name like "
+                    "'Gemini 3.8 Flash (High)'. Run `agy models` for the live list."
         }, indent=2)
 
     categorized = []
@@ -401,14 +409,16 @@ async def gemini_models() -> str:
         "models": categorized,
         "guidance": (
             "Pass the exact `model` value from the list above. Both the slug "
-            "(e.g. 'gemini-3.1-pro-high') and the display name (e.g. "
-            "'Gemini 3.1 Pro (High)') are accepted, but slugs are stable across "
+            "(e.g. 'gemini-3.8-flash-high') and the display name (e.g. "
+            "'Gemini 3.8 Flash (High)') are accepted, but slugs are stable across "
             "agy releases and are preferred. Short names (pro/flash/claude) were "
-            "dropped in agy 1.1.4 and will hard-fail. Pro tiers are High and Low "
-            "only; Flash (3.6, 3.7, 3.8) offers High, Medium and Low. A base "
-            "slug without the tier (e.g. 'gemini-3.8-flash') is also accepted, "
-            "but only together with `effort`, which only gemini_prompt and "
-            "gemini_sandbox take; use a tiered slug with every other tool."
+            "dropped in agy 1.1.4 and will hard-fail. Gemini 3.8 Flash offers "
+            "High, Medium and Low. A base slug without the tier (e.g. "
+            "'gemini-3.8-flash') is also accepted: with `effort` (gemini_prompt "
+            "and gemini_sandbox only) it runs at that tier, and without it, since "
+            "agy 1.3.4, at the model's default tier. The roster changes between "
+            "agy releases (1.5.3 removed Gemini 3.1 Pro), so pick from the live "
+            "list above rather than from memory."
         ),
         "task_defaults": {
             k: v or "(agy default)"
@@ -424,6 +434,10 @@ async def gemini_agents() -> str:
 
     Agents are specialized personas that can be selected via the `agent`
     parameter on gemini_prompt and gemini_sandbox (requires agy >= 1.1.1).
+    Only custom agents are listed (`agy agents` omits the built-in ones), so
+    the list is empty when none have been created. Since agy 1.3.4 an unknown
+    agent name makes the call fail with `unknown agent "<name>"` instead of
+    silently running the default agent.
 
     Returns:
         JSON with available agent names.
@@ -523,7 +537,7 @@ async def gemini_sandbox(
 
     Args:
         prompt: The prompt to execute in sandbox mode
-        model: Model to use (slug or display name, e.g. "gemini-3.1-pro-high").
+        model: Model to use (slug or display name, e.g. "gemini-3.8-flash-high").
                Defaults to agy's default. See gemini_models().
         agent: Custom agent to use (agy >= 1.1.1). See gemini_agents().
         project: Project ID or name for session isolation (agy >= 1.0.12;
@@ -531,13 +545,15 @@ async def gemini_sandbox(
         interpret_slash_commands: When False (default) the prompt is sent
                   verbatim, even if it begins with "/". Set True to let agy
                   expand its own slash commands and skills (agy >= 1.1.9).
-        effort: Reasoning effort — "low", "medium", "high" (agy >= 1.1.10)
-               or "max" (agy >= 1.2.11; no current model offers it).
-               Use it with a base model slug such as "gemini-3.8-flash" or
-               "gemini-3.1-pro" — agy REQUIRES effort with a base slug. Tiered
-               slugs (e.g. "gemini-3.8-flash-high") already pin one; a
-               different effort on top is rejected by agy. Claude and GPT-OSS
-               models do not accept effort at all.
+        effort: Reasoning effort — "low", "medium", "high" (agy >= 1.1.10),
+               "xhigh" (agy >= 1.5.3) or "max" (agy >= 1.2.11). No current
+               model offers xhigh or max; Gemini 3.8 Flash offers low, medium
+               and high. Use it with a base model slug such as
+               "gemini-3.8-flash" (since agy 1.3.4 a base slug without effort
+               runs at the model's default tier). Tiered slugs (e.g.
+               "gemini-3.8-flash-high") already pin one; a different effort on
+               top is rejected by agy. Claude and GPT-OSS models do not accept
+               effort at all.
 
     Returns:
         JSON string with execution results
@@ -553,7 +569,7 @@ async def gemini_sandbox(
             "error_code": "INPUT_TOO_LARGE"
         })
 
-    effective_model = get_task_model("sandbox", model)
+    effective_model, model_note = await resolve_task_model("sandbox", model)
     effective_effort = get_task_effort("sandbox", effort)
 
     cleaned_prompt, files = extract_file_refs(prompt)
@@ -570,6 +586,7 @@ async def gemini_sandbox(
 
     try:
         result = await execute_cli_with_retry(args, timeout=get_task_timeout("sandbox"))
+        result = add_model_metadata(result, model_note)
         result = add_model_metadata(
             result, await validate_model(effective_model, effective_effort)
         )
@@ -759,10 +776,11 @@ async def gemini_credits() -> str:
     agy >= 1.1.11.
 
     Note: agy inherits the `use_ai_credits` setting from ~/.gemini/settings.json,
-    so once the standard quota is exhausted a headless run can spend paid credits
-    with no CLI flag to prevent it. Check gemini_usage() alongside this to see
-    whether quota is close to exhaustion. This tool only reports; it does not
-    gate any other tool.
+    so once the standard quota is exhausted a headless run can spend paid
+    credits. The server operator can pin this per run with CLI_AI_CREDITS=off
+    (agy >= 1.5.3 accepts it; whether it stops spend is unverified). Check
+    gemini_usage() alongside this to see whether quota is close to exhaustion.
+    This tool only reports; it does not gate any other tool.
 
     Returns:
         JSON with remaining_credits and an upgrade URI when applicable.
@@ -831,7 +849,7 @@ async def gemini_summarize(
     Args:
         content: Content to summarize (supports @filename syntax)
         focus: Optional focus area (e.g., "architecture and design patterns")
-        model: Model to use (slug or display name, e.g. "gemini-3.1-pro-high").
+        model: Model to use (slug or display name, e.g. "gemini-3.8-flash-high").
                Defaults to agy's default.
 
     Returns:
@@ -856,13 +874,14 @@ async def gemini_summarize(
         focus_text = f" Focus on: {focus}" if focus else ""
         prompt = f"IMPORTANT: This is an analysis-only task. Do NOT create, modify, or delete any files. Do NOT execute any code. Only provide your written summary.\n\nPlease summarize the following content.{focus_text}\n\n{content}"
 
-    effective_model = get_task_model("summarize", model)
+    effective_model, model_note = await resolve_task_model("summarize", model)
 
     cleaned_prompt, files = extract_file_refs(prompt)
     args = _build_cli_args(prompt=cleaned_prompt, files=files, model=effective_model)
 
     try:
         result = await execute_cli_with_retry(args, mutating=False)
+        result = add_model_metadata(result, model_note)
         result = add_model_metadata(result, await validate_model(effective_model))
         return json.dumps(result, indent=2)
     except (CLITimeoutError, CLIRateLimitError, CLIExecutionError) as e:
@@ -884,7 +903,7 @@ async def gemini_summarize_files(
     Args:
         files: Files to summarize using @filename syntax (e.g., "@src/ @docs/")
         focus: Optional focus area for analysis
-        model: Model to use (slug or display name, e.g. "gemini-3.1-pro-high").
+        model: Model to use (slug or display name, e.g. "gemini-3.8-flash-high").
                Defaults to agy's default.
 
     Returns:
@@ -903,13 +922,14 @@ async def gemini_summarize_files(
     focus_text = f" Focus on: {focus}" if focus else ""
     prompt = f"IMPORTANT: This is an analysis-only task. Do NOT create, modify, or delete any files. Do NOT execute any code. Only provide your written summary.\n\nAnalyze and summarize the following files.{focus_text}\n\n{files}"
 
-    effective_model = get_task_model("summarize_files", model)
+    effective_model, model_note = await resolve_task_model("summarize_files", model)
 
     cleaned_prompt, files = extract_file_refs(prompt)
     args = _build_cli_args(prompt=cleaned_prompt, files=files, model=effective_model)
 
     try:
         result = await execute_cli_with_retry(args, mutating=False, timeout=get_task_timeout("summarize_files"))
+        result = add_model_metadata(result, model_note)
         result = add_model_metadata(result, await validate_model(effective_model))
         return json.dumps(result, indent=2)
     except (CLITimeoutError, CLIRateLimitError, CLIExecutionError) as e:
@@ -939,7 +959,7 @@ async def gemini_eval_plan(
         context: Optional context (e.g., "Node.js REST API with MongoDB")
         requirements: Optional requirements or constraints
         model: Model to use (slug or display name, e.g. "gemini-3.8-flash-medium").
-               Defaults to "gemini-3.1-pro-high".
+               Defaults to "gemini-3.8-flash-high".
 
     Returns:
         JSON string with evaluation results
@@ -977,13 +997,14 @@ Provide a detailed analysis with:
 3. Missing considerations
 4. Recommendations"""
 
-    effective_model = get_task_model("eval_plan", model)
+    effective_model, model_note = await resolve_task_model("eval_plan", model)
 
     cleaned_prompt, files = extract_file_refs(prompt)
     args = _build_cli_args(prompt=cleaned_prompt, files=files, model=effective_model)
 
     try:
         result = await execute_cli_with_retry(args, mutating=False, timeout=get_task_timeout("eval_plan"))
+        result = add_model_metadata(result, model_note)
         result = add_model_metadata(result, await validate_model(effective_model))
         return json.dumps(result, indent=2)
     except (CLITimeoutError, CLIRateLimitError, CLIExecutionError) as e:
@@ -1009,8 +1030,8 @@ async def gemini_review_code(
         purpose: Purpose of the review (e.g., "Security review")
         context: Additional context
         language: Programming language
-        model: Model to use (slug or display name, e.g. "gemini-3.1-pro-high").
-               Defaults to "gemini-3.1-pro-high".
+        model: Model to use (slug or display name, e.g. "gemini-3.8-flash-high").
+               Defaults to "gemini-3.8-flash-high".
 
     Returns:
         JSON string with review results
@@ -1048,13 +1069,14 @@ Provide a detailed review covering:
 4. Performance considerations
 5. Recommendations"""
 
-    effective_model = get_task_model("review_code", model)
+    effective_model, model_note = await resolve_task_model("review_code", model)
 
     cleaned_prompt, files = extract_file_refs(prompt)
     args = _build_cli_args(prompt=cleaned_prompt, files=files, model=effective_model)
 
     try:
         result = await execute_cli_with_retry(args, mutating=False, timeout=get_task_timeout("review_code"))
+        result = add_model_metadata(result, model_note)
         result = add_model_metadata(result, await validate_model(effective_model))
         return json.dumps(result, indent=2)
     except (CLITimeoutError, CLIRateLimitError, CLIExecutionError) as e:
@@ -1080,8 +1102,8 @@ async def gemini_verify_solution(
         requirements: Original requirements
         test_criteria: Testing and performance criteria
         context: Deployment context
-        model: Model to use (slug or display name, e.g. "gemini-3.1-pro-high").
-               Defaults to "gemini-3.1-pro-high".
+        model: Model to use (slug or display name, e.g. "gemini-3.8-flash-high").
+               Defaults to "gemini-3.8-flash-high".
 
     Returns:
         JSON string with verification results
@@ -1121,13 +1143,14 @@ Verify:
 5. Test coverage adequacy
 6. Production readiness"""
 
-    effective_model = get_task_model("verify_solution", model)
+    effective_model, model_note = await resolve_task_model("verify_solution", model)
 
     cleaned_prompt, files = extract_file_refs(prompt)
     args = _build_cli_args(prompt=cleaned_prompt, files=files, model=effective_model)
 
     try:
         result = await execute_cli_with_retry(args, mutating=False, timeout=get_task_timeout("verify_solution"))
+        result = add_model_metadata(result, model_note)
         result = add_model_metadata(result, await validate_model(effective_model))
         return json.dumps(result, indent=2)
     except (CLITimeoutError, CLIRateLimitError, CLIExecutionError) as e:
@@ -1234,7 +1257,7 @@ async def gemini_continue_conversation(
         conversation_id: A handle from gemini_start_conversation(), or an
                existing agy conversation id from gemini_list_conversations().
         prompt: The new prompt/message
-        model: Model to use (slug or display name, e.g. "gemini-3.1-pro-high").
+        model: Model to use (slug or display name, e.g. "gemini-3.8-flash-high").
                Defaults to agy's default; the model is not carried over from
                earlier turns of the conversation.
         project: Project ID or name for session isolation (agy >= 1.0.12;
@@ -1249,7 +1272,7 @@ async def gemini_continue_conversation(
             prompt="How do I optimize this?",
         )
     """
-    effective_model = get_task_model("continue_conversation", model)
+    effective_model, model_note = await resolve_task_model("continue_conversation", model)
 
     try:
         from modules.services.conversation_manager import ConversationManager
@@ -1260,6 +1283,7 @@ async def gemini_continue_conversation(
             model=effective_model,
             project=project,
         )
+        result = add_model_metadata(result, model_note)
         result = add_model_metadata(result, await validate_model(effective_model))
         return json.dumps(result, indent=2)
     except ImportError:
@@ -1270,11 +1294,14 @@ async def gemini_continue_conversation(
             project=project,
         )
         result = await execute_cli_with_retry(args)
-        return json.dumps(add_model_metadata({
+        response = add_model_metadata({
             "status": "success",
             "conversation_id": conversation_id,
             "response": result
-        }, await validate_model(effective_model)), indent=2)
+        }, model_note)
+        return json.dumps(add_model_metadata(
+            response, await validate_model(effective_model)
+        ), indent=2)
 
 
 @mcp.tool()
@@ -1405,8 +1432,8 @@ async def gemini_code_review(
         focus_areas: Comma-separated focus areas (security,performance,quality,best_practices)
         severity_threshold: Minimum severity to report (info, warning, error, critical)
         output_format: Output format (structured, markdown, json)
-        model: Model to use (slug or display name, e.g. "gemini-3.1-pro-high").
-               Defaults to "gemini-3.1-pro-high".
+        model: Model to use (slug or display name, e.g. "gemini-3.8-flash-high").
+               Defaults to "gemini-3.8-flash-high".
 
     Returns:
         JSON with structured code review
@@ -1425,7 +1452,7 @@ async def gemini_code_review(
             model=model,
         )
     except ImportError:
-        effective_model = get_task_model("code_review", model)
+        effective_model, model_note = await resolve_task_model("code_review", model)
         focus_text = f"\n\nFocus areas: {focus_areas}" if focus_areas else ""
         lang_text = f"\n\nLanguage: {language}" if language else ""
         prompt = f"""Perform a comprehensive code review.{focus_text}{lang_text}
@@ -1438,6 +1465,7 @@ Provide analysis in {output_format} format with severity levels."""
         cleaned_prompt, files = extract_file_refs(prompt)
         args = _build_cli_args(prompt=cleaned_prompt, files=files, model=effective_model)
         result = await execute_cli_with_retry(args, mutating=False, timeout=get_task_timeout("code_review"))
+        result = add_model_metadata(result, model_note)
         result = add_model_metadata(result, await validate_model(effective_model))
         return json.dumps(result, indent=2)
 
@@ -1465,8 +1493,8 @@ async def gemini_extract_structured(
         strict_mode: True (default) enforces the schema upstream and returns
                `structured_output`. False uses prompt-only extraction, where the
                model is merely asked to follow the schema.
-        model: Model to use (slug or display name, e.g. "gemini-3.1-pro-high").
-               Defaults to "gemini-3.1-pro-high".
+        model: Model to use (slug or display name, e.g. "gemini-3.8-flash-high").
+               Defaults to "gemini-3.8-flash-high".
 
     Returns:
         JSON with `schema_validation` set to "enforced" or "prompt_only". When
@@ -1486,7 +1514,7 @@ async def gemini_extract_structured(
             model=model
         )
     except ImportError:
-        effective_model = get_task_model("extract_structured", model)
+        effective_model, model_note = await resolve_task_model("extract_structured", model)
         strict_text = " Strictly follow the schema." if strict_mode else ""
         example_text = f"\n\nExamples:\n{examples}" if examples else ""
         prompt = f"""IMPORTANT: This is an analysis-only task. Do NOT create, modify, or delete any files. Do NOT execute any code. Only return the extracted data.
@@ -1516,6 +1544,7 @@ Return valid JSON matching the schema."""
                 "error_code": cli_error_code(e),
                 "schema_validation": "prompt_only",
             })
+        result = add_model_metadata(result, model_note)
         result = add_model_metadata(result, await validate_model(effective_model))
         # This fallback never passes --json-schema, so the schema is only ever
         # requested in the prompt.
@@ -1541,8 +1570,8 @@ async def gemini_git_diff_review(
         review_type: Review type (comprehensive, security_only, performance_only, quick)
         base_branch: Base branch for context
         commit_message: Associated commit message
-        model: Model to use (slug or display name, e.g. "gemini-3.1-pro-high").
-               Defaults to "gemini-3.1-pro-high".
+        model: Model to use (slug or display name, e.g. "gemini-3.8-flash-high").
+               Defaults to "gemini-3.8-flash-high".
 
     Returns:
         JSON with diff analysis
@@ -1561,7 +1590,7 @@ async def gemini_git_diff_review(
             model=model,
         )
     except ImportError:
-        effective_model = get_task_model("git_diff_review", model)
+        effective_model, model_note = await resolve_task_model("git_diff_review", model)
         branch_text = f"\n\nBase branch: {base_branch}" if base_branch else ""
         commit_text = f"\n\nCommit message: {commit_message}" if commit_message else ""
         prompt = f"""Review the following git diff ({review_type} review).{branch_text}{commit_text}
@@ -1578,6 +1607,7 @@ Provide feedback on:
         cleaned_prompt, files = extract_file_refs(prompt)
         args = _build_cli_args(prompt=cleaned_prompt, files=files, model=effective_model)
         result = await execute_cli_with_retry(args, mutating=False, timeout=get_task_timeout("git_diff_review"))
+        result = add_model_metadata(result, model_note)
         result = add_model_metadata(result, await validate_model(effective_model))
         return json.dumps(result, indent=2)
 
@@ -1604,8 +1634,8 @@ async def gemini_content_comparison(
         output_format: Output format (structured, matrix, summary, detailed, json)
         include_metrics: Include similarity scores and metrics
         focus_areas: Comma-separated focus areas
-        model: Model to use (slug or display name, e.g. "gemini-3.1-pro-high").
-               Defaults to "gemini-3.1-pro-high".
+        model: Model to use (slug or display name, e.g. "gemini-3.8-flash-high").
+               Defaults to "gemini-3.8-flash-high".
 
     Returns:
         JSON with comparison results
@@ -1624,7 +1654,7 @@ async def gemini_content_comparison(
             model=model,
         )
     except ImportError:
-        effective_model = get_task_model("content_comparison", model)
+        effective_model, model_note = await resolve_task_model("content_comparison", model)
         focus_text = f"\n\nFocus on: {focus_areas}" if focus_areas else ""
         prompt = f"""Compare the following sources using {comparison_type} comparison.{focus_text}
 
@@ -1636,6 +1666,7 @@ Provide a {output_format} comparison{"with similarity metrics" if include_metric
         cleaned_prompt, files = extract_file_refs(prompt)
         args = _build_cli_args(prompt=cleaned_prompt, files=files, model=effective_model)
         result = await execute_cli_with_retry(args, mutating=False, timeout=get_task_timeout("content_comparison"))
+        result = add_model_metadata(result, model_note)
         result = add_model_metadata(result, await validate_model(effective_model))
         return json.dumps(result, indent=2)
 
@@ -1674,7 +1705,7 @@ async def gemini_ai_collaboration(
         collaboration_mode: Mode (sequential, debate, validation)
         content: Content to analyze
         models: Comma-separated model list using slugs or display names
-               (e.g., "gemini-3.1-pro-high,gemini-3.8-flash-medium")
+               (e.g., "gemini-3.8-flash-high,claude-sonnet-4-6")
         context: Additional context
         conversation_id: Accepted for backward compatibility but NOT used;
                 the collaboration engine does not thread it through

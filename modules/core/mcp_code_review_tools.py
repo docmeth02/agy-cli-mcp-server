@@ -13,6 +13,7 @@ from modules.utils.cli_utils import (
     execute_cli_with_retry,
     extract_file_refs,
     _build_cli_args,
+    resolve_task_model,
     validate_model,
     add_model_metadata,
     CLIExecutionError,
@@ -23,7 +24,6 @@ from modules.config.cli_config import (
     GEMINI_CODE_REVIEW_LIMIT,
     GEMINI_EXTRACT_STRUCTURED_LIMIT,
     GEMINI_GIT_DIFF_LIMIT,
-    get_task_model,
     get_task_timeout,
 )
 
@@ -81,13 +81,14 @@ Code:
 
 Provide analysis in {output_format} format with severity levels."""
 
-    effective_model = get_task_model("code_review", model)
+    effective_model, model_note = await resolve_task_model("code_review", model)
 
     cleaned_prompt, files = extract_file_refs(prompt)
     args = _build_cli_args(prompt=cleaned_prompt, files=files, model=effective_model)
 
     try:
         result = await execute_cli_with_retry(args, mutating=False, timeout=get_task_timeout("code_review"))
+        result = add_model_metadata(result, model_note)
         result = add_model_metadata(result, await validate_model(effective_model))
         return json.dumps(result, indent=2)
     except (CLITimeoutError, CLIRateLimitError, CLIExecutionError) as e:
@@ -114,7 +115,7 @@ async def execute_extract_structured(
         strict_mode: True enforces the schema upstream via agy's --json-schema
                      (agy >= 1.1.8), returning a validated `structured_output`.
                      False uses prompt-only extraction.
-        model: Model to use. Resolved via get_task_model().
+        model: Model to use. Resolved via resolve_task_model().
 
     Returns:
         JSON string with extracted data. On the enforced path the response
@@ -179,7 +180,7 @@ Content:
 
 Return valid JSON matching the schema."""
 
-    effective_model = get_task_model("extract_structured", model)
+    effective_model, model_note = await resolve_task_model("extract_structured", model)
 
     # Upstream enforcement when available: agy validates the model's output
     # against the schema and returns it as a parsed `structured_output` object,
@@ -214,6 +215,7 @@ Return valid JSON matching the schema."""
 
     try:
         result = await execute_cli_with_retry(args, mutating=False, timeout=get_task_timeout("extract_structured"))
+        result = add_model_metadata(result, model_note)
         result = add_model_metadata(result, await validate_model(effective_model))
         result["schema_validation"] = "enforced" if enforce else "prompt_only"
         if enforce and "structured_output" not in result:
@@ -284,13 +286,14 @@ Provide feedback on:
 3. Security implications
 4. Suggestions for improvement"""
 
-    effective_model = get_task_model("git_diff_review", model)
+    effective_model, model_note = await resolve_task_model("git_diff_review", model)
 
     cleaned_prompt, files = extract_file_refs(prompt)
     args = _build_cli_args(prompt=cleaned_prompt, files=files, model=effective_model)
 
     try:
         result = await execute_cli_with_retry(args, mutating=False, timeout=get_task_timeout("git_diff_review"))
+        result = add_model_metadata(result, model_note)
         result = add_model_metadata(result, await validate_model(effective_model))
         return json.dumps(result, indent=2)
     except (CLITimeoutError, CLIRateLimitError, CLIExecutionError) as e:
