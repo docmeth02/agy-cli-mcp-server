@@ -167,10 +167,14 @@ class TestValidateModelBothColumns:
         monkeypatch.setattr(cu, "_get_cached_or_sync_version", lambda: "1.1.11")
 
         async def _models():
+            # The roster agy 1.5.3 lists (Gemini 3.1 Pro was dropped there).
             return [
-                {"slug": "gemini-3.1-pro-high", "display_name": "Gemini 3.1 Pro (High)"},
-                {"slug": "gemini-3.6-flash-medium", "display_name": "Gemini 3.6 Flash (Medium)"},
+                {"slug": "gemini-3.8-flash-high", "display_name": "Gemini 3.8 Flash (High)"},
+                {"slug": "gemini-3.8-flash-medium", "display_name": "Gemini 3.8 Flash (Medium)"},
+                {"slug": "gemini-3.8-flash-low", "display_name": "Gemini 3.8 Flash (Low)"},
                 {"slug": "claude-sonnet-4-6", "display_name": "Claude Sonnet 4.6 (Thinking)"},
+                {"slug": "claude-opus-4-6-thinking", "display_name": "Claude Opus 4.6 (Thinking)"},
+                {"slug": "gpt-oss-120b-medium", "display_name": "GPT-OSS 120B (Medium)"},
             ]
 
         monkeypatch.setattr(cu, "get_available_models", _models)

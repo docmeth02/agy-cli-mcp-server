@@ -12,6 +12,7 @@ from modules.utils.cli_utils import (
     execute_cli_with_retry,
     extract_file_refs,
     _build_cli_args,
+    drop_unavailable_default,
     validate_model,
     add_model_metadata,
     CLIExecutionError,
@@ -27,11 +28,14 @@ logger = logging.getLogger(__name__)
 
 # Stable model slugs (agy >= 1.1.5). The short names these replaced
 # ("flash", "pro", "claude") were dropped in agy 1.1.4 and now hard-fail, which
-# meant every default collaboration run errored out.
+# meant every default collaboration run errored out. The same happened again
+# when agy 1.5.3 dropped gemini-3.1-pro-high; its High-tier role is now taken by
+# gemini-3.8-flash-high, and a default that disappears from `agy models` is now
+# dropped at run time with a warning (see execute_collaboration).
 DEFAULT_MODELS = {
-    "sequential": "gemini-3.8-flash-medium,gemini-3.1-pro-high",
-    "debate": "gemini-3.1-pro-high,gemini-3.8-flash-medium,claude-sonnet-4-6",
-    "validation": "gemini-3.1-pro-high,gemini-3.8-flash-medium",
+    "sequential": "gemini-3.8-flash-medium,gemini-3.8-flash-high",
+    "debate": "gemini-3.8-flash-high,gemini-3.8-flash-medium,claude-sonnet-4-6",
+    "validation": "gemini-3.8-flash-high,gemini-3.8-flash-medium",
 }
 
 # Model used for the cheap aggregation steps (pipeline summary, debate
@@ -68,7 +72,7 @@ async def execute_collaboration(
         collaboration_mode: Mode (sequential, debate, validation)
         content: Content to analyze
         models: Comma-separated model list of slugs or display names
-                (e.g., "gemini-3.1-pro-high,gemini-3.8-flash-medium" for debate)
+                (e.g., "gemini-3.8-flash-high,claude-sonnet-4-6" for debate)
         context: Additional context
         Other mode-specific parameters
 
@@ -82,15 +86,39 @@ async def execute_collaboration(
             "error_code": "INPUT_TOO_LARGE"
         })
 
-    # Get default models for mode if not specified
-    if not models:
-        models = DEFAULT_MODELS.get(collaboration_mode, DEFAULT_MODELS["sequential"])
+    # Checked before any model resolution, which may run `agy models`.
+    if collaboration_mode not in DEFAULT_MODELS:
+        return json.dumps({
+            "status": "error",
+            "error": f"Unknown collaboration mode: {collaboration_mode}",
+            "valid_modes": list(DEFAULT_MODELS),
+        })
 
-    model_list = [m.strip() for m in models.split(",")]
+    # Get default models for mode if not specified. Only shipped defaults are
+    # checked against the live roster; a list the caller passed must fail
+    # loudly on an unknown model rather than quietly run a different one.
+    # SYNTHESIS_MODEL is always a shipped default, so it is checked either way
+    # (the synthesis steps resolve it again through _synthesis_model()).
+    default_notes: list[dict] = []
 
-    # Route to appropriate handler
+    def _note(meta: dict) -> None:
+        # The same model can be both a stage default and the synthesis model.
+        if meta and meta not in default_notes:
+            default_notes.append(meta)
+
+    if models:
+        model_list = [m.strip() for m in models.split(",")]
+    else:
+        model_list = []
+        for default in DEFAULT_MODELS[collaboration_mode].split(","):
+            # A dropped default becomes "": _execute_model then lets agy pick.
+            resolved, note = await drop_unavailable_default(default.strip())
+            model_list.append(resolved or "")
+            _note(note)
+    _note((await drop_unavailable_default(SYNTHESIS_MODEL))[1])
+
     if collaboration_mode == "sequential":
-        return await _execute_sequential(
+        output = await _execute_sequential(
             content=content,
             models=model_list,
             context=context,
@@ -100,7 +128,7 @@ async def execute_collaboration(
             focus=focus
         )
     elif collaboration_mode == "debate":
-        return await _execute_debate(
+        output = await _execute_debate(
             content=content,
             models=model_list,
             context=context,
@@ -109,8 +137,8 @@ async def execute_collaboration(
             convergence_criteria=convergence_criteria,
             focus=focus
         )
-    elif collaboration_mode == "validation":
-        return await _execute_validation(
+    else:  # "validation" (the mode was validated above)
+        output = await _execute_validation(
             content=content,
             models=model_list,
             context=context,
@@ -120,12 +148,13 @@ async def execute_collaboration(
             conflict_resolution=conflict_resolution,
             focus=focus
         )
-    else:
-        return json.dumps({
-            "status": "error",
-            "error": f"Unknown collaboration mode: {collaboration_mode}",
-            "valid_modes": ["sequential", "debate", "validation"]
-        })
+
+    if not default_notes:
+        return output
+    merged = json.loads(output)
+    for note in default_notes:
+        add_model_metadata(merged, note)
+    return json.dumps(merged, indent=2)
 
 
 async def _execute_sequential(
@@ -321,7 +350,19 @@ Provide validation results."""
     }, indent=2)
 
 
-async def _execute_model(model: str, prompt: str) -> dict:
+async def _synthesis_model() -> Optional[str]:
+    """
+    SYNTHESIS_MODEL, or None (agy's default) if agy no longer offers it.
+
+    The warning is dropped here because execute_collaboration already added the
+    same check's warning to the response (the roster is cached, so both calls
+    see the same list).
+    """
+    model, _ = await drop_unavailable_default(SYNTHESIS_MODEL)
+    return model
+
+
+async def _execute_model(model: Optional[str], prompt: str) -> dict:
     """Execute a prompt with the specified model via agy."""
     cleaned_prompt, files = extract_file_refs(prompt)
     args = _build_cli_args(prompt=cleaned_prompt, files=files, model=model or None)
@@ -361,7 +402,7 @@ async def _generate_pipeline_summary(
         )
         prompt = get_pipeline_summary_prompt(original_content, all_outputs, stages)
 
-        result = await _execute_model(SYNTHESIS_MODEL, prompt)
+        result = await _execute_model(await _synthesis_model(), prompt)
         return result.get("content", result.get("stdout", "Pipeline complete"))
     except Exception as e:
         logger.error(f"Error generating pipeline summary: {e}")
@@ -383,7 +424,7 @@ async def _generate_debate_synthesis(
         )
         prompt = get_debate_synthesis_prompt(topic, args_text, debate_style, total_rounds)
 
-        result = await _execute_model(SYNTHESIS_MODEL, prompt)
+        result = await _execute_model(await _synthesis_model(), prompt)
         return result.get("content", result.get("stdout", "Debate concluded"))
     except Exception as e:
         logger.error(f"Error generating debate synthesis: {e}")
@@ -408,7 +449,7 @@ async def _build_consensus(
             content, all_validations, validation_criteria, consensus_method, conflict_resolution
         )
 
-        result = await _execute_model(SYNTHESIS_MODEL, prompt)
+        result = await _execute_model(await _synthesis_model(), prompt)
         return result.get("content", result.get("stdout", "Consensus reached"))
     except Exception as e:
         logger.error(f"Error building consensus: {e}")

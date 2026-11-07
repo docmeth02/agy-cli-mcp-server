@@ -163,7 +163,7 @@ List available custom agents (agy >= 1.1.1). Agents are specialized personas sel
 gemini_agents()
 ```
 
-> **Caveat:** agy silently ignores an unknown `--agent` name, so a typo passes unnoticed. `validate_agent()` pre-checks the name and attaches a warning to the response.
+> **Caveat:** only *custom* agents are listed (`agy agents` omits the built-in ones), so the list is empty when you have created none. Since agy 1.3.4 an unknown `--agent` name makes the call fail before any turn with `unknown agent "<name>"`; on older agy it was silently ignored, and `validate_agent()` pre-checks the name there and attaches a warning to the response.
 
 #### `gemini_metrics`
 Get comprehensive server performance metrics and statistics.
@@ -220,7 +220,7 @@ Show the remaining paid **G1 credit** balance (requires agy >= 1.1.11). Also fre
 gemini_credits()
 ```
 
-> **Why this matters:** agy inherits the `use_ai_credits` setting from `~/.gemini/settings.json`, so once the standard quota is exhausted a headless MCP server can silently spend paid credits — there is no CLI flag or env var to pin this. These two tools make that state visible. They **report only** and never gate another tool: quota state is race-prone and window-specific, and a remaining-credit figure does not tell you whether credit fallback is even enabled, so a heuristic block would give a false sense of billing safety.
+> **Why this matters:** agy inherits the `use_ai_credits` setting from `~/.gemini/settings.json`, so once the standard quota is exhausted a headless MCP server can silently spend paid credits. These two tools make that state visible. They **report only** and never gate another tool: quota state is race-prone and window-specific, and a remaining-credit figure does not tell you whether credit fallback is even enabled, so a heuristic block would give a false sense of billing safety. To pin credit fallback per run, set `CLI_AI_CREDITS=off` (see [G1 credit spend](#core-configuration)).
 
 ### Analysis Tools (5)
 
@@ -432,7 +432,7 @@ gemini_ai_collaboration(
 **Universal Parameters:**
 - **`collaboration_mode`** (required): `sequential` | `debate` | `validation`
 - **`content`** (required): Content to be analyzed/processed
-- **`models`** (optional): Comma-separated list of AI models (e.g., "gemini-3.1-pro-high,gemini-3.8-flash-medium" for diverse debate; auto-selected if not provided)
+- **`models`** (optional): Comma-separated list of AI models (e.g., "gemini-3.8-flash-high,claude-sonnet-4-6" for diverse debate; auto-selected if not provided — a default that agy no longer offers is dropped with a `warning` and agy's own default model runs in its place)
 - **`context`** (optional): Additional context for collaboration
 - **`conversation_id`** (optional): For stateful conversation history
 
@@ -534,7 +534,7 @@ gemini_ai_collaboration(
 ### Prerequisites
 
 - **Python 3.10+** - Required for MCP SDK compatibility
-- **Antigravity CLI** - Google's command-line tool for Gemini AI (`agy`). Verified against **agy 1.2.14**; older versions keep working through version-gated flags (see the per-feature `agy >=` notes below)
+- **Antigravity CLI** - Google's command-line tool for Gemini AI (`agy`). Verified against **agy 1.5.3**; older versions keep working through version-gated flags (see the per-feature `agy >=` notes below)
 - **uv** (recommended) or pip for package management
 
 ### Linux Setup
@@ -902,14 +902,16 @@ Since agy 1.1.5, `agy models` reports **two accepted forms per model** and eithe
 
 | Form | Example | Notes |
 |------|---------|-------|
-| Stable slug | `gemini-3.1-pro-high` | **Preferred** — documented as stable across releases |
-| Display name | `Gemini 3.1 Pro (High)` | Tracks marketing labels, can change |
+| Stable slug | `gemini-3.8-flash-high` | **Preferred** — documented as stable across releases |
+| Display name | `Gemini 3.8 Flash (High)` | Tracks marketing labels, can change |
 
 Short names (`pro`/`flash`/`claude`) were dropped in agy 1.1.4 and now hard-fail with an error listing the valid names.
 
-Current roster (run `gemini_models()` or `agy models` for the live list): Gemini 3.8 Flash, Gemini 3.7 Flash and Gemini 3.6 Flash (each High/Medium/Low), Gemini 3.1 Pro (**High/Low only — no Medium tier**), Claude Sonnet 4.6 (Thinking), Claude Opus 4.6 (Thinking), GPT-OSS 120B (Medium).
+Current roster on agy 1.5.3 (run `gemini_models()` or `agy models` for the live list): Gemini 3.8 Flash (High/Medium/Low), Claude Sonnet 4.6 (Thinking), Claude Opus 4.6 (Thinking), GPT-OSS 120B (Medium). agy 1.5.3 dropped Gemini 3.1 Pro and Gemini 3.6/3.7 Flash.
 
-Complex tools (eval_plan, review_code, verify_solution, code_review, extract_structured, git_diff_review, content_comparison) default to `gemini-3.1-pro-high` for deeper reasoning; lightweight tools let agy decide. Per-task defaults can be overridden via `CLI_MODEL_{TASK}` / `GEMINI_MODEL_{TASK}` environment variables.
+Complex tools (eval_plan, review_code, verify_solution, code_review, extract_structured, git_diff_review, content_comparison) default to `gemini-3.8-flash-high`, the strongest Gemini tier left; lightweight tools let agy decide. Per-task defaults can be overridden via `CLI_MODEL_{TASK}` / `GEMINI_MODEL_{TASK}` environment variables.
+
+If a release drops a model the server ships as a default, the call no longer fails: the default is left out, agy's own default model runs instead, and the response carries a `warning` naming the missing model. A model you name yourself (the `model` argument, `CLI_MODEL_{TASK}` or `CLI_DEFAULT_MODEL`) is never replaced — an unknown one still fails before any turn starts.
 
 > **Version caveat:** agy 1.1.10 fixed `--model` (and `--effort`) being *silently ignored* in headless `-p` runs. On agy 1.1.4–1.1.9 a passed model may never have been applied.
 
@@ -933,11 +935,17 @@ exits 0 with `status: SUCCESS`. The envelope's `status` field is the only
 dependable indicator, so it is what the server trusts.
 
 Responses gain `usage`, `num_turns`, `conversation_id`, `agy_status`,
-`agy_duration_seconds` and `denied_actions` (agy >= 1.1.27) alongside the existing
-`stdout`/`stderr`/`return_code`. When a turn fails on an agent or model API error,
-agy >= 1.2.6 exits 3 and prints a structured `AGY_ERROR: {...}` line on stderr;
-it is surfaced as `agy_error`, and its `retryable: false` verdict suppresses
-retries.
+`agy_duration_seconds`, `denied_actions` (agy >= 1.1.27) and `finished_reason`
+(agy >= 1.4.11: `print_timeout`, `interrupted` or `error` when a turn ended early)
+alongside the existing `stdout`/`stderr`/`return_code`. When a turn fails on an
+agent or model API error, agy >= 1.2.6 exits 3 and prints a structured
+`AGY_ERROR: {...}` line on stderr; it is surfaced as `agy_error`, and its
+`retryable: false` verdict suppresses retries.
+
+When a run outlives its budget on agy >= 1.5.0, agy ends the turn itself and the
+response keeps what was written so far: `status: "error"`, `error_code: "TIMEOUT"`,
+`finished_reason: "print_timeout"` and `partial: true`, with the partial answer in
+`stdout`. See the `--print-timeout` note under Configuration.
 
 | `CLI_OUTPUT_FORMAT` | Behavior |
 |---|---|
@@ -964,7 +972,7 @@ executed and files already edited.
 |---|---|
 | Mutating (`gemini_prompt`, `gemini_sandbox`, `gemini_cli`, `gemini_ai_collaboration`, `gemini_continue_conversation`) | **None** — surfaced to the caller instead of repeated |
 | Analysis (`gemini_summarize`, `gemini_summarize_files`, `gemini_eval_plan`, `gemini_review_code`, `gemini_code_review`, `gemini_verify_solution`, `gemini_extract_structured`, `gemini_git_diff_review`, `gemini_content_comparison`) | Up to `RETRY_MAX_ATTEMPTS`, **and only if agy did no work** |
-| `gemini_prompt(readonly=True)` | **Not** retried. `readonly` only prepends a preamble asking the model not to write; nothing enforces it — `--dangerously-skip-permissions` is still passed, and `--mode plan` does **not** block writes either (re-measured on agy 1.2.14: headless runs auto-approve their own plan and write). Treating a prompt instruction as a safety boundary is the mistake the `--sandbox` note warns about. |
+| `gemini_prompt(readonly=True)` | **Not** retried. On agy >= 1.5.3 `readonly` runs agy in `--mode plan`, which held back every write in the measurements (file and shell writes, inside and outside the workspace) while reads still worked; the response reports `readonly_enforcement: "plan_mode"`. On older agy it is only a preamble asking the model not to write (`"prompt_only"`). Neither is treated as a guarantee strong enough to re-run a whole agent turn — the mistake the `--sandbox` note warns about. |
 
 Even where retrying is permitted, it happens **only when agy provably did no work** — the envelope reporting zero turns and zero tokens, meaning the request was refused before anything ran. A limit that arrives mid-run is never retried, because agy allows hundreds of tool calls and the run may already have edited files. This is unknowable on the text transport, which therefore never retries.
 
@@ -972,24 +980,25 @@ Timeouts and `CLIProtocolError` are never retried.
 
 ### Reasoning Effort (agy >= 1.1.10)
 
-`gemini_prompt` and `gemini_sandbox` accept `effort` (`low`/`medium`/`high`, and
-`max` on agy >= 1.2.11 — though no current model offers it). Most model slugs
-already pin a tier (`gemini-3.1-pro-high`), so `effort` is only needed with a
-tier-free base slug, which agy **requires** it for:
+`gemini_prompt` and `gemini_sandbox` accept `effort` (`low`/`medium`/`high`,
+`max` on agy >= 1.2.11 and `xhigh` on agy >= 1.5.3 — though no current model
+offers `xhigh` or `max`). Most model slugs already pin a tier
+(`gemini-3.8-flash-high`), so `effort` is only needed with a tier-free base slug.
+Up to agy 1.3.3 a base slug **required** it; since 1.3.4 a base slug alone runs at
+the model's default tier:
 
 ```python
 gemini_prompt(prompt="…", model="gemini-3.8-flash", effort="low")
 ```
 
-agy 1.2.14 **rejects** a tier-suffixed slug combined with a different `effort`
+agy **rejects** a tier-suffixed slug combined with a different `effort`
 (`--model gemini-3.8-flash-high conflicts with --effort=low`); the response then
 carries a warning naming the base slug to use. This detects both accepted forms
-(`gemini-3.1-pro-low` and `Gemini 3.1 Pro (Low)`). Claude and GPT-OSS models do
-not accept `effort` at all, and a base slug's `effort` must be a tier the family
-offers (Gemini 3.1 Pro has no `medium`). The response warns about each of these
-combinations using the live model list. Base slugs work only on `gemini_prompt`
-and `gemini_sandbox` (the only tools that take `effort`); other tools warn when
-given one. Per-task defaults via `CLI_EFFORT_{TASK}`, global default via
+(`gemini-3.8-flash-low` and `Gemini 3.8 Flash (Low)`). Claude and GPT-OSS models
+do not accept `effort` at all, and a base slug's `effort` must be a tier the
+family offers (Gemini 3.8 Flash has no `xhigh`). The response warns about each
+of these combinations using the live model list. On agy < 1.3.4 the other tools
+(which take no `effort`) warn when given a base slug. Per-task defaults via `CLI_EFFORT_{TASK}`, global default via
 `CLI_DEFAULT_EFFORT` (applies to `gemini_prompt`/`gemini_sandbox` only).
 
 Gated on **1.1.10**, not 1.1.5: the flag exists from 1.1.5 but agy 1.1.10 fixed
@@ -1177,7 +1186,8 @@ export CLI_COMMAND_PATH=agy     # Path to Antigravity CLI executable
 export GEMINI_TIMEOUT=900       # Fallback for CLI_TIMEOUT
 export GEMINI_LOG_LEVEL=INFO    # Fallback for CLI_LOG_LEVEL
 export GEMINI_COMMAND_PATH=agy  # Fallback for CLI_COMMAND_PATH
-export CLI_PRINT_TIMEOUT_GRACE=30  # Seconds agy's --print-timeout sits above the resolved timeout
+export CLI_PRINT_TIMEOUT_GRACE=30  # Max gap between agy's --print-timeout and the resolved timeout (see below)
+export CLI_AI_CREDITS=inherit   # inherit | off | on — pin G1 credit fallback per run (see below)
 export CLI_LOG_FILE=            # Optional path for agy diagnostics; keeps stdout clean (do NOT use /dev/null — agy hangs)
 ```
 
@@ -1194,8 +1204,14 @@ value is the true wall-clock cap.
 > **G1 credit spend:** As of agy 1.0.8 the CLI inherits the `use_ai_credits`
 > (`UseG1Credits`) setting from `~/.gemini/settings.json` on startup, so a
 > headless server can silently consume paid G1 credits once the standard quota
-> is exhausted. There is no CLI flag or env var to pin this — set it in that
-> global settings file. Raised per-task timeouts amplify worst-case spend.
+> is exhausted. Raised per-task timeouts amplify worst-case spend.
+> `CLI_AI_CREDITS=off` (or `on`) pins it for every print run through agy's
+> per-run `--settings '{"useG1Credits": false}'`, which is never saved. agy 1.5.3
+> accepts that key (misspelt keys fail with `unknown setting`), but whether
+> `off` actually stops credit spend could not be measured — that needs an
+> account with credits and an exhausted quota — so the default stays `inherit`.
+> A pinned value is passed whatever the agy version: an agy that does not know
+> the flag or key fails loudly rather than quietly ignoring a billing control.
 
 > **`--sandbox` scope:** agy's `--sandbox` enables *terminal command*
 > restrictions, **not** a filesystem jail. Since the server always passes
@@ -1206,10 +1222,17 @@ value is the true wall-clock cap.
 > **agy version floor:** legacy non-AES-NI CPUs require **agy ≥ 1.0.8**
 > (SIGILL crash fix).
 
-`--print-timeout`: agy's internal print-mode timeout defaulted to 5 minutes before
-agy 1.2.6 (unlimited since). The server passes
-`--print-timeout (CLI_TIMEOUT + CLI_PRINT_TIMEOUT_GRACE)s` so agy never preempts a
-long run before the Python-side supervisor timeout fires. A timeout error reading
+`--print-timeout`: the server always passes one, set relative to the tool's
+resolved timeout:
+
+| agy | `--print-timeout` | What happens on overrun |
+|---|---|---|
+| >= 1.5.0 | resolved timeout minus a tenth of it (at least 3s, at most `CLI_PRINT_TIMEOUT_GRACE`), e.g. 870s for 900s | agy ends the turn itself and returns the partial answer (`finished_reason: "print_timeout"`, `partial: true`, `error_code: "TIMEOUT"`) |
+| older or unknown | resolved timeout + `CLI_PRINT_TIMEOUT_GRACE` | the server kills agy at the resolved timeout; nothing is returned |
+
+Before 1.5.0 a cut-short print run could exit 0, so letting agy stop first could
+pass a truncated answer off as complete. Either way the server still kills agy at
+exactly the resolved timeout if it has not exited. A timeout error reading
 `Command timed out after N seconds` comes from this server, not from agy. The server also sets
 `AGY_CLI_HIDE_ACCOUNT_INFO=1` on the agy subprocess so the account/credits header
 never leaks into the parsed stdout.
@@ -1240,7 +1263,7 @@ export GEMINI_GIT_DIFF_LIMIT=300000  # gemini_git_diff_review character limit
 #### Transport & Effort
 ```bash
 export CLI_OUTPUT_FORMAT=auto          # auto | json | text (see Output Transport)
-export CLI_DEFAULT_EFFORT=             # low | medium | high | max (max: agy >= 1.2.11; empty = model's own tier)
+export CLI_DEFAULT_EFFORT=             # low | medium | high | xhigh | max (max: agy >= 1.2.11, xhigh: >= 1.5.3; empty = model's own tier)
 export CLI_EFFORT_PROMPT=              # per-task override, e.g. CLI_EFFORT_SANDBOX
 ```
 Each also accepts a `GEMINI_`-prefixed fallback name (`GEMINI_OUTPUT_FORMAT`,
@@ -1256,6 +1279,8 @@ export CLI_DEFAULT_MODEL=              # Global default model (empty = let agy d
 > but no module reads them — automatic model fallback mid-session is not wired
 > up. Setting them has no effect, and the `fallback_count` figure reported by
 > `gemini_rate_limiting_stats` is therefore always 0.
+> This is separate from the shipped-default check under [Model Selection](#model-selection):
+> that one only leaves out a *default* model agy no longer lists, before the run starts.
 
 #### Security Configuration (Advanced)
 ```bash
